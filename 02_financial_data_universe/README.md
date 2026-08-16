@@ -1,6 +1,6 @@
 # Chapter 2: The Financial Data Universe
 
-The chapter gives readers the conceptual map they need before touching any dataset. Its key contribution is not just the market / fundamental / alternative taxonomy, but the claim that every dataset embeds definitions about timestamps, adjustments, identifiers, and revisions, and that these choices determine what the data actually means in research.
+The chapter gives readers the conceptual map they need before touching any dataset. Its key contribution is not just the market / fundamental/alternative taxonomy, but the claim that every dataset embeds definitions about timestamps, adjustments, identifiers, and revisions, and that these choices determine what the data actually means in research.
 
 ## Learning Objectives
 
@@ -14,7 +14,7 @@ The chapter gives readers the conceptual map they need before touching any datas
 
 ### 2.1 A Modern Taxonomy of Financial Data
 
-This section gives readers the conceptual map they need before touching any dataset. Its key contribution is not just the market / fundamental / alternative taxonomy, but the claim that every dataset embeds definitions about timestamps, adjustments, identifiers, and revisions, and that these choices determine what the data actually means in research.
+This section gives readers the conceptual map they need before touching any dataset. Its key contribution is not just the market / fundamental/alternative taxonomy, but the claim that every dataset embeds definitions about timestamps, adjustments, identifiers, and revisions, and that these choices determine what the data actually means in research.
 
 ### 2.2 The Asset-Class Market Data Landscape
 
@@ -49,7 +49,7 @@ This section translates data discipline into infrastructure decisions. Rather th
 - [`17_complete_pipeline`](17_complete_pipeline.ipynb) — This notebook demonstrates end-to-end data pipelines, bringing together concepts from this chapter: Uses crypto_perps, wiki_provider data.
 - [`18_data_management`](18_data_management.ipynb) — Previous notebooks fetched and validated data. This notebook shows how to manage it at scale using ml4t-data's production features: Uses universe data.
 - [`19_incremental_updates`](19_incremental_updates.ipynb) — The previous notebook introduced DataManager and HiveStorage. This notebook focuses on the update workflow — the core reason ml4t-data exists: Uses all, treasury_yields data.
-- [`20_storage_benchmark_file`](20_storage_benchmark_file.ipynb) — Focus: Pure file format comparison (no query engines) Technologies: CSV, Parquet, Feather (Arrow IPC), HDF5 Operations: Write, Read (with forced materialization), Columnar...
+- [`20_storage_benchmark_file`](20_storage_benchmark_file.ipynb) — Focus: Pure file format comparison (no query engines). Technologies: CSV, Parquet, Feather (Arrow IPC), HDF5 Operations: Write, Read (with forced materialization), Columnar...
 - [`21_storage_benchmark_database`](21_storage_benchmark_database.ipynb) — > Docker required: This notebook depends on the benchmark environment and > database services.
 - [`22_pandas_polars_benchmark`](22_pandas_polars_benchmark.ipynb) — DataFrame-engine comparison (pandas vs Polars) across read, filter, groupby, join, and lazy operations on synthetic financial data at S/M/L scales. Backs the in-memory engine-choice recommendation in §2.4.
 
