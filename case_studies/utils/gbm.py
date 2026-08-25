@@ -243,7 +243,10 @@ _SKIP_PARAMS: dict[str, set[str]] = {
 _BEST_GPU: dict[str, str | None] = {}
 
 DEFAULT_GBM_CPU_THREADS = 8
-GBM_DEFAULT_MAX_BIN = 63
+# What every case study's setup.yaml declares under modeling.gbm.max_bin. It is LightGBM's own
+# default; the 63 that preceded it was inherited from a device branch rather than declared, and
+# the populations fitted under it are superseded.
+GBM_DEFAULT_MAX_BIN = 255
 
 # Declared behaviour of this runner. Bump when a change here would change a fitted result: the
 # libraries it dispatches to, how a parameter is derived, the fitting procedure, the checkpoint
@@ -2895,6 +2898,8 @@ def run_resolved_request(study: Study, spec: dict[str, Any], context: GBMContext
         if not _valid_gbm_model_dir(model_dir, context):
             raise ValueError(f"partial fitted-state directory requires inspection: {model_dir}")
         result = _predict_from_gbm_models(model_dir, spec, context)
+        reused_folds = sorted(context.fold_ids)
+        fitted_folds: list[int] = []
     else:
         staging = train_dir / f".models.{uuid.uuid4().hex}.tmp"
         staging.mkdir(parents=True)
@@ -2924,6 +2929,8 @@ def run_resolved_request(study: Study, spec: dict[str, Any], context: GBMContext
         except Exception:
             shutil.rmtree(staging, ignore_errors=True)
             raise
+        reused_folds = []
+        fitted_folds = sorted(context.fold_ids)
     prediction_results = []
     published = context.published_checkpoints or tuple(
         int(item["value"]) for item in computation["checkpoint_schedule"]
@@ -2959,7 +2966,19 @@ def run_resolved_request(study: Study, spec: dict[str, Any], context: GBMContext
     # a resolved request runs through here rather than through the batch path, so recording it
     # only there left every row this path produced with a NULL elapsed_s.
     _record_gbm_runtime(study, training, elapsed_s=elapsed_s, cpu_s=cpu_seconds() - started_cpu)
-    return ModelRun(training=training, predictions=tuple(prediction_results))
+    # Every other GBM path reports which folds it fitted and which it reused, and so does the
+    # linear runner's single-request path (linear.py:1498-1502). This one returned no diagnostics
+    # at all, so `execution.diagnostics` came back as {"status", "training_hash"} and a notebook
+    # reading `item["fitted_folds"]` raised KeyError rather than reporting the run.
+    return ModelRun(
+        training=training,
+        predictions=tuple(prediction_results),
+        diagnostics={
+            "cache_hit": False,
+            "reused_folds": reused_folds,
+            "fitted_folds": fitted_folds,
+        },
+    )
 
 
 def validate_locked_run(
