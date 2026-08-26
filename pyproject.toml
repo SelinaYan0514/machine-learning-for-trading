@@ -282,7 +282,7 @@ dev = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["utils", "data", "case_studies"]
+include = ["utils", "data", "case_studies", "scripts"]
 namespaces = false
 
 # Auto-loaded at interpreter startup to put numbered chapter dirs on sys.path
@@ -331,3 +331,6 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
 addopts = "-v --tb=short -p no:torchtyping"
+markers = [
+    "production_extract: asserts an absolute property of the full production dataset (a name count, a surplus), which no CI checkout carries - the test-data extract is reduced by design. Runs locally against the real data; deselected in CI.",
+]

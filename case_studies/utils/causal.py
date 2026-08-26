@@ -652,6 +652,36 @@ def _placebo_moved_mask(original: np.ndarray, permuted: np.ndarray) -> np.ndarra
     return moved
 
 
+# Below this many successful placebo draws the permutation test is not computed at all:
+# the plus-one correction floors the empirical p at 1/(n+1), so under ten draws no data
+# could produce a pass and a number would be reported that no test earned. When it is not
+# computed, `refutation` stays empty and `refutation_p` is registered NULL - a missing
+# measurement, which is what it is.
+MIN_PLACEBO_DRAWS = 10
+
+
+def placebo_request_is_on_the_boundary(n_placebo: int) -> bool:
+    """Would one failed draw take the whole refutation with it?
+
+    This is not enforced at run time, and the attempt to do so is worth recording. Nine
+    tests in tests/test_causal_adapter.py request two to six draws on purpose, to
+    exercise the block-span and permutation-feasibility logic without paying for a
+    refutation they never read; refusing every small request turned all nine red for a
+    property they are not about. The boundary is a property of a *declared reduction* -
+    a config that says how a real run should be made cheap - not of every call.
+
+    Zero means "do not refute", which is a different statement from "refute with too
+    few draws to say anything".
+    """
+    return 0 < n_placebo < MIN_PLACEBO_DRAWS + PLACEBO_REQUEST_MARGIN
+
+
+# Enough that one draw failing does not take the whole test with it. Small on purpose:
+# a placebo draw is a full nuisance refit, so this is the least that makes the boundary
+# unreachable by a single failure rather than a comfortable cushion.
+PLACEBO_REQUEST_MARGIN = 5
+
+
 def _assert_placebo_permutation_possible(
     unchanged_draws: int, n_draws: int, block_size: int, short_segment_fraction: float = 0.0
 ) -> None:
@@ -806,9 +836,11 @@ def run_dml_analysis(
     horizon : int or None
         Label horizon in observation periods, forwarded to the second-stage
         HAC regression so the Newey-West bandwidth satisfies L >= horizon - 1.
-        Pass it for overlapping labels (horizon >= ~10), for example,
-        `horizon=embargo_from_buffer(mds.label_buffer)`. When both `horizon`
-        and `hac_maxlags` are None, the bandwidth falls back to the
+        Pass it for overlapping labels (horizon >= ~10). It is the outcome
+        horizon, read with
+        `resolve_label_horizon(case_study_id, label, setup)`, and not the CV
+        buffer, which bounds a different quantity and can be longer. When both
+        `horizon` and `hac_maxlags` are None, the bandwidth falls back to the
         horizon-blind cube-root rule and a warning is emitted.
     time_col : str or None
         Ordered decision-time column. Inferred from canonical ``timestamp``
@@ -854,7 +886,11 @@ def run_dml_analysis(
                 "run_dml_analysis: no horizon or hac_maxlags given; the second-stage "
                 "HAC bandwidth falls back to the horizon-blind cube-root rule, which "
                 "under-lags overlapping labels of horizon >= ~10 and overstates the "
-                "t-statistic. Pass horizon=embargo_from_buffer(mds.label_buffer).",
+                "t-statistic. Pass the outcome horizon in observation periods: read the "
+                "horizon with resolve_label_horizon(case_study_id, label, setup) - not the "
+                "CV buffer, which can be longer - and convert it against the panel's own "
+                "cadence. embargo_from_buffer without observed_step applies per-unit "
+                "defaults instead, which read 24H as one period on an eight-hour panel.",
                 stacklevel=2,
             )
 
@@ -952,7 +988,7 @@ def run_dml_analysis(
         )
 
         refutation = {}
-        if len(placebo_effects) >= 10:
+        if len(placebo_effects) >= MIN_PLACEBO_DRAWS:
             placebo_arr = np.array(placebo_effects)
             p_mean = np.mean(placebo_arr)
             p_std = np.std(placebo_arr)
@@ -1110,6 +1146,7 @@ def resolve_causal_request(study: Study, request: dict[str, Any]):
     from case_studies.research.contracts import ExecutionTier
     from case_studies.research.identity import ResolvedSpec
     from case_studies.utils.artifact_digest import value_digest
+    from utils.artifact_specs import resolve_label_horizon
     from utils.modeling import load_configs, load_modeling_dataset
 
     tier = ExecutionTier(request["execution_tier"])
@@ -1173,7 +1210,33 @@ def resolve_causal_request(study: Study, request: dict[str, Any]):
     if missing:
         raise ValueError(f"DML analysis columns are missing: {missing}")
     holdout = pd.Timestamp(setup["evaluation"]["holdout_start"], tz="UTC")
-    horizon_delta = pd.Timedelta(str(mds.label_buffer).replace("H", "h"))
+    # Two quantities, and one name used to stand for both. The buffer keeps a fold's training
+    # rows clear of its validation labels and bounds the pre-holdout window; the outcome horizon
+    # is how long one outcome stays open, which is what makes successive outcomes overlap and
+    # therefore what the Newey-West bandwidth has to cover. `resolve_label_horizon` reads the
+    # second and its docstring says it may be shorter than the first. They agree in most case
+    # studies here, but by configuration rather than by construction, so deriving the bandwidth
+    # from the buffer is right by luck wherever it is right at all.
+    buffer_delta = pd.Timedelta(str(mds.label_buffer).replace("H", "h"))
+    outcome_delta = pd.Timedelta(
+        str(
+            resolve_label_horizon(study.case_study, label_ref.name, setup) or mds.label_buffer
+        ).replace("H", "h")
+    )
+    # The seal and the placebo block below both take the buffer, on the grounds that it is the
+    # longer of the two. Nothing enforces that: both values are hand-authored in setup.yaml and
+    # `resolve_label_horizon` promises only that the horizon *may* be shorter. A case study
+    # declaring a horizon longer than its buffer would get a permutation block shorter than the
+    # dependence it exists to hold fixed, and a seal that leaves outcomes reaching into the
+    # holdout, both silently.
+    if outcome_delta > buffer_delta:
+        raise ValueError(
+            f"outcome horizon {outcome_delta} exceeds the CV buffer {buffer_delta} for "
+            f"{label_ref.name!r}. The buffer bounds the pre-holdout window and sizes the "
+            "placebo block, so it cannot be shorter than the outcome it is holding clear. "
+            "Raise labels.buffer (or labels.variant_buffers) in setup.yaml, or correct "
+            "labels.horizons."
+        )
     date_dtype = mds.dataset.schema[mds.date_col]
     # The cutoff steps back a count of observations, not a calendar duration. The horizons
     # these buffers describe are counted in the panel's own observations, so subtracting the
@@ -1195,7 +1258,8 @@ def resolve_causal_request(study: Study, request: dict[str, Any]):
     if pre_holdout.is_empty():
         raise ValueError("DML request resolved an empty pre-holdout analysis frame")
     cadence = _observed_cadence(pre_holdout, mds.date_col)
-    horizon_steps = max(1, int(np.ceil(horizon_delta / cadence)))
+    buffer_steps = max(1, int(np.ceil(buffer_delta / cadence)))
+    outcome_horizon_steps = max(1, int(np.ceil(outcome_delta / cadence)))
     # The step-back is counted within each entity, not across the panel's distinct
     # timestamps. A label advances by that entity's own observations, so on a panel where
     # one product is missing some of the final sessions, a global count reaches back fewer
@@ -1209,7 +1273,7 @@ def resolve_causal_request(study: Study, request: dict[str, Any]):
     # drag the boundary back to its own exit date and silently truncate every other
     # entity to an early slice of the panel.
     #
-    # An entity that does not hold more than `horizon_steps` observations before the
+    # An entity that does not hold more than `buffer_steps` observations before the
     # holdout has no row whose outcome resolves before it, so it contributes no cutoff and
     # drops out entirely.
     per_entity = (
@@ -1220,16 +1284,16 @@ def resolve_causal_request(study: Study, request: dict[str, Any]):
             pl.col(mds.date_col).len().alias("observations"),
             pl.col(mds.date_col).alias("timestamps"),
         )
-        .filter(pl.col("observations") > horizon_steps)
+        .filter(pl.col("observations") > buffer_steps)
         .with_columns(
             pl.col("timestamps")
-            .list.get(pl.col("observations") - horizon_steps)
+            .list.get(pl.col("observations") - buffer_steps)
             .alias("entity_cutoff")
         )
     )
     if per_entity.is_empty():
         raise ValueError(
-            f"no entity holds more than {horizon_steps} observations before "
+            f"no entity holds more than {buffer_steps} observations before "
             f"{holdout.date()}, so none can absorb the buffer and leave anything to analyse"
         )
     analysis = (
@@ -1276,7 +1340,7 @@ def resolve_causal_request(study: Study, request: dict[str, Any]):
             "treatment": treatment,
             "confounders": list(confounders),
             "treatment_observed_at": "decision_timestamp",
-            "outcome_horizon": str(horizon_delta),
+            "outcome_horizon": str(outcome_delta),
             "holdout_endpoint_cutoff": endpoint_cutoff.isoformat(),
         },
         "cv": {
@@ -1296,7 +1360,7 @@ def resolve_causal_request(study: Study, request: dict[str, Any]):
         "refutation": {
             "method": "within_symbol_contiguous_block_permutation",
             "n_placebo": n_placebo,
-            "block_size": horizon_steps,
+            "block_size": buffer_steps,
             "seed": seed,
             "temporal_gap_policy": "reset",
             "observation_cadence": str(cadence),
@@ -1333,21 +1397,18 @@ def resolve_causal_request(study: Study, request: dict[str, Any]):
         n_folds=n_folds,
         embargo=embargo,
         n_placebo=n_placebo,
-        # The block spans the label horizon, because the overlapping labels are
-        # what create the serial dependence the permutation exists to preserve -
-        # the same scale the second-stage HAC bandwidth uses (L >= h - 1).
-        #
-        # It is named `horizon_steps` rather than `embargo` even though the two
-        # are equal here: `embargo` is `embargo_from_buffer(mds.label_buffer,
-        # observed_step=cadence)`, which is `horizon_steps` by construction, so
-        # this is a rename and no result moves. Naming it for the horizon is what
-        # keeps it correct if the embargo ever stops being derived from the label
-        # buffer. The five case-study notebooks that call `run_dml_analysis`
-        # directly take `BLOCK_SIZE = EMBARGO_PERIODS` from the *fallback*
-        # conversion, with no `observed_step`, and there the two can diverge.
-        block_size=horizon_steps,
+        # The block takes the buffer and the bandwidth takes the outcome horizon.
+        # The block holds fixed the dependence the fold structure already keeps
+        # clear, which the buffer measures; the bandwidth corrects for outcomes
+        # that overlap, and how far one outcome reaches is the horizon. The two
+        # are equal wherever a case study declares them equal, which is most of
+        # them here, so the split changes no result until one of them declares a
+        # horizon shorter than its buffer. Newey-West is not monotonic in the
+        # bandwidth, so a bandwidth taken from the wrong quantity is not a known
+        # direction of error.
+        block_size=buffer_steps,
         seed=seed,
-        horizon=horizon_steps,
+        horizon=outcome_horizon_steps,
         expected_step=cadence,
         nuisance_params=nuisance_params,
         runtime_provenance=provenance,
@@ -1359,10 +1420,15 @@ def run_resolved_causal_request(
     study: Study,
     spec: dict[str, Any],
     context: DMLResearchContext,
+    *,
+    supersedes: str | None = None,
 ):
     import math
 
     from case_studies.research.causal import CausalResult
+    from case_studies.utils.registry.registration import (
+        declare_causal_supersedes,
+    )
     from case_studies.utils.registry.registration import register_causal_run as register_record
     from case_studies.utils.registry.specs import canonical_json, training_hash_from_spec
 
@@ -1378,6 +1444,23 @@ def run_resolved_causal_request(
     if cached is not None:
         if training_hash_from_spec(cached.spec) != causal_hash or not cached.complete:
             raise ValueError(f"causal cache is incomplete or conflicts with {causal_hash}")
+        if supersedes is not None:
+            # The declaration has to land even when the fit does not re-run, because
+            # that is the shape of the repair. A registry already holding two
+            # undeclared identities tells the author to re-register the newer one
+            # naming the older; doing so reproduces the same causal_hash, so the cache
+            # answers and the fit is skipped. Returning here without writing would drop
+            # the declaration silently and leave the label unresolvable, with the
+            # notebook reporting success. register_causal_run fills the column
+            # once and validates what it is given.
+            declare_causal_supersedes(
+                study.case_study,
+                causal_hash,
+                supersedes_hash=supersedes,
+                label=context.outcome_col,
+                tier=str(spec["execution_tier"]),
+                case_dir=study.storage_root(spec["execution_tier"]),
+            )
         return cached
 
     nuisance_y = HistGradientBoostingRegressor(**context.nuisance_params)
@@ -1413,6 +1496,11 @@ def run_resolved_causal_request(
     register_record(
         study.case_study,
         causal_hash,
+        # The identity this run retires, from the notebook's SUPERSEDES_CAUSAL. A refit
+        # under a changed version of this file produces a second canonical identity for
+        # the same label, and a reader resolves a label to exactly one; register_record
+        # refuses the second without a declaration.
+        supersedes_hash=supersedes,
         label=context.outcome_col,
         treatment=context.treatment_col,
         confounders_json=json.dumps(list(context.confounder_cols)),
@@ -1466,6 +1554,7 @@ def register_causal_run(
     case_dir=None,
     started_at: str | None = None,
     elapsed_s: float | None = None,
+    supersedes_hash: str | None = None,
 ) -> str:
     """Register a causal DML run in the dedicated `causal_runs` table.
 
@@ -1550,6 +1639,11 @@ def register_causal_run(
         notebook=notebook,
         started_at=started_at or results.get("started_at"),
         elapsed_s=elapsed_s if elapsed_s is not None else results.get("elapsed_s"),
+        # The causal identity this run retires. A refit produces a second canonical
+        # identity for the same label and `CausalResult.one` resolves a label to exactly
+        # one, so the chain is declared here rather than guessed from `created_at`.
+        # Notebooks pass their SUPERSEDES_CAUSAL parameter through.
+        supersedes_hash=supersedes_hash,
         case_dir=case_dir,
     )
 
