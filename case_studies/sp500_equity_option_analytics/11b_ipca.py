@@ -32,7 +32,9 @@
 #
 # - **The features finally reach the factor structure.** In PCA they reached nothing. The distance
 #   between the two notebooks is what conditioning on the surface buys, measured rather than
-#   assumed, with the folds, the factor count and the scoring identical on both sides.
+#   assumed, with the folds, the factor count and the scoring identical on both sides - though not
+#   the sample, for the reason the next point gives, which is why section 5 reads that distance as
+#   a bound rather than an estimate.
 # - **The panel no longer has to stay balanced.** PCA needs a stock to be the same stock with a
 #   usable return history across the training window. IPCA needs only that a stock have features on
 #   a date, because the exposure is computed from them rather than estimated from its past. On a
@@ -102,17 +104,22 @@ MODEL_NAME = "ipca"
 
 # %%
 study = open_study(
-    "sp500_equity_option_analytics", execution_tier=EXECUTION_TIER, workspace=WORKSPACE or None
+    "sp500_equity_option_analytics",
+    execution_tier=EXECUTION_TIER,
+    workspace=WORKSPACE or None,
+    entry_point="11b_ipca",
 )
 
 # %% [markdown]
 # ## 1. Which labels, and what the configuration says
 #
-# Every label whose training menu declares `latent_factors:` is fitted, and three do: `fwd_ret_5d`,
-# the stock's total return over the five trading days after the decision date; `fwd_ret_10d`, the
-# same over ten; and `fwd_ret_risk_adj_5d`, the five-day return divided by a measure of its own
-# dispersion. The two `fwd_dir_*` classification labels declare linear and gradient boosting only,
-# so they are absent here rather than dropped.
+# Every label whose training menu declares `latent_factors:` is fitted, and the cell below reads
+# which those are rather than this sentence asserting a count that would go stale the moment a
+# sixth label declared the family. What the names mean is the part prose has to supply:
+# `fwd_ret_5d` is the stock's total return over the five trading days after the decision date,
+# `fwd_ret_10d` the same over ten, and `fwd_ret_risk_adj_5d` the five-day return divided by a
+# measure of its own dispersion. A `fwd_dir_*` classification label declaring only linear and
+# gradient boosting is absent here rather than dropped.
 
 # %%
 declared_labels(study, "latent_factors")
@@ -324,9 +331,14 @@ print(f"population {population.name}: {len(population.members)} prediction sets"
 # %% [markdown]
 # ## 4. What came out
 #
-# One row per label. `ic_mean` is the **information coefficient**: on each validation date, rank the
-# stocks by the model's prediction, rank them by the return they went on to earn, correlate the two
-# rankings, and average that daily correlation over the validation period.
+# One row per label. The **information coefficient** is the rank correlation, on one validation
+# date, between the stocks ordered by the model's prediction and the stocks ordered by the return
+# they went on to earn.
+#
+# `ic_mean` aggregates that **over folds, not over days**: each fold's own mean IC is computed and
+# those are averaged with equal weight (`latent_factors/cv.py`, and
+# `registry/metrics.py` states the convention). With folds of unequal length the fold mean and the
+# pooled daily mean are different numbers, and this column is the first.
 #
 # `ic_n_days` is how many validation dates produced a defined correlation, and it decides which rows
 # are comparable with each other. `auc_scored_against` says what the AUC column was scored against:
@@ -394,10 +406,11 @@ catalog.select(
 # enters the fit. So a gap between these rows says the map itself came out different, not just that
 # the same forecast was scored three ways.
 #
-# `ic_t` is a Newey-West HAC statistic on the daily IC series. It is a diagnostic and not a
-# selection rule - the series is short, overlapping multi-day returns make successive days
-# dependent, and the folds have been read many times over by the time a case study reaches this
-# notebook.
+# `ic_t` is the t-statistic across those fold means, not a Newey-West statistic on the daily
+# series - the registry keeps the HAC-corrected version separately as `ic_t_hac`, and that is the
+# inferential one. Either way it is a diagnostic and not a selection rule: the series is short,
+# overlapping multi-day returns make successive days dependent, and the folds have been read many
+# times over by the time a case study reaches this notebook.
 
 # %% tags=["results"]
 by_label = catalog.select(
@@ -406,6 +419,13 @@ by_label = catalog.select(
     ic_mean=pl.col("ic_mean"),
     ic_t=pl.col("ic_t"),
     scored_dates=pl.col("ic_n_days"),
+    # `ic_n_days` counts the days behind `ic_mean_daily`, the pooled daily statistic - not the
+    # folds behind `ic_mean`, which is what the rows are ordered by. So this column is a
+    # comparability guarantee about one statistic attached to a ranking on another. It is kept
+    # because unequal day counts are still the thing that makes two rows incomparable, and
+    # flagged because the two are not the same measurement: `registry/metrics.py:203` averages
+    # folds for `ic_mean`, and `:234-250` computes the daily family together. Reading the
+    # ordering on `ic_mean_daily` would need `PredictionCatalog` to carry it.
     full_coverage=pl.col("ic_n_days") == pl.col("ic_n_days").max(),
 ).sort("ic_mean", descending=True)
 by_label
@@ -465,13 +485,24 @@ show_plotly_with_alt(
 # measure of its own dispersion - so a gap between those two rows is a statement about scaling by
 # width and nothing else.
 #
-# **This notebook and [`11a_pca`](11a_pca.ipynb) differ by one thing, which is the comparison to
-# make.** Same folds, same factor count, same scoring, same three labels. PCA estimates each
-# stock's loading from its own return history and never sees an option-surface column; IPCA
-# requires the loading to be a linear function of exactly those columns. The distance between the
-# two populations is therefore what conditioning on the surface buys, measured rather than argued -
-# and it is a distance in both directions, because a constraint that is wrong costs more than no
-# constraint at all.
+# **This notebook and [`11a_pca`](11a_pca.ipynb) differ in two things, not one, and the second one
+# limits what the comparison can say.** Same folds, same factor count, same scoring, same three
+# labels. PCA estimates each stock's loading from its own return history and never sees an
+# option-surface column; IPCA requires the loading to be a linear function of exactly those
+# columns. That is the difference the comparison is for.
+#
+# The second difference is the sample. The section above is explicit that IPCA does not need a
+# balanced panel and PCA does, and the consequence is that the two populations are not scored on
+# the same rows: IPCA covers about a tenth more of the panel on every label - 192,139 against
+# 175,360 on `fwd_ret_10d`, 194,813 against 177,682 on `fwd_ret_5d`, 194,748 against 177,769 on
+# `fwd_ret_risk_adj_5d`. The extra rows are the names PCA had to drop for want of a complete return
+# history, which are systematically the shorter-lived and less liquid ones.
+#
+# So the gap between the two ICs is what conditioning buys **plus** whatever those rows contribute,
+# and this notebook cannot separate them. Read it as a bound rather than an estimate, and read it
+# in both directions, because a constraint that is wrong costs more than no constraint at all.
+# Making it an estimate would mean scoring IPCA on PCA's balanced subset, which is a different
+# notebook and would throw away the tolerance that is IPCA's main practical advantage.
 #
 # **A model with no epochs still has a checkpoint, and the checkpoint is not a formality.** The
 # registry keys a prediction set on `(training identity, checkpoint)`, so a family whose members

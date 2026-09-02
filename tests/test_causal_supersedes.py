@@ -60,9 +60,14 @@ def _register(case_dir, causal_hash, *, effect=-0.02, supersedes=None) -> None:
 
 
 def _study(case_dir):
+    # `release_case_root` is read by the canonical lookup in `CausalResult`: a workspace opened
+    # over a release starts with an empty run_log, so a result registered by the release lives
+    # only there. Pointing it at the same directory is the "no separate release" case, which is
+    # what a tmp_path registry is.
     return SimpleNamespace(
         root=case_dir,
         output_root=None,
+        release_case_root=case_dir,
         storage_root=lambda _tier: case_dir,
     )
 
@@ -240,17 +245,14 @@ _CANNED = {
 }
 
 
-def _refit_under_a_changed_causal_module(monkeypatch, digest: str) -> None:
-    """What a refit is: the same request against a changed case_studies/utils/causal.py.
-
-    `_causal_source_identity` hashes that file, so editing it is what produces a second
-    identity for the same label. Simulating it here keeps the test about the chain
-    rather than about which edit was made.
-    """
+def _refit_under_a_changed_causal_module(monkeypatch, version: int) -> None:
+    """Run the same request against a new causal computation version."""
     from case_studies.utils import causal as causal_module
 
     monkeypatch.setattr(causal_module, "run_dml_analysis", lambda *a, **k: dict(_CANNED))
-    monkeypatch.setattr(causal_module, "_causal_source_identity", lambda: {"causal.py": digest})
+    monkeypatch.setattr(
+        causal_module, "_causal_source_identity", lambda: {"causal_runner": version}
+    )
 
 
 def test_a_refit_through_the_request_path_is_refused_without_a_declaration(
@@ -259,10 +261,10 @@ def test_a_refit_through_the_request_path_is_refused_without_a_declaration(
     from tests.test_causal_adapter import _causal_fixture
 
     study, label, _frame = _causal_fixture(tmp_path, monkeypatch)
-    _refit_under_a_changed_causal_module(monkeypatch, "a" * 64)
+    _refit_under_a_changed_causal_module(monkeypatch, 1)
     first = study.causal(method="dml", label=label.name).run()
 
-    _refit_under_a_changed_causal_module(monkeypatch, "b" * 64)
+    _refit_under_a_changed_causal_module(monkeypatch, 2)
     with pytest.raises(ValueError, match="SUPERSEDES_CAUSAL"):
         study.causal(method="dml", label=label.name).run()
 

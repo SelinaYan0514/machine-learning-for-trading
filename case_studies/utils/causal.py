@@ -29,11 +29,13 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 # Fixed rather than derived from the host: a value like -1 varies with the machine, so a
 # result would not be identity-stable across the readers' hardware.
 DML_THREAD_LIMIT = 1
+CAUSAL_RUNNER_VERSION = 1
 
 import hashlib
 import importlib.metadata
 import json
 import platform
+import re
 import time
 import warnings
 from dataclasses import dataclass
@@ -149,12 +151,27 @@ def embargo_from_buffer(
                 f"omitting observed_step."
             )
         span = pd.Timedelta(normalized)
+        # The floor of one period is there so a buffer shorter than a bar still
+        # embargoes the bar it resolves inside. A zero-length buffer is not that
+        # case: it declares that the label resolves on its own row's timestamp, so
+        # there is nothing to embargo, and the floor would invent a gap the case
+        # study did not ask for. The `periods_per_year` branch below answers zero
+        # for the same declaration, and the two must not disagree.
+        if span == pd.Timedelta(0):
+            return 0
         return max(1, math.ceil(span / step))
 
     match = re.match(r"(\d+)(D|H|h|M|T|min)", label_buffer.strip())
     if not match:
         raise ValueError(f"Cannot parse label_buffer: {label_buffer}")
     value, unit = int(match.group(1)), match.group(2)
+    # The per-unit conversions below divide by the value and are built eagerly, so
+    # every unit raised on a zero, including the D branch that would have returned it
+    # unchanged had it been reached. A case study whose outcome resolves on the row's
+    # own timestamp declares exactly that, for example `labels.horizons` in
+    # us_firm_characteristics.
+    if value == 0:
+        return 0
     return {
         "D": value,
         "H": max(1, 24 // value),
@@ -1074,9 +1091,9 @@ def format_dml_summary(results: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _causal_source_identity() -> dict[str, str]:
-    path = Path(__file__)
-    return {path.name: hashlib.sha256(path.read_bytes()).hexdigest()}
+def _causal_source_identity() -> dict[str, int]:
+    """Return the declared version of the result-affecting causal implementation."""
+    return {"causal_runner": CAUSAL_RUNNER_VERSION}
 
 
 def _causal_runtime_identity() -> dict[str, str]:
@@ -1128,6 +1145,46 @@ def _observed_cadence(frame, timestamp: str) -> pd.Timedelta:
     return pd.Timedelta(cadence)
 
 
+def _treatment_persistence_steps(setup: dict[str, Any], treatment: str) -> int | None:
+    """Bars the treatment's own construction window spans, from `features.windows`.
+
+    A 14-day z-score is autocorrelated over its whole window whatever the label
+    horizon is, so a placebo that permutes in blocks shorter than that window
+    destroys the dependence the permutation exists to preserve. `setup.yaml`
+    already declares every window once, keyed by the suffix the emitted column
+    carries, so the number is read from there rather than parsed out of the
+    column name. Returns None when the register declares no window for this
+    treatment, which the caller records rather than papers over.
+    """
+    # An explicit declaration in the causal block wins. The feature register below can only
+    # answer for a column whose family is suffix-keyed, and eight of the nine treatments are
+    # not: cme's `carry_pct` has no `carry` family, etfs' `skip_recent_6_1` sits under a family
+    # that is a bare int, us_firm and us_equities_panel declare no windows at all. Contorting
+    # the register to reach them would have meant renaming keys the feature code reads by name.
+    # Declared next to `treatment` and `confounders`, which is where a reader looks for what
+    # the treatment is, and where the derivation can be written down beside it.
+    declared = (setup.get("causal") or {}).get("treatment_window")
+    if declared is not None:
+        return max(1, int(declared))
+    windows = (setup.get("features") or {}).get("windows") or {}
+    for family, suffixes in windows.items():
+        prefix = f"{family}_"
+        if not treatment.startswith(prefix):
+            continue
+        # Only the suffix-keyed mapping says which window *this* column carries.
+        # The register also holds bare ints and lists of bar counts for families
+        # whose columns are named some other way (etfs `skip_recent: 21`, and
+        # `momentum: [5, 10, 21, ...]`), and guessing which element a treatment
+        # was built from would put a wrong block size behind a right-looking
+        # number. Those return None, and the caller warns.
+        if not isinstance(suffixes, dict):
+            continue
+        declared = suffixes.get(treatment[len(prefix) :])
+        if declared is not None:
+            return max(1, int(declared))
+    return None
+
+
 def _resolve_nuisance_params(config: dict[str, Any], overrides: dict[str, Any], seed: int):
     configured = dict(config.get("params") or {})
     supplied = dict(overrides.get("nuisance_params") or {})
@@ -1137,6 +1194,61 @@ def _resolve_nuisance_params(config: dict[str, Any], overrides: dict[str, Any], 
         raise ValueError(f"unsupported DML nuisance parameters: {sorted(unknown)}")
     estimator.set_params(**configured, **supplied)
     return estimator.get_params(deep=True)
+
+
+# A calendar month is 28 to 31 days long, so the modal gap of a monthly panel lands in this
+# range whichever months the sample happens to span, and no daily, hourly or minute panel
+# can. It is the whole test: a declaration of `1M` can only be counted in observations on a
+# panel whose observations are months.
+_MONTHLY_CADENCE = (pd.Timedelta(days=27), pd.Timedelta(days=32))
+_MONTH_DECLARATION = re.compile(r"^(\d+)\s*M$")
+
+
+def _declared_steps(declaration: str, cadence: pd.Timedelta, *, field: str) -> tuple[int, str]:
+    """Observations a declared duration spans, and how to record it.
+
+    Buffers and horizons are hand-authored in ``setup.yaml`` as duration strings, and every
+    use of them below is a count of the panel's own observations. Most units are fixed spans
+    and divide by the measured cadence. A month is not: `pd.Timedelta` refuses ``1M``
+    outright, because January and February are different lengths and there is no answer that
+    is right for both.
+
+    On a monthly panel there is no ambiguity to resolve - one month is one observation - so
+    the count is the declared number, once the panel has been shown to be recorded in months.
+    On any other panel the declaration cannot be honoured at all and this raises rather than
+    substituting a nominal month, which would be wrong by however far that panel's month
+    differs from the nominal one and would not show in the result.
+
+    **A zero-length declaration answers zero**, and is not floored to one. It says the span
+    is closed on the row's own timestamp - ``us_firm_characteristics`` declares
+    ``labels.horizons: 0D`` because the return is already realised there - and a floor turns
+    that statement into a one-observation overlap the case study never declared. The floor
+    belongs on a span that is nonzero but shorter than a bar, which does reach into the bar
+    it resolves inside. :func:`embargo_from_buffer` draws the same line for the same reason,
+    and the two must not disagree about one declaration.
+
+    Returns the count and the string the resolved spec records. That string is
+    ``str(pd.Timedelta(...))`` wherever the duration is fixed, which is what the spec has
+    always carried, so a case study whose buffer is expressible as a Timedelta keeps the
+    identity it already published.
+    """
+    # pandas deprecated the uppercase hour alias; the buffers still use it.
+    text = re.sub(r"(?<=\d)H\b", "h", declaration.strip())
+    month = _MONTH_DECLARATION.match(text)
+    if month is None:
+        span = pd.Timedelta(text)
+        if span == pd.Timedelta(0):
+            return 0, str(span)
+        return max(1, int(np.ceil(span / cadence))), str(span)
+    low, high = _MONTHLY_CADENCE
+    if not low <= cadence <= high:
+        raise ValueError(
+            f"{field} is declared as {declaration!r}, a calendar month, but this panel is "
+            f"recorded at {cadence}. A month has no fixed length, so it can be counted in "
+            "observations only on a panel whose observations are months. Declare the span in "
+            "days on a panel recorded in days."
+        )
+    return int(month.group(1)), text
 
 
 def resolve_causal_request(study: Study, request: dict[str, Any]):
@@ -1183,7 +1295,9 @@ def resolve_causal_request(study: Study, request: dict[str, Any]):
         raise ValueError(f"DML runner does not support entity key {mds.entity_cols[0]!r}")
     configs = {
         config["config_name"]: config
-        for config in load_configs(study.case_study, label_ref.name, "causal_dml")
+        for config in load_configs(
+            study.case_study, label_ref.name, "causal_dml", case_dir=study.root
+        )
     }
     try:
         config = configs[request["config_name"]]
@@ -1196,8 +1310,8 @@ def resolve_causal_request(study: Study, request: dict[str, Any]):
     seed = int(config.get("seed", RANDOM_SEED))
     n_folds = int(reductions.get("n_folds", config.get("n_folds", 5)))
     n_placebo = int(reductions.get("n_placebo", config.get("n_placebo", 100)))
-    # The shared preset still declares max_samples for the six case-study DML stages that have
-    # not migrated to this path and read it as their own default. This path ignores it: a
+    # The shared preset still declares max_samples for the case-study DML stages that have not
+    # migrated to this path and read it as their own default. This path ignores it: a
     # canonical run uses the full declared population, and a reduction reaches it only through
     # preview_reductions, which research/causal.py refuses for a canonical request. So the
     # preset cannot cap a canonical sample, and the resolved spec records max_samples: 0.
@@ -1217,26 +1331,10 @@ def resolve_causal_request(study: Study, request: dict[str, Any]):
     # second and its docstring says it may be shorter than the first. They agree in most case
     # studies here, but by configuration rather than by construction, so deriving the bandwidth
     # from the buffer is right by luck wherever it is right at all.
-    buffer_delta = pd.Timedelta(str(mds.label_buffer).replace("H", "h"))
-    outcome_delta = pd.Timedelta(
-        str(
-            resolve_label_horizon(study.case_study, label_ref.name, setup) or mds.label_buffer
-        ).replace("H", "h")
+    buffer_declaration = str(mds.label_buffer)
+    horizon_declaration = str(
+        resolve_label_horizon(study.case_study, label_ref.name, setup) or mds.label_buffer
     )
-    # The seal and the placebo block below both take the buffer, on the grounds that it is the
-    # longer of the two. Nothing enforces that: both values are hand-authored in setup.yaml and
-    # `resolve_label_horizon` promises only that the horizon *may* be shorter. A case study
-    # declaring a horizon longer than its buffer would get a permutation block shorter than the
-    # dependence it exists to hold fixed, and a seal that leaves outcomes reaching into the
-    # holdout, both silently.
-    if outcome_delta > buffer_delta:
-        raise ValueError(
-            f"outcome horizon {outcome_delta} exceeds the CV buffer {buffer_delta} for "
-            f"{label_ref.name!r}. The buffer bounds the pre-holdout window and sizes the "
-            "placebo block, so it cannot be shorter than the outcome it is holding clear. "
-            "Raise labels.buffer (or labels.variant_buffers) in setup.yaml, or correct "
-            "labels.horizons."
-        )
     date_dtype = mds.dataset.schema[mds.date_col]
     # The cutoff steps back a count of observations, not a calendar duration. The horizons
     # these buffers describe are counted in the panel's own observations, so subtracting the
@@ -1258,8 +1356,42 @@ def resolve_causal_request(study: Study, request: dict[str, Any]):
     if pre_holdout.is_empty():
         raise ValueError("DML request resolved an empty pre-holdout analysis frame")
     cadence = _observed_cadence(pre_holdout, mds.date_col)
-    buffer_steps = max(1, int(np.ceil(buffer_delta / cadence)))
-    outcome_horizon_steps = max(1, int(np.ceil(outcome_delta / cadence)))
+    buffer_steps, _ = _declared_steps(buffer_declaration, cadence, field="labels.buffer")
+    if buffer_steps < 1:
+        # The seal below steps back `buffer_steps` observations within each entity, so a
+        # zero buffer has no row to step back to and the per-entity cutoff silently
+        # becomes null - which reaches the caller as "empty pre-holdout analysis frame",
+        # naming neither the declaration nor the reason. No case study declares one; a
+        # panel whose labels really do need no gap should say so here rather than be
+        # discovered three failures downstream.
+        raise ValueError(
+            f"labels.buffer is declared as {buffer_declaration!r}, which spans no "
+            "observations, so there is no gap to seal a fold's training rows against its "
+            "validation labels. The DML resolver requires a buffer of at least one "
+            "observation."
+        )
+    outcome_horizon_steps, outcome_horizon_label = _declared_steps(
+        horizon_declaration, cadence, field="labels.horizons"
+    )
+    # The seal and the placebo block below both take the buffer, on the grounds that it is the
+    # longer of the two. Nothing enforces that: both values are hand-authored in setup.yaml and
+    # `resolve_label_horizon` promises only that the horizon *may* be shorter. A case study
+    # declaring a horizon longer than its buffer would get a permutation block shorter than the
+    # dependence it exists to hold fixed, and a seal that leaves outcomes reaching into the
+    # holdout, both silently.
+    #
+    # Compared as observation counts rather than as durations, because that is the comparison
+    # the two quantities are used for below and it is the only one a calendar month can take
+    # part in: `1M` is not a fixed span, so `pd.Timedelta` refuses it outright.
+    if outcome_horizon_steps > buffer_steps:
+        raise ValueError(
+            f"outcome horizon {horizon_declaration} spans {outcome_horizon_steps} observations "
+            f"and the CV buffer {buffer_declaration} spans {buffer_steps} for "
+            f"{label_ref.name!r}. The buffer bounds the pre-holdout window and sizes the "
+            "placebo block, so it cannot be shorter than the outcome it is holding clear. "
+            "Raise labels.buffer (or labels.variant_buffers) in setup.yaml, or correct "
+            "labels.horizons."
+        )
     # The step-back is counted within each entity, not across the panel's distinct
     # timestamps. A label advances by that entity's own observations, so on a panel where
     # one product is missing some of the final sessions, a global count reaches back fewer
@@ -1324,7 +1456,52 @@ def resolve_causal_request(study: Study, request: dict[str, Any]):
     try:
         embargo = embargo_from_buffer(mds.label_buffer, observed_step=cadence)
     except ValueError:
-        embargo = embargo_from_buffer(mds.label_buffer)
+        # `periods_per_year` is what the calendar branch needs to answer a month buffer in
+        # observations. Omitting it made `1M` resolve to twenty-one periods on a monthly
+        # panel - the trading days in a month, on a panel whose observations are months -
+        # which is an embargo twenty-one times the declaration and longer than most of the
+        # samples it would be applied to.
+        embargo = embargo_from_buffer(
+            mds.label_buffer,
+            periods_per_year=int(setup["evaluation"]["periods_per_year"]),
+        )
+    # Two separate scales create the serial dependence the placebo has to preserve, and the
+    # block spans the longer of them: the overlapping labels span the label horizon, and the
+    # treatment's own construction window spans itself. Sizing by the horizon alone permutes
+    # a 126-session momentum column in blocks of 21, which is close enough to an independent
+    # shuffle that the p-value it produces does not mean what it reads as.
+    treatment_window_steps = _treatment_persistence_steps(setup, treatment)
+    if treatment_window_steps is None:
+        # A canonical run refuses rather than warns. A warning still leaves a registered
+        # result whose refutation is weaker than it reads, and nothing downstream can tell
+        # it from one whose block was sized correctly.
+        #
+        # Preview keeps the warning. That tier exists to run reduced and be thrown away, so
+        # failing it would block CI on every case study that has not declared a window yet
+        # without protecting any registered number.
+        if tier is not ExecutionTier.PREVIEW:
+            raise ValueError(
+                f"{study.case_study}: no construction window is declared for treatment "
+                f"{treatment!r}, so the placebo block would span only the label buffer "
+                f"({buffer_steps} bars). Set `causal.treatment_window` in setup.yaml to the "
+                "number of bars the treatment's own construction spans, read off the code "
+                "that builds the column rather than its name. A canonical refutation will "
+                "not be registered against a block that cannot be shown to span the "
+                "treatment. One bar is a valid answer for a column built from quantities "
+                "carrying the row's own timestamp, and is how it is said."
+            )
+        warnings.warn(
+            f"{study.case_study}: no construction window is declared for treatment "
+            f"{treatment!r}, so the placebo block spans only the label buffer "
+            f"({buffer_steps} bars). If the treatment is a rolling statistic, set "
+            "`causal.treatment_window` in setup.yaml so the block can span it.",
+            UserWarning,
+            stacklevel=2,
+        )
+    block_size = max(buffer_steps, treatment_window_steps or 1)
+    block_size_basis = (
+        "treatment_window" if block_size == treatment_window_steps else "label_buffer"
+    )
     nuisance_params = _resolve_nuisance_params(config, request["overrides"], seed)
     key_frame = analysis.select(mds.entity_cols[0], mds.date_col)
     if key_frame.n_unique([mds.entity_cols[0], mds.date_col]) != key_frame.height:
@@ -1340,7 +1517,7 @@ def resolve_causal_request(study: Study, request: dict[str, Any]):
             "treatment": treatment,
             "confounders": list(confounders),
             "treatment_observed_at": "decision_timestamp",
-            "outcome_horizon": str(outcome_delta),
+            "outcome_horizon": outcome_horizon_label,
             "holdout_endpoint_cutoff": endpoint_cutoff.isoformat(),
         },
         "cv": {
@@ -1360,7 +1537,18 @@ def resolve_causal_request(study: Study, request: dict[str, Any]):
         "refutation": {
             "method": "within_symbol_contiguous_block_permutation",
             "n_placebo": n_placebo,
-            "block_size": buffer_steps,
+            "block_size": block_size,
+            "block_size_basis": block_size_basis,
+            "label_buffer_steps": buffer_steps,
+            # The quantity the second-stage HAC bandwidth is sized by, restored here after the
+            # treatment-window work dropped it. It was emitted through e71730e4 and replaced by
+            # label_buffer_steps in e5604dff - not renamed, replaced: these are two different
+            # quantities, and the buffer is the CV gap, which is declared deliberately longer
+            # than the outcome it seals. Both are recorded now because a notebook comparing a
+            # block size against a bandwidth needs to name which scale it means. They coincide
+            # at 1 on crypto_perps_funding, which is why the substitution looked harmless.
+            "label_horizon_steps": outcome_horizon_steps,
+            "treatment_window_steps": treatment_window_steps,
             "seed": seed,
             "temporal_gap_policy": "reset",
             "observation_cadence": str(cadence),
@@ -1397,16 +1585,20 @@ def resolve_causal_request(study: Study, request: dict[str, Any]):
         n_folds=n_folds,
         embargo=embargo,
         n_placebo=n_placebo,
-        # The block takes the buffer and the bandwidth takes the outcome horizon.
-        # The block holds fixed the dependence the fold structure already keeps
-        # clear, which the buffer measures; the bandwidth corrects for outcomes
-        # that overlap, and how far one outcome reaches is the horizon. The two
-        # are equal wherever a case study declares them equal, which is most of
-        # them here, so the split changes no result until one of them declares a
-        # horizon shorter than its buffer. Newey-West is not monotonic in the
-        # bandwidth, so a bandwidth taken from the wrong quantity is not a known
-        # direction of error.
-        block_size=buffer_steps,
+        # The block takes the longer of the buffer and the treatment's construction
+        # window; the bandwidth takes the outcome horizon. The block holds fixed the
+        # dependence the permutation must preserve, and there are two sources of it:
+        # the fold structure keeps the overlapping labels clear, which the buffer
+        # measures, and the treatment's own rolling window carries dependence of its
+        # own for as long as it spans. The bandwidth corrects for outcomes that
+        # overlap, and how far one outcome reaches is the horizon. Newey-West is not
+        # monotonic in the bandwidth, so a bandwidth taken from the wrong quantity is
+        # not a known direction of error.
+        #
+        # This is the same number the spec registers above. They are derived once and
+        # passed to both, because a spec that records a block the analysis did not use
+        # is worse than either value alone.
+        block_size=block_size,
         seed=seed,
         horizon=outcome_horizon_steps,
         expected_step=cadence,
@@ -1414,6 +1606,25 @@ def resolve_causal_request(study: Study, request: dict[str, Any]):
         runtime_provenance=provenance,
     )
     return spec, context
+
+
+def _placebo_draws_json(refutation: dict) -> str | None:
+    """Serialize the placebo draws behind ``refutation_p``, or None when there are none.
+
+    ``causal_runs`` stored only the scalars - the p-value and the successful draw count -
+    so the permutation-distribution figure every causal notebook draws had no source in
+    the registry. Each notebook read ``ref.get("placebo_effects", [])`` from an in-memory
+    result, which is populated on the run that fits and empty on every reader afterwards,
+    so the figure rendered blank behind its guard while the prose described it.
+
+    The draws are the evidence for the refutation verdict, not a diagnostic byproduct: a
+    p-value cannot say whether the draws could have rejected at all, and the distribution
+    is what shows a reader the observed effect against what noise produces.
+    """
+    draws = refutation.get("placebo_effects")
+    if not draws:
+        return None
+    return json.dumps([float(value) for value in draws])
 
 
 def run_resolved_causal_request(
@@ -1427,6 +1638,7 @@ def run_resolved_causal_request(
 
     from case_studies.research.causal import CausalResult
     from case_studies.utils.registry.registration import (
+        check_causal_supersedes,
         declare_causal_supersedes,
     )
     from case_studies.utils.registry.registration import register_causal_run as register_record
@@ -1442,8 +1654,22 @@ def run_resolved_causal_request(
     except KeyError:
         cached = None
     if cached is not None:
-        if training_hash_from_spec(cached.spec) != causal_hash or not cached.complete:
-            raise ValueError(f"causal cache is incomplete or conflicts with {causal_hash}")
+        if training_hash_from_spec(cached.spec) != causal_hash:
+            raise ValueError(f"causal cache conflicts with {causal_hash}")
+        if not cached.complete:
+            # Serving it would make the first incomplete fit the last one: every later
+            # run reads this row and nothing recomputes what went missing. Saying which
+            # part is missing is what separates "delete this row and refit" from "the
+            # registry is corrupt", and the usual cause is a refutation whose placebo
+            # refits mostly failed.
+            raise ValueError(
+                f"causal row {causal_hash} is registered but incomplete - "
+                f"n_obs={cached.metrics.get('n_obs')}, "
+                f"effect={cached.metrics.get('dml_effect')}, "
+                f"refutation_p={cached.metrics.get('refutation_p')}, "
+                f"successful_placebos={cached.metrics.get('refutation_n_successful')}. "
+                "Delete the row and re-run; serving it would leave the gap permanent."
+            )
         if supersedes is not None:
             # The declaration has to land even when the fit does not re-run, because
             # that is the shape of the repair. A registry already holding two
@@ -1463,6 +1689,19 @@ def run_resolved_causal_request(
             )
         return cached
 
+    # Before the fit, not after it. The registry can already hold a current identity for
+    # this label that this run does not retire - the ordinary state whenever this module
+    # has been edited, since the spec carries a hash of the whole file - and the write
+    # refuses that. Asking now costs one read and names the hash to declare; asking at
+    # the write costs the fit and every placebo refit first. See #953.
+    check_causal_supersedes(
+        study.case_study,
+        causal_hash,
+        label=context.outcome_col,
+        tier=str(spec["execution_tier"]),
+        supersedes_hash=supersedes,
+        case_dir=study.storage_root(spec["execution_tier"]),
+    )
     nuisance_y = HistGradientBoostingRegressor(**context.nuisance_params)
     nuisance_t = HistGradientBoostingRegressor(**context.nuisance_params)
     thread_limit = int(
@@ -1514,6 +1753,7 @@ def run_resolved_causal_request(
         confounding_bias_pct=float(results["confounding_bias_pct"]),
         refutation_p=float(refutation_p) if refutation_p is not None else None,
         refutation_n_successful=int(refutation_n) if refutation_n is not None else None,
+        refutation_placebo_json=_placebo_draws_json(refutation),
         spec_json=canonical_json(spec),
         notebook="case_studies.utils.causal",
         started_at=results.get("started_at"),
@@ -1550,6 +1790,7 @@ def register_causal_run(
     max_samples: int | None = None,
     max_symbols: int | None = None,
     development_end: str | None = None,
+    config_name: str = "dml",
     notebook: str = "causal_dml",
     case_dir=None,
     started_at: str | None = None,
@@ -1603,9 +1844,30 @@ def register_causal_run(
     if development_end is not None:
         causal_params["development_end"] = development_end
 
+    # NOTE: this spec carries no `identity_version`, and `current_causal_identities` skips
+    # every row that lacks one. A run registered through this wrapper therefore lands in
+    # `causal_runs` and resolves to nothing - the label's current identity set comes back
+    # empty, and the notebook that reads it shows no result rather than an error.
+    #
+    # It cannot be fixed by stamping version 3 here: `project_training_identity` refuses a
+    # version-3 identity whose payload is not `ml4t.resolved-spec/v1`, which only
+    # `resolve_causal_request` produces. The fix is per notebook, converting it to the
+    # resolver, and `tests/test_causal_rows_are_resolvable.py` names the ones still to go.
+    #
+    # Measured across the nine registries on 2026-08-25: crypto 2/2 rows visible, cme 6/6
+    # and fx 3/3, all resolver-written; us_firm 0/3 and etfs 0/1, both wrapper-written.
+    # sp500_options' single row IS visible, but it was written before that notebook moved
+    # to this wrapper, so the row describes a path the notebook no longer takes and its
+    # next run registers an invisible one. Five notebooks call this; do not delete it when
+    # the first two convert.
+
+    # The preset name was a literal here while `case_studies/config/dml/` held one file.
+    # A case study that declares a different preset would otherwise record a spec naming a
+    # configuration it did not run, and no consumer could select its run by name. The default
+    # keeps the identity of every case study still on the shared preset unchanged.
     spec = build_training_spec(
         "causal_dml",
-        "dml",
+        config_name,
         label,
         n_folds=n_folds,
         causal_params=causal_params,
@@ -1635,6 +1897,7 @@ def register_causal_run(
         confounding_bias_pct=float(results.get("confounding_bias_pct", 0.0)),
         refutation_p=float(refutation_p) if refutation_p is not None else None,
         refutation_n_successful=int(refutation_n) if refutation_n is not None else None,
+        refutation_placebo_json=_placebo_draws_json(ref),
         spec_json=canonical_json(spec),
         notebook=notebook,
         started_at=started_at or results.get("started_at"),
