@@ -868,7 +868,23 @@
 19_risk_management/11_systematic_risk_sweep:
   timeout: 900
 20_strategy_synthesis/00_holdout_predictions:
-  skip_reason: Requires trained model registry (not available in CI test data)
+  # No `skip: true` ever stood above the skip_reason this replaces, so the notebook has
+  # always run; the reason was describing a state that had stopped being true. It also
+  # carried no timeout, so it inherited the 300s default while 01 and 03 next to it carry
+  # 600 - it had never been priced, only kept under the default by work it was not doing.
+  #
+  # It is doing that work now. Until #746 the seeded fixtures gave cme_futures' two cohort
+  # leaders a fabricated entity grid (the RuntimeWarning naming b099266d758c and
+  # fbeb779467d5 is in the last green run's log), the holdout retrain found nothing real to
+  # fit, and the cell finished in about 135s while stepping over the case study. Seeding
+  # those leaders from the case study's own label parquet makes the retrain run: measured
+  # here at 350s for cme_futures and 60s for sp500_equity_option_analytics against 426s for
+  # the whole loop, with every other case study in single figures. Measured at 590s in the
+  # ml4t image with the wider fixture panels of #749 on top.
+  #
+  # 1800s is three times the widest of those against a runner slower than either machine,
+  # the same ratio 11d_conditional_autoencoder's cap carries, and it absorbs #749.
+  timeout: 1800
 20_strategy_synthesis/01_aggregate_synthesis:
   parameters:
     # Isolated test registry has no nasdaq out-of-band cost-feasible carrier,
@@ -1030,7 +1046,6 @@
   long_running: true
   parameters:
     MAX_COMPANIES: 3
-  skip_reason: Needs GPU + Neo4j
   timeout: 1200
 24_autonomous_agents/01_react_reasoning:
   parameters:
@@ -1212,6 +1227,13 @@ case_studies/cme_futures/05_evaluation:
   # evaluates, and the reduction bought nothing: the panel is 38k rows either way.
   timeout: 600
 case_studies/cme_futures/06_linear:
+  # 120s is measured here, not copied. Slowest of 5 green `cs-cme_futures` runs of
+  # .github/workflows/test.yml sampled 2026-09-04: 15.1s, 13% of the budget, against
+  # 20.9s for the gbm sibling on its 180. The premise that the linear stage does more work
+  # than its gbm sibling holds for us_equities_panel, whose reduction leaves all three
+  # labels x 16 configurations; it does not hold here, where the preview reduction cuts the
+  # grid and the gbm run is the slower of the two in every case study measured. The tier is
+  # the one-third line the raised entries elsewhere in this file state.
   parameters:
     # Restored after #560, same removal as 07_gbm below. This one has been passing on its 120s
     # budget rather than failing, which is the reason to fix it now: it is mispriced in exactly
@@ -1389,6 +1411,13 @@ case_studies/crypto_perps_funding/05_evaluation:
     MAX_SYMBOLS: 5
   timeout: 300
 case_studies/crypto_perps_funding/06_linear:
+  # 120s is measured here, not copied. Slowest of 5 green `cs-crypto_perps_funding` runs of
+  # .github/workflows/test.yml sampled 2026-09-04: 19.8s, 17% of the budget, against
+  # 27.9s for the gbm sibling on its 180. The premise that the linear stage does more work
+  # than its gbm sibling holds for us_equities_panel, whose reduction leaves all three
+  # labels x 16 configurations; it does not hold here, where the preview reduction cuts the
+  # grid and the gbm run is the slower of the two in every case study measured. The tier is
+  # the one-third line the raised entries elsewhere in this file state.
   timeout: 120
 case_studies/crypto_perps_funding/07_gbm:
   timeout: 180
@@ -1496,6 +1525,13 @@ case_studies/etfs/05_evaluation:
   # re-narrows the cross-section that 04 was widened to preserve.
   timeout: 900
 case_studies/etfs/06_linear:
+  # 120s is measured here, not copied. Slowest of 5 green `cs-etfs` runs of
+  # .github/workflows/test.yml sampled 2026-09-04: 16.1s, 13% of the budget, against
+  # 22.9s for the gbm sibling on its 180. The premise that the linear stage does more work
+  # than its gbm sibling holds for us_equities_panel, whose reduction leaves all three
+  # labels x 16 configurations; it does not hold here, where the preview reduction cuts the
+  # grid and the gbm run is the slower of the two in every case study measured. The tier is
+  # the one-third line the raised entries elsewhere in this file state.
   # #560 moved this notebook onto the shared boundary and removed `MAX_FOLDS: 2` /
   # `MAX_SYMBOLS: 5` without replacing them, leaving a timeout that had been measured
   # against them. `_collect_preview_reductions` defaults `max_symbols: 5` when nothing is
@@ -1580,7 +1616,14 @@ case_studies/etfs/10_dl_tsmixer:
     POPULATION_NAME: etfs-tsmixer-preview
     PREVIEW_REDUCTIONS:
       folds: [0, 1]
-  timeout: 180
+  # Budget raised from 180 on a CI measurement, not on another notebook's number.
+  # Slowest of 5 green `cs-etfs` runs of .github/workflows/test.yml sampled 2026-09-04:
+  # 103.1s, 57% of the old budget. A budget a green run already fills is one
+  # contention band away from a timeout that reads as a notebook defect. The line is a
+  # third, because the only measurement anyone has of that band is the
+  # us_equities_panel/06_linear timeout this rule comes from: a notebook that fit in 120s
+  # idle, did not fit in 120s loaded, and passed at 300.
+  timeout: 360
 case_studies/etfs/10a_dl_nlinear:
   # Without a block here the notebook runs as a preview that declares no reduction, which
   # `run_model_population` refuses outright, so an absent entry is a failed job rather than a
@@ -1636,7 +1679,14 @@ case_studies/etfs/11b_ipca:
       folds: [0, 1]
       max_symbols: 5
       n_factors: 1
-  timeout: 300
+  # Budget raised from 300 on a CI measurement, not on another notebook's number.
+  # Slowest of 5 green `cs-etfs` runs of .github/workflows/test.yml sampled 2026-09-04:
+  # 251.9s, 84% of the old budget. A budget a green run already fills is one
+  # contention band away from a timeout that reads as a notebook defect. The line is a
+  # third, because the only measurement anyone has of that band is the
+  # us_equities_panel/06_linear timeout this rule comes from: a notebook that fit in 120s
+  # idle, did not fit in 120s loaded, and passed at 300.
+  timeout: 780
 case_studies/etfs/11_latent_factors:
   gpu: true
   timeout: 900
@@ -1749,6 +1799,13 @@ case_studies/fx_pairs/05_evaluation:
     MAX_SYMBOLS: 5
   timeout: 300
 case_studies/fx_pairs/06_linear:
+  # 120s is measured here, not copied. Slowest of 5 green `cs-fx_pairs` runs of
+  # .github/workflows/test.yml sampled 2026-09-04: 17.2s, 14% of the budget, against
+  # 22.7s for the gbm sibling on its 180. The premise that the linear stage does more work
+  # than its gbm sibling holds for us_equities_panel, whose reduction leaves all three
+  # labels x 16 configurations; it does not hold here, where the preview reduction cuts the
+  # grid and the gbm run is the slower of the two in every case study measured. The tier is
+  # the one-third line the raised entries elsewhere in this file state.
   # Restores the reduction #560 removed. It dropped MAX_FOLDS: 2 / MAX_SYMBOLS: 5 when the
   # stage moved onto the shared boundary and left the timeout priced for them, so since
   # 2026-08-20 this has run all 8 folds over all 20 pairs on a budget measured against 2 and 5.
@@ -1780,7 +1837,14 @@ case_studies/fx_pairs/09_dl_tcn:
     MAX_FOLDS: 2
     MAX_SYMBOLS: 5
     N_EPOCHS: 1
-  timeout: 180
+  # Budget raised from 180 on a CI measurement, not on another notebook's number.
+  # Slowest of 5 green `cs-fx_pairs` runs of .github/workflows/test.yml sampled 2026-09-04:
+  # 104.7s, 58% of the old budget. A budget a green run already fills is one
+  # contention band away from a timeout that reads as a notebook defect. The line is a
+  # third, because the only measurement anyone has of that band is the
+  # us_equities_panel/06_linear timeout this rule comes from: a notebook that fit in 120s
+  # idle, did not fit in 120s loaded, and passed at 300.
+  timeout: 360
 case_studies/fx_pairs/10_dl_nlinear:
   parameters:
     BATCH_SIZE: 256
@@ -1876,6 +1940,7 @@ case_studies/nasdaq100_microstructure/02_labels:
   timeout: 120
 case_studies/nasdaq100_microstructure/03_financial_features:
   parameters:
+    MAX_SYMBOLS: 5
     START_DATE: '2000-01-01'
   timeout: 120
 case_studies/nasdaq100_microstructure/04_model_based_features:
@@ -1922,50 +1987,86 @@ case_studies/nasdaq100_microstructure/07_gbm:
   tier: weekly
   timeout: 900
 case_studies/nasdaq100_microstructure/08_dl_nlinear:
-  # The CPU CI image has no CUDA and this case study declares gpu for production. DEVICE
-  # is passed so the run is registered as the CPU run it is, rather than skipped.
+  # Converted onto the research boundary, so BATCH_SIZE, LOOKBACK, MAX_FOLDS, MAX_SYMBOLS and
+  # N_EPOCHS name nothing this notebook binds any more: the window and the batch come from the
+  # preset, the epoch budget from tests/preset_patches.py (two epochs at checkpoint_interval
+  # one), and a sample reduction reaches the notebook only under PREVIEW_REDUCTIONS.
+  # DEVICE and POPULATION_NAME travel together: the device is inside the training identity, so
+  # a CPU run declares a different member set and must name its own population rather than
+  # publish into the canonical one. The CPU CI image has no CUDA and this case study declares
+  # gpu for production.
+  # max_train_sequences is what keeps this affordable on a minute panel, where five symbols of
+  # a fold still hold six figures of overlapping windows. It is a reduction below the declared
+  # `modeling.dl.max_train_sequences`, which a preview may lower and cannot raise.
   parameters:
-    BATCH_SIZE: 32
     DEVICE: cpu
-    LOOKBACK: 5
-    MAX_FOLDS: 2
-    MAX_SYMBOLS: 5
-    N_EPOCHS: 1
+    POPULATION_NAME: nasdaq100_microstructure-nlinear-preview
+    PREVIEW_REDUCTIONS:
+      folds: [0, 1]
+      max_symbols: 5
+      max_train_sequences: 2000
   timeout: 600
 case_studies/nasdaq100_microstructure/09_dl_lstm:
-  # The CPU CI image has no CUDA and this case study declares gpu for production. DEVICE
-  # is passed so the run is registered as the CPU run it is, rather than skipped.
+  # Converted onto the research boundary, so BATCH_SIZE, LOOKBACK, MAX_FOLDS, MAX_SYMBOLS and
+  # N_EPOCHS name nothing this notebook binds any more: the window and the batch come from the
+  # preset, the epoch budget from tests/preset_patches.py (two epochs at checkpoint_interval
+  # one), and a sample reduction reaches the notebook only under PREVIEW_REDUCTIONS.
+  # DEVICE and POPULATION_NAME travel together: the device is inside the training identity, so
+  # a CPU run declares a different member set and must name its own population rather than
+  # publish into the canonical one. The CPU CI image has no CUDA and this case study declares
+  # gpu for production.
+  # max_train_sequences is what keeps this affordable on a minute panel, where five symbols of
+  # a fold still hold six figures of overlapping windows. It is a reduction below the declared
+  # `modeling.dl.max_train_sequences`, which a preview may lower and cannot raise.
   parameters:
-    BATCH_SIZE: 32
     DEVICE: cpu
-    LOOKBACK: 5
-    MAX_FOLDS: 2
-    MAX_SYMBOLS: 5
-    N_EPOCHS: 1
+    POPULATION_NAME: nasdaq100_microstructure-lstm_h64-preview
+    PREVIEW_REDUCTIONS:
+      folds: [0, 1]
+      max_symbols: 5
+      max_train_sequences: 2000
   timeout: 600
 case_studies/nasdaq100_microstructure/10_dl_tcn:
-  # The CPU CI image has no CUDA and this case study declares gpu for production. DEVICE
-  # is passed so the run is registered as the CPU run it is, rather than skipped.
+  # Converted onto the research boundary, so BATCH_SIZE, LOOKBACK, MAX_FOLDS, MAX_SYMBOLS and
+  # N_EPOCHS name nothing this notebook binds any more: the window and the batch come from the
+  # preset, the epoch budget from tests/preset_patches.py (two epochs at checkpoint_interval
+  # one), and a sample reduction reaches the notebook only under PREVIEW_REDUCTIONS.
+  # DEVICE and POPULATION_NAME travel together: the device is inside the training identity, so
+  # a CPU run declares a different member set and must name its own population rather than
+  # publish into the canonical one. The CPU CI image has no CUDA and this case study declares
+  # gpu for production.
+  # max_train_sequences is what keeps this affordable on a minute panel, where five symbols of
+  # a fold still hold six figures of overlapping windows. It is a reduction below the declared
+  # `modeling.dl.max_train_sequences`, which a preview may lower and cannot raise.
   parameters:
-    BATCH_SIZE: 32
     DEVICE: cpu
-    LOOKBACK: 5
-    MAX_FOLDS: 2
-    MAX_SYMBOLS: 5
-    N_EPOCHS: 1
+    POPULATION_NAME: nasdaq100_microstructure-tcn-preview
+    PREVIEW_REDUCTIONS:
+      folds: [0, 1]
+      max_symbols: 5
+      max_train_sequences: 2000
   timeout: 600
 case_studies/nasdaq100_microstructure/11_dl_patchtst:
-  # Needs CUDA: MAX_SYMBOLS=5 of a 15-minute panel is ~26x the rows of the
-  # daily-frequency patchtst notebooks, which share these parameters and
-  # finish in under 180s. On CPU this overruns any sane cell timeout (measured
-  # 625s against a 600s budget); on GPU it completes in 155s.
-  gpu: true
+  # Converted onto the research boundary alongside 08 through 10, so the same five names are
+  # gone for the same reasons; see 08_dl_nlinear above.
+  # `gpu: true` is dropped with them. It was there because CPU overran a 600s budget at 625s
+  # with LOOKBACK=24 and no sequence cap, and what it did in exchange was skip this test on
+  # every runner without a card - which is all of them - so the attention architecture had no
+  # coverage at all. The declared cap is what makes CPU affordable: the run is bounded by
+  # max_train_sequences rather than by the panel, so it no longer scales with the fixture.
   parameters:
-    BATCH_SIZE: 32
-    LOOKBACK: 24
-    MAX_FOLDS: 2
-    MAX_SYMBOLS: 5
-    N_EPOCHS: 1
+    DEVICE: cpu
+    POPULATION_NAME: nasdaq100_microstructure-patchtst-preview
+    PREVIEW_REDUCTIONS:
+      folds: [0, 1]
+      max_symbols: 5
+      max_train_sequences: 2000
+      # The training cap bounded the fit and left the forward pass over validation
+      # scaling with the panel, which is why this cell sat at its 600s budget while
+      # nlinear, lstm and tcn finished in 92-94s: patchtst pays the most per window
+      # and was scoring every one of them. Matched to the training cap, three orders
+      # below the panel, and above the symbol count so the cross-section is intact.
+      max_predict_sequences: 2000
   timeout: 600
 case_studies/nasdaq100_microstructure/12_causal_dml:
   parameters:
@@ -1989,6 +2090,12 @@ case_studies/nasdaq100_microstructure/13_model_analysis:
     # are here, makes the notebook refuse a family it cannot check.
     LINEAR_POPULATION: nasdaq100_microstructure-fixture-linear-validation-v1
     GBM_POPULATION: nasdaq100_microstructure-fixture-gbm-validation-v1
+    # The four sequence populations, added when 08 through 11 converted onto the research
+    # boundary and began publishing one population each. Same prefix and the same reason.
+    NLINEAR_POPULATION: nasdaq100_microstructure-fixture-nlinear-validation-v1
+    LSTM_POPULATION: nasdaq100_microstructure-fixture-lstm_h64-validation-v1
+    TCN_POPULATION: nasdaq100_microstructure-fixture-tcn-validation-v1
+    PATCHTST_POPULATION: nasdaq100_microstructure-fixture-patchtst-validation-v1
   timeout: 300
 case_studies/nasdaq100_microstructure/14_backtest:
   parameters:
@@ -2002,7 +2109,14 @@ case_studies/nasdaq100_microstructure/14_backtest:
     TOP_N_PREDICTIONS: 2
   # Doubled with the universe. The slot grid does not widen with the ceiling, so this run
   # prices twice the names over the same number of schemes.
-  timeout: 360
+  # Budget raised from 360 on a CI measurement, not on another notebook's number.
+  # Slowest of 6 green `cs-nasdaq100_microstructure` runs of .github/workflows/test.yml sampled 2026-09-04:
+  # 354.1s, 98% of the old budget. A budget a green run already fills is one
+  # contention band away from a timeout that reads as a notebook defect. The line is a
+  # third, because the only measurement anyone has of that band is the
+  # us_equities_panel/06_linear timeout this rule comes from: a notebook that fit in 120s
+  # idle, did not fit in 120s loaded, and passed at 300.
+  timeout: 1080
 case_studies/nasdaq100_microstructure/15_portfolio_management:
   parameters:
     # Same constraint as 14_backtest above, and the widened fixture relaxes it.
@@ -2045,6 +2159,13 @@ case_studies/sp500_equity_option_analytics/05_evaluation:
     MAX_SYMBOLS: 5
   timeout: 300
 case_studies/sp500_equity_option_analytics/06_linear:
+  # 120s is measured here, not copied. Slowest of 5 green `cs-sp500_equity_option_analytics` runs of
+  # .github/workflows/test.yml sampled 2026-09-04: 20.0s, 17% of the budget, against
+  # 31.9s for the gbm sibling on its 180. The premise that the linear stage does more work
+  # than its gbm sibling holds for us_equities_panel, whose reduction leaves all three
+  # labels x 16 configurations; it does not hold here, where the preview reduction cuts the
+  # grid and the gbm run is the slower of the two in every case study measured. The tier is
+  # the one-third line the raised entries elsewhere in this file state.
   timeout: 120
 case_studies/sp500_equity_option_analytics/07_gbm:
   timeout: 180
@@ -2318,12 +2439,26 @@ case_studies/sp500_options/04_model_based_features:
   parameters:
     SV_N_PARTICLES: 100
     SV_POOL_SIZE: 2
-  timeout: 1800
+  # Budget raised from 1800 on a CI measurement, not on another notebook's number.
+  # Slowest of 5 green `cs-sp500_options` runs of .github/workflows/test.yml sampled 2026-09-04:
+  # 903.5s, 50% of the old budget. A budget a green run already fills is one
+  # contention band away from a timeout that reads as a notebook defect. The line is a
+  # third, because the only measurement anyone has of that band is the
+  # us_equities_panel/06_linear timeout this rule comes from: a notebook that fit in 120s
+  # idle, did not fit in 120s loaded, and passed at 300.
+  timeout: 2760
 case_studies/sp500_options/05_evaluation:
   parameters:
     MAX_SYMBOLS: 5
   timeout: 300
 case_studies/sp500_options/06_linear:
+  # 120s is measured here, not copied. Slowest of 5 green `cs-sp500_options` runs of
+  # .github/workflows/test.yml sampled 2026-09-04: 22.8s, 19% of the budget, against
+  # 33.1s for the gbm sibling on its 180. The premise that the linear stage does more work
+  # than its gbm sibling holds for us_equities_panel, whose reduction leaves all three
+  # labels x 16 configurations; it does not hold here, where the preview reduction cuts the
+  # grid and the gbm run is the slower of the two in every case study measured. The tier is
+  # the one-third line the raised entries elsewhere in this file state.
   # The reductions these budgets were measured against, restored. #446 removed
   # NUM_BOOST_ROUND and #560 removed MAX_FOLDS and MAX_SYMBOLS from both entries, in each case
   # because the notebook could no longer receive that parameter - and left the timeouts, which
@@ -2746,6 +2881,13 @@ case_studies/us_firm_characteristics/04_evaluation:
     MAX_SYMBOLS: 5
   timeout: 300
 case_studies/us_firm_characteristics/05_linear:
+  # 120s is measured here, not copied. Slowest of 5 green `cs-us_firm_characteristics` runs of
+  # .github/workflows/test.yml sampled 2026-09-04: 13.9s, 12% of the budget, against
+  # 16.8s for the gbm sibling on its 180. The premise that the linear stage does more work
+  # than its gbm sibling holds for us_equities_panel, whose reduction leaves all three
+  # labels x 16 configurations; it does not hold here, where the preview reduction cuts the
+  # grid and the gbm run is the slower of the two in every case study measured. The tier is
+  # the one-third line the raised entries elsewhere in this file state.
   parameters:
     # Restored after #560 removed MAX_FOLDS/MAX_SYMBOLS and left the timeout that had
     # been measured against them, so this preview had been fitting the full declared
