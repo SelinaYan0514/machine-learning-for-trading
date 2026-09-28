@@ -14,22 +14,65 @@
 # ---
 
 # %% [markdown]
-# # US Equities Panel: Alternative Position Sizing
+# # US equities panel: the same names, sized differently
 #
-# The equal-weight baseline supplies a complete immutable population. Within each label, this
-# notebook ranks baseline validation Sharpe, retains one checkpoint and signal decision per
-# distinct model configuration, and applies every declared alternative sizing method. Equal weight
-# is excluded because it is the baseline and would produce the same backtest identity.
+# [`16_backtest`](16_backtest.ipynb) put the same amount of money in every position. That is the
+# plainest rule there is, and it embeds an assumption worth naming: that a stock the model ranked
+# first and a stock it ranked fiftieth deserve the same capital, and that a quiet stock and a
+# violent one do too.
 #
-# **Learning objectives**
+# This notebook keeps the names and changes only the money. The model, the checkpoint, the
+# rebalancing dates and which stocks are held are all held fixed; what varies is how much goes into
+# each. Every allocator declared in `config/setup.yaml` is applied, and they answer the question
+# in three different ways:
 #
-# - Derive the allocation shortlist from complete equal-weight validation results.
-# - Hold model, checkpoint, and signal decisions fixed while changing position sizing.
-# - Plan, execute, and validate the complete alternative-sizing population.
+# - **From the prediction.** `score_weighted` gives more capital to the names the model was more
+#   confident about, so it trusts the magnitude of a prediction and not only its order.
+#   `conformal_weighted` reads the prediction's uncertainty rather than its size: it weights each
+#   name by one over the width of its prediction interval, so a name the model is less sure about
+#   gets less capital. The width is floored at the first percentile of that date's own
+#   cross-section before the reciprocal is taken, which keeps an unusually confident name from
+#   taking the whole leg and uses no width from a later date to do it. That is the same width whose
+#   calibration [`15_model_analysis`](15_model_analysis.ipynb) checked, which is why the check
+#   there matters here.
+# - **From each stock's own volatility.** `inverse_vol` puts less into a stock that moves more, so
+#   each position contributes a similar amount of variation rather than a similar amount of money.
+#   `risk_parity` as implemented here is the same idea with a steeper exponent on volatility,
+#   which approximates equal risk contribution without estimating how the stocks move together.
+# - **From how the stocks move together.** `mvo_ledoit_wolf` and `hrp` read a covariance matrix, so
+#   they alone can tell that two names which always move together are one bet held twice. That is
+#   the property none of the rules above can see, and it is the one that has to be estimated. These
+#   two need history before they can decide anything, and how much is declared per allocator rather
+#   than assumed.
 #
-# **Book reference**: Chapter 17, Sections 17.2-17.8
+# **Equal weight is excluded here because its backtest already exists.** It is the baseline every
+# row is measured against, and [`16_backtest`](16_backtest.ipynb) ran it.
 #
-# **Prerequisites**: `16_backtest.py` publishes the compatible equal-weight baseline sets.
+# **A shortlist is taken first, and that is a real decision.** Applying every allocator to every
+# member of the whole model population would multiply an already large grid by seven. So the
+# highest validation Sharpe per distinct model configuration is carried forward, which means the
+# allocator comparison is made on strategies the equal-weight rule already liked. An allocator that
+# rescues a model equal weight buried is not something this design can find.
+#
+# **Learning objectives.** By the end of this notebook you will be able to:
+#
+# - Name the assumption an equal-weight book makes about its positions, and say what each family
+#   of allocator replaces it with.
+# - Say what a covariance-reading allocator can see that a per-stock one cannot, what it needs in
+#   exchange, and which of the declared allocators actually read one.
+# - Explain why a lookback window is declared per allocator rather than shared, and what a shared
+#   one would silently do to the ones that need less.
+# - State what a shortlist taken on baseline Sharpe makes it impossible for this comparison to
+#   discover.
+#
+# **Book reference**: Chapter 17, Sections 17.2 to 17.8.
+#
+# **Prerequisites**: [`16_backtest`](16_backtest.ipynb) has frozen the equal-weight baseline sets
+# this notebook draws from.
+#
+# **What it writes**: one validation backtest per surviving configuration and allocator, in
+# `run_log/registry.db`, frozen as one named allocation set per label.
+# [`18_risk_management`](18_risk_management.ipynb) reads them next.
 
 # %%
 """Generate the US-equities allocation-stage validation population."""
@@ -44,9 +87,10 @@ import polars as pl
 from case_studies.research import (
     CandidateSet,
     OfficialPopulation,
-    Study,
+    candidate_set_supersedes,
     open_study,
     plan_backtests,
+    population_supersedes,
     run_backtests,
 )
 from case_studies.research.strategy import strategy_warmup_periods
@@ -54,47 +98,61 @@ from case_studies.utils.backtest_loaders import (
     get_backtest_config,
     load_backtest_prices_for,
 )
+from case_studies.utils.notebook_contracts import degenerate_prediction_hashes
 from case_studies.utils.sweep_config import (
     get_allocators,
     get_checkpoints_per_config,
     get_top_n_predictions,
+    top_n_cap,
 )
-from utils.paths import REPO_ROOT
+from utils.style import add_message_title, ml4t_palette, show_with_alt, zero_line
 
 # %% tags=["parameters"]
 CASE_STUDY_ID = "us_equities_panel"
 BASELINE_SET_NAMES = [
     "us-equities-fwd-ret-1d-baseline-v1",
-    "us-equities-fwd-ret-5d-baseline-v1",
-    "us-equities-fwd-ret-21d-baseline-v1",
 ]
 EXECUTION_TIER = "canonical"
-WORKSPACE = "experiments"
+POPULATION_NAME = ""
+SUPERSEDES_POPULATION = ""
+SUPERSEDES_SETS: dict = {}
+# Empty means this run writes to the case study's own store, which is what canonical
+# production execution wants. Any other value routes the run's writes there instead, at
+# either tier, and is how a rehearsal at full scale is compared against the published
+# result without being able to damage it.
+WORKSPACE = ""
 PREVIEW_LABELS = []
 PREVIEW_MAX_BASELINE_ROWS = 0
 PREVIEW_MAX_ALLOCATORS = 0
 MAX_SYMBOLS = 0
+# None means the width `setup.yaml` declares; an int overrides it. Declared here because
+# papermill only binds a name the parameters cell already holds - a run that passes
+# TOP_N_PREDICTIONS to a notebook without it sweeps the declared width and exits 0.
+TOP_N_PREDICTIONS = None
 
 # %% [markdown]
-# ## Open and validate the baseline population
+# ## 2. The baseline this notebook varies
 #
-# Canonical execution resolves the named sets produced by the baseline notebook. A reduced proof
-# selects preview baseline rows by visible labels and explicit row, allocator, and symbol limits.
+# The equal-weight sets are opened and checked complete. Everything below changes one thing about
+# them, so a gap here would silently narrow what the allocator comparison is made over.
+
+# %% [markdown]
+# Both tiers resolve the study through `open_study`. It reads the labels and features in place and
+# redirects only writes, so a preview run scores the same inputs a canonical one does and cannot
+# publish over it.
 
 # %%
-# Both tiers resolve the study through `open_study`, never `Study.open`/`Study.regenerate`
-# directly. In a maintainer worktree the generated directories are symlinks to shared data, and
-# `open_study` handles that by reading inputs in place - `root` stays the release case directory
-# and only writes are redirected to the workspace. `Study.open(workspace=...)` instead puts `root`
-# inside the workspace, so `source = self.root / "labels"` (workspace.py:274) resolves somewhere
-# else and `_ensure_input_link` rejects the link a sibling notebook already made. Two notebooks in
-# one session then cannot both open a preview workspace.
+workspace_override = os.environ.get("ML4T_OUTPUT_DIR") or WORKSPACE
 if EXECUTION_TIER == "canonical":
     if PREVIEW_LABELS or PREVIEW_MAX_BASELINE_ROWS or PREVIEW_MAX_ALLOCATORS or MAX_SYMBOLS:
         raise ValueError("Canonical execution cannot declare preview reductions")
     if not BASELINE_SET_NAMES or len(BASELINE_SET_NAMES) != len(set(BASELINE_SET_NAMES)):
         raise ValueError("Canonical execution requires unique named baseline sets")
-    study = open_study(CASE_STUDY_ID, execution_tier=EXECUTION_TIER)
+    study = open_study(
+        CASE_STUDY_ID,
+        execution_tier=EXECUTION_TIER,
+        workspace=Path(workspace_override) if workspace_override else None,
+    )
 elif EXECUTION_TIER == "preview":
     if (
         not PREVIEW_LABELS
@@ -108,16 +166,17 @@ elif EXECUTION_TIER == "preview":
     study = open_study(
         CASE_STUDY_ID,
         execution_tier=EXECUTION_TIER,
-        workspace=Path(os.environ.get("ML4T_OUTPUT_DIR") or WORKSPACE),
+        workspace=Path(workspace_override or "experiments"),
     )
 else:
     raise ValueError(f"Unsupported execution tier: {EXECUTION_TIER!r}")
 
 # %% [markdown]
-# ## Select eligible baseline rows
+# ## 3. Which baseline rows can be re-sized
 #
-# Canonical rows come from the named immutable sets. Preview rows use the visible label and row
-# limits declared above.
+# Complete, validation-split, and produced under this run's tier. A row failing any of those is
+# refused rather than dropped, so the shortlist below is taken from a population that means what it
+# says.
 
 # %%
 backtest_catalog = study.backtests.table(include_preview=True)
@@ -156,14 +215,50 @@ if baseline.is_empty() or not ineligible.is_empty():
     raise ValueError("Allocation requires complete finite equal-weight validation rows")
 
 # %% [markdown]
-# ## Select the declared baseline survivors
+# ## 3b. The rows that rank but do not forecast
 #
-# `top_n` counts distinct `(family, config_name)` pairs within each label. Sorting first retains the
-# exact prediction checkpoint and equal-weight signal decision associated with the highest baseline
-# validation Sharpe for that model configuration.
+# A regularized linear model that shrinks every coefficient to zero on a fold predicts one
+# constant for that fold. The backtest still runs: a constant score ranks nothing, so the
+# top-k rule holds whichever names the tie-break leaves on top and the book turns into a slow
+# buy-and-hold. That book has a *good*-looking Sharpe here, because it trades 5,761 times
+# instead of 121,521 and so pays almost none of the costs that dominate every real member.
+#
+# **This is an exclusion, not a refusal.** The rows above are legitimate members of the
+# baseline population and the sweep that produced them has no degeneracy filter of its own -
+# the same gap `nasdaq100_microstructure/14_backtest` closes at the point of use. What must not
+# happen is that they reach a leaderboard: `selectable_validation_candidates` already refuses
+# them when it resolves the carrier, so without this the allocator comparison and the carrier
+# pool would disagree about which configurations exist.
+
+# %%
+degenerate = degenerate_prediction_hashes(study.root)
+excluded = baseline.filter(pl.col("prediction_hash").is_in(degenerate))
+baseline = baseline.filter(~pl.col("prediction_hash").is_in(degenerate))
+if baseline.is_empty():
+    raise ValueError("Every baseline row is a constant-prediction set")
+print(
+    f"{excluded.height} of {excluded.height + baseline.height} baseline rows excluded as "
+    f"constant-prediction sets, leaving {baseline.height}"
+)
+excluded.select("label", "family", "config_name", "prediction_hash", "sharpe", "max_drawdown")
+
+# %% [markdown]
+# ## 4. The shortlist, and what it costs
+#
+# One row per distinct model configuration, taken on baseline Sharpe. Without it every allocator
+# would be applied to every member of the whole model population, multiplying an already large grid
+# by the number of allocators.
+#
+# **What that makes invisible is worth stating plainly.** The allocators are compared only on
+# strategies the equal-weight rule already ranked highly. An allocator whose value is precisely
+# that it rescues a model equal weight buried cannot be discovered by this design, and no result
+# below is evidence against one existing.
 
 # %% tags=["results"]
-top_n = get_top_n_predictions(CASE_STUDY_ID, "allocation")
+if TOP_N_PREDICTIONS is None:
+    TOP_N_PREDICTIONS = get_top_n_predictions(CASE_STUDY_ID, "allocation")
+top_n = TOP_N_PREDICTIONS
+label_cap = top_n_cap(top_n)
 checkpoints_per_config = get_checkpoints_per_config(CASE_STUDY_ID)
 if checkpoints_per_config != 1:
     raise ValueError(
@@ -176,13 +271,18 @@ for label in baseline.get_column("label").unique().sort().to_list():
     ranked = baseline.filter(pl.col("label") == label).sort(
         "sharpe", "backtest_hash", descending=[True, False]
     )
-    shortlist_parts.append(
-        ranked.unique(
-            subset=["family", "config_name"],
-            keep="first",
-            maintain_order=True,
-        ).head(top_n)
+    per_label = ranked.unique(
+        subset=["family", "config_name"],
+        keep="first",
+        maintain_order=True,
     )
+    # `top_n` of 0 asks for every configuration, as `top_n_predictions.signal` does in this
+    # setup.yaml. Passed straight to `.head` it means the opposite, and the empty shortlist
+    # then failed below as "the equal-weight baseline produced no allocation survivors",
+    # blaming the baseline for a width the caller declared.
+    if label_cap is not None:
+        per_label = per_label.head(label_cap)
+    shortlist_parts.append(per_label)
 shortlist = pl.concat(shortlist_parts).sort("label", "sharpe", descending=[False, True])
 if shortlist.is_empty():
     raise RuntimeError("The equal-weight baseline produced no allocation survivors")
@@ -199,21 +299,33 @@ shortlist.select(
 )
 
 # %% [markdown]
-# ## Plan every alternative sizing member
+# ## 5. Planning one backtest per allocator
 #
-# The selected baseline row supplies the prediction and signal decision. The only new decision is
-# position sizing. Every planned identity is snapshotted before execution so an unsuccessful member
-# cannot disappear from the allocation population.
+# Each surviving configuration crossed with each declared allocator, every identity written down
+# before the first runs.
+#
+# **The history each allocator needs is declared per allocator, not shared.** The methods that read
+# a covariance matrix cannot decide anything until they have enough bars to estimate one, and the
+# amount differs between them - the mean-variance method here declares a longer window than the
+# others because shrinkage on a matrix estimated from too few observations pulls it all the way to
+# its target and hands back something close to equal weight under a different name. Each allocator
+# therefore declares the history it needs, and is measured on that.
+#
+# `SUPERSEDES_POPULATION` and `SUPERSEDES_SETS` name the generation this run replaces. A population
+# and a candidate set are both immutable, so a re-run that admits different members has to say
+# which snapshot it supersedes or the registry refuses the write. Both default to empty, which is
+# right for a first run and for a reader's clean clone; `population_supersedes` and
+# `candidate_set_supersedes` withhold a declared hash wherever offering it would be refused.
+
+# %% [markdown]
+# **Prices are cached by label and warmup, not once per label.** Each allocator needs a different
+# amount of history before it can decide anything - none for the ones that read only the
+# predictions, a volatility window for the per-stock ones, a longer lookback for the ones that
+# estimate a covariance matrix - and the price frame a member was handed is digested into that
+# member's identity. So the frame has to be the one that member's own warmup implies, and the
+# cache key is what keeps it that way while still loading each distinct frame once.
 
 # %%
-# Prices are cached by (label, warmup) rather than loaded once per label. Strategy._build_spec
-# (research/strategy.py:389) digests exactly the frame it is handed, and strategy_warmup_periods
-# (:201-211) resolves a different prefix per allocator: 0 for the non-moment methods, vol_window
-# for inverse_vol / risk_parity / hrp, lookback for mvo and mvo_ledoit_wolf. Handing every member
-# of a label the same 126-bar frame stamps a price digest that 20_strategy_analysis recomputes at
-# the member's own warmup (20:157-169) and then rejects as "does not use canonical validation
-# prices" - and lifecycle.evaluate_holdout (lifecycle.py:342-368) applies the same rule, so the
-# holdout inherits it. cme_futures/research_workflow.py:674-682 caches on the same key.
 _price_cache: dict[tuple[str, int], object] = {}
 
 
@@ -305,9 +417,13 @@ if planned_population.get_column("backtest_hash").n_unique() != planned_populati
 
 official_population = None
 if EXECUTION_TIER == "canonical":
+    population_name = POPULATION_NAME or "us-equities-allocation-v1"
     official_population = OfficialPopulation.create(
         study,
-        name="us-equities-allocation-v1",
+        name=population_name,
+        supersedes=population_supersedes(
+            study, name=population_name, declared=SUPERSEDES_POPULATION
+        ),
         member_kind="backtest",
         members=tuple(planned_population.get_column("backtest_hash")),
     )
@@ -315,10 +431,10 @@ if EXECUTION_TIER == "canonical":
 planned_population
 
 # %% [markdown]
-# ## Execute the planned members
+# ## 6. Running them
 #
-# Each selected prediction row is passed directly to the shared runner. Completed siblings remain
-# reusable if another sizing member fails, and the notebook raises after attempting the full pass.
+# Independent per member, so a failure costs that allocator on that configuration and leaves the
+# rest usable.
 
 # %%
 execution_rows = []
@@ -397,10 +513,15 @@ if official_population is not None:
 execution_diagnostics
 
 # %% [markdown]
-# ## Freeze the reader-facing allocation sets
+# ## 7. Naming the allocation sets
 #
-# Each label gets one immutable set of alternative sizing results. Costs and risk controls derive
-# their inputs from the union of the matching baseline and allocation sets.
+# One frozen set per label, published only by an unnarrowed canonical run, for the reason
+# [`16_backtest`](16_backtest.ipynb) gives.
+#
+# **The freeze is also the comparability check.** Nothing is declared comparable, so
+# `CandidateSet.create` requires every field of the protocol to be identical across the members:
+# two rows that measured their Sharpe on different folds are not two rankings of one thing, and
+# this is what refuses to freeze them together.
 
 # %% tags=["results"]
 set_rows = []
@@ -418,18 +539,13 @@ if (
 if EXECUTION_TIER == "canonical":
     for label in completed.get_column("label").unique().sort().to_list():
         label_name = label.replace("_", "-")
-        # No comparison_contract, matching cme_futures/research_workflow.py:811, which builds the
-        # same per-label pool across the full funnel and declares nothing. An empty contract makes
-        # every protocol field required-constant, which is the guard: if two members disagree on
-        # `cv` they measured their Sharpe on different folds and ranking them is not a comparison,
-        # and this field is the only thing checking that. Latent-factor members will refuse on
-        # `feature_artifacts` when they enter this pool - latent builds it from a different object
-        # than the other five families (latent_factors/case_study.py:337-383, carrying the label
-        # digest and setup.yaml bytes). That refusal is a known adapter defect surfacing, not a
-        # property to declare around; report it rather than adding the field here.
+        result_set_name = f"us-equities-{label_name}-allocation-v1"
         result_set = study.backtests.freeze(
             completed.filter(pl.col("label") == label),
-            name=f"us-equities-{label_name}-allocation-v1",
+            name=result_set_name,
+            supersedes=candidate_set_supersedes(
+                study, name=result_set_name, declared=SUPERSEDES_SETS.get(result_set_name, "")
+            ),
         )
         set_rows.append(
             {"label": label, "set_name": result_set.name, "members": len(result_set.members)}
@@ -442,10 +558,19 @@ compatible_sets = pl.DataFrame(
 compatible_sets
 
 # %% [markdown]
-# ## Inspect the alternative-sizing population
+# ## 8. What came out
 #
-# Each point is one complete allocation-stage validation backtest. The chart retains every planned
-# result and groups them only by the allocator named in the request.
+# Each allocator against the equal-weight row it was built from. The comparison is like-for-like:
+# same model, same checkpoint, same names, same dates, different money.
+#
+# **A small difference is a result.** Equal weight is a strong baseline on a broad cross-section
+# precisely because it makes no estimate that can be wrong, and an allocator that reads a
+# covariance matrix has to estimate one well enough to beat that. Where the differences are small,
+# what that says is that the estimation was not worth its error here - not that sizing does not
+# matter.
+#
+# **Still gross of costs.** The allocators differ in how much they trade, and turnover is charged
+# in [`19_costs`](19_costs.ipynb), so an allocator that looks better here may not survive it.
 
 # %% tags=["results"]
 allocation_results = planned_population.select("label", "allocation", "backtest_hash").join(
@@ -458,35 +583,73 @@ if allocation_results.height != planned_population.height:
     raise RuntimeError("The plotted allocation population differs from the planned population")
 
 fig, ax = plt.subplots(figsize=(10, 5))
-for label in allocation_results.get_column("label").unique().sort().to_list():
+allocator_order = allocation_results.get_column("allocation").unique().sort().to_list()
+labels = allocation_results.get_column("label").unique().sort().to_list()
+# `ml4t_palette` returns a list of that many colours, so it is called once and indexed.
+palette = ml4t_palette(len(labels), categorical=True)
+for index, label in enumerate(labels):
     label_rows = allocation_results.filter(pl.col("label") == label)
+    positions = [allocator_order.index(name) for name in label_rows.get_column("allocation")]
+    # A small fixed offset per label so three points on one allocator stay countable rather than
+    # landing on top of each other; the horizontal position carries no meaning of its own.
+    offset = (index - (len(labels) - 1) / 2) * 0.14
     ax.scatter(
-        label_rows["allocation"],
+        [position + offset for position in positions],
         label_rows["sharpe"],
-        alpha=0.5,
-        s=20,
+        alpha=0.6,
+        s=22,
+        color=palette[index],
+        edgecolors="none",
         label=label,
     )
-ax.axhline(0, color="black", linewidth=0.8, linestyle="--")
-ax.set_xlabel("Allocator")
+zero_line(ax)
+ax.set_xticks(range(len(allocator_order)), allocator_order, rotation=25, ha="right")
+ax.set_xlim(-0.5, len(allocator_order) - 0.5)
 ax.set_ylabel("Validation Sharpe")
-ax.set_title("Alternative-sizing validation Sharpe by allocator")
-ax.tick_params(axis="x", rotation=25)
-ax.legend(fontsize=8)
-fig.tight_layout()
-fig.show()
+add_message_title(
+    ax,
+    "Validation Sharpe by allocator, for the shortlisted configurations",
+    subtitle="One point per shortlisted configuration and allocator, coloured by label",
+)
+ax.legend(fontsize=8, frameon=False)
+# The alt text counts rather than asserts: how many allocators clear zero anywhere is a fact about
+# the frame, and a panel described as beating the baseline when it does not is a claim the data
+# refutes.
+_above = allocation_results.group_by("allocation").agg(best=pl.col("sharpe").max())
+_n_positive = int((_above.get_column("best") > 0).sum())
+show_with_alt(
+    fig,
+    "A scatter plot with one column per allocator and a dashed line at zero. Each point is one "
+    "shortlisted configuration re-sized by that allocator, placed at its validation Sharpe, with "
+    "the three labels offset slightly from one another and coloured separately. Counted from the "
+    f"underlying frame, {_n_positive} of {_above.height} allocators reach a positive Sharpe on at "
+    "least one configuration.",
+)
 
 # %% [markdown]
-# The cost and risk notebooks reopen these names together with the matching equal-weight baseline.
-# No model is retrained, and the selected checkpoint remains part of every downstream identity.
-
-# %% [markdown]
-# ## Key takeaways and limitations
+# ## What to notice
 #
-# - Allocation requests change position sizing while retaining the selected model, checkpoint, and
-#   signal rule.
-# - The shortlist uses validation backtest Sharpe within each label and distinct model
-#   configuration.
-# - The population snapshot preserves every planned allocator result across failure and restart.
-# - These comparisons remain validation evidence; costs, risk controls, and the locked holdout are
-#   evaluated separately.
+# **Every row here differs from its baseline in exactly one thing.** Same model, same checkpoint,
+# same names on the same dates, different money. That is what makes a difference attributable to
+# the sizing rule.
+#
+# **Equal weight is hard to beat on a broad cross-section, and the reason is estimation.** The
+# allocators that read a covariance matrix have to estimate one from a finite window, and a
+# three-thousand-name cross-section gives far fewer observations per parameter than a small
+# universe does. An allocator that does not beat equal weight here has not shown that sizing is
+# irrelevant; it has shown that the estimate it needed was not accurate enough to pay for itself.
+#
+# **The shortlist bounds what this can find.** Allocators are compared only on strategies equal
+# weight already ranked highly, so nothing here can discover one whose value is rescuing a model
+# equal weight buried.
+#
+# **Still gross of costs, and the allocators differ in turnover.** A rule that reweights more
+# aggressively trades more, so an ordering established here can change once
+# [`19_costs`](19_costs.ipynb) charges for it.
+#
+# **Known limitations.** The covariance-reading allocators are sensitive to their lookback, and one
+# window per allocator is declared rather than swept, so nothing here separates an allocator's
+# method from its window. Validation folds have been read many times over by this point.
+#
+# **Next**: [`18_risk_management`](18_risk_management.ipynb) lays rules on top that can close a
+# position before the next rebalance.

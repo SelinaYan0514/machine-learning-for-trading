@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import sqlite3
 import warnings
-from pathlib import Path
 from typing import Any
 
 # Import lightgbm before ml4t.diagnostic, which transitively loads
@@ -42,8 +41,11 @@ import polars as pl
 import torch  # noqa: F401
 from ml4t.diagnostic.metrics import cross_sectional_ic
 
+from case_studies.research.population import retired_prediction_hashes
 from utils.paths import get_case_study_dir
 
+from .booster_paths import booster_dir
+from .gbm_importance import top_features_by_gain
 from .notebook_contracts import defined_ic, degenerate_prediction_sql
 
 # ---------------------------------------------------------------------------
@@ -55,14 +57,27 @@ def load_metrics_from_registry(
     case_study_id: str,
     label: str | None = None,
     families: list[str] | None = None,
+    *,
+    include_retired: bool = False,
 ) -> pl.DataFrame:
     """Load pre-computed IC metrics directly from the registry.
 
     Much faster than loading raw predictions - queries prediction_metrics
     table which stores ic_mean/ic_std computed during training runs.
 
-    Returns one row per prediction set, including its exact training and
-    prediction hashes alongside the model identity and metrics.
+    Returns one row per prediction set of the live generation, including its exact
+    training and prediction hashes alongside the model identity and metrics.
+
+    A registry keeps every generation, and supersession is recorded one layer up in
+    ``official_populations``, so a query that joins ``training_runs`` to
+    ``prediction_metrics`` sees the retired generations too. That is not a neutral
+    error for a caller that ranks what comes back: a generation is usually refitted
+    because it was short or narrow, a narrower sample is an easier one, and the stale
+    rows therefore run toward the top. Measured 2026-09-18, ``cme_futures`` holds a
+    retired deep-learning generation covering 71.4% of its declared (entity, session)
+    pairs that outranked the complete refit which replaced it, and two cells of the
+    book's Table 14.3 were drawn from retired rows. Retired generations are dropped
+    here by default; pass ``include_retired=True`` to look at history deliberately.
     """
     case_dir = get_case_study_dir(case_study_id)
     db_path = case_dir / "run_log" / "registry.db"
@@ -142,8 +157,11 @@ def load_metrics_from_registry(
         params.extend(families)
 
     rows = db.execute(query, params).fetchall()
+    retired = set() if include_retired else retired_prediction_hashes(db)
     db.close()
 
+    if retired:
+        rows = [row for row in rows if row[1] not in retired]
     if not rows:
         return pl.DataFrame()
 
@@ -912,8 +930,8 @@ def load_gbm_feature_importance(
 ) -> pl.DataFrame | None:
     """Load GBM feature importance from saved booster files.
 
-    Looks for LightGBM booster .txt files in run_log/training/{hash}/boosters/.
-    Extracts gain-based importance per fold.
+    The training stage writes boosters under the run's own models directory,
+    run_log/training/{hash}/models/boosters/. Extracts gain-based importance per fold.
 
     Returns DataFrame with columns: config_name, fold_id, feature, importance.
     Returns None if no booster files found.
@@ -943,14 +961,11 @@ def load_gbm_feature_importance(
 
     results = []
     for t_hash, config_name in rows:
-        booster_dir = case_dir / "run_log" / "training" / t_hash / "boosters"
-        if not booster_dir.exists():
-            # Also check under run_log/models/{hash}/boosters (older layout)
-            booster_dir = case_dir / "run_log" / "models" / t_hash / "boosters"
-        if not booster_dir.exists():
+        run_booster_dir = booster_dir(case_dir, t_hash)
+        if run_booster_dir is None:
             continue
 
-        for booster_file in sorted(booster_dir.glob("*.txt")):
+        for booster_file in sorted(run_booster_dir.glob("*.txt")):
             # Extract fold from filename: fold_0.txt or {config}_fold0.txt
             name = booster_file.stem
             fold_str = name.split("fold")[-1].lstrip("_") if "fold" in name else "0"
@@ -978,23 +993,29 @@ def load_gbm_feature_importance(
 
     df = pl.DataFrame(results)
 
+    # A (config, fold) whose booster made no split at all has a maximum gain of zero, so
+    # normalising by it divides zero by zero and gives NaN for every feature of that fold.
+    # NaN then propagates through the mean the ranking rule takes, and because polars
+    # answers True to `NaN > 0` and sorts NaN above every float, one dead fold would make
+    # the whole figure an alphabetical list presented as a gain ranking. It is dropped
+    # here rather than refused: this loader pools every gbm configuration in the case
+    # study, so one dead fold among many still leaves the others worth ranking, whereas
+    # `insight_chapter`'s loader reads a single configuration and raises instead.
+    # Measured 2026-09-19: no (config, fold) in the four case studies this serves has a
+    # zero maximum, across 331 groups, so nothing published today reaches this.
+    df = df.with_columns(fold_max=pl.col("importance").max().over(["config_name", "fold_id"]))
+    df = df.filter(pl.col("fold_max") > 0)
+    if df.is_empty():
+        return None
+
     # Normalize per (config, fold) to [0, 1]
-    df = df.with_columns(
-        (pl.col("importance") / pl.col("importance").max().over(["config_name", "fold_id"])).alias(
-            "importance_norm"
-        )
-    )
+    df = df.with_columns(importance_norm=pl.col("importance") / pl.col("fold_max")).drop("fold_max")
 
-    # Filter to top_n features by mean importance across folds
-    top_features = (
-        df.group_by("feature")
-        .agg(pl.col("importance_norm").mean().alias("mean_imp"))
-        .sort("mean_imp", descending=True)
-        .head(top_n)["feature"]
-        .to_list()
-    )
-
-    return df.filter(pl.col("feature").is_in(top_features))
+    # Ranked and cut by the shared rule, which drops never-split features and breaks
+    # ties on the name. This loader pools every gbm configuration in the case study,
+    # so it is the mean over (configuration, fold) rather than over folds alone; the
+    # rule is the same either way and its docstring says what pooling changes.
+    return df.filter(pl.col("feature").is_in(top_features_by_gain(df, top_n)))
 
 
 def load_linear_coefficients(
@@ -1410,3 +1431,39 @@ def common_sample_daily_ic(
     }
     shared_rows = common.join(scored_dates, on=date_col)
     return ics, scored_dates.height, shared_rows.height
+
+
+def align_join_clock(
+    frame: pl.DataFrame, dtype: pl.Datetime, column: str = "timestamp"
+) -> pl.DataFrame:
+    """Put one timestamp column on `dtype`, so a join on it cannot silently match nothing.
+
+    Prediction artifacts and panel artifacts disagree on the time unit, and sometimes on the
+    zone. The sequence path round-trips the frame through pandas, whose ``datetime64[ns]`` comes
+    back as ``us`` rather than the unit the panel is written at, and the zone can be lost the
+    same way. The instants are identical.
+
+    **The divergence is deliberate and must not be unified at the source.**
+    ``artifact_digest.value_digest`` is sensitive to the time unit, and
+    ``computation.expected_prediction_keys.digest`` is taken over this column, so rewriting the
+    stored unit would move ``training_hash`` for every registered sequence run. Reconciling a
+    cosmetic difference by re-keying a registry is the most expensive mistake available here.
+
+    So the normalization belongs at each join site, which is what this is. A naive value is
+    stamped as the UTC it is rather than the zone being dropped from everything, and the replace
+    comes before the cast because casting a naive column to a zoned dtype converts it instead of
+    stamping it.
+
+    `crypto_perps_funding/13_backtest.py::on_clock_dtype` is the same function against that
+    notebook's own clock, written first and left in place because changing it is a code-cell edit
+    that costs an execution. Fold it into this one when that notebook next runs.
+    """
+    have = frame.schema[column]
+    if have == dtype:
+        return frame
+    stamp = pl.col(column)
+    if getattr(have, "time_zone", None) is None and dtype.time_zone is not None:
+        stamp = stamp.dt.replace_time_zone("UTC")
+    elif getattr(have, "time_zone", None) is not None and dtype.time_zone is None:
+        stamp = stamp.dt.convert_time_zone("UTC").dt.replace_time_zone(None)
+    return frame.with_columns(stamp.cast(dtype))

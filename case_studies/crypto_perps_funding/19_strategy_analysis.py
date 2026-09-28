@@ -83,7 +83,7 @@ WORKSPACE: str = ""
 # admission rule is applied to stopped being every row the registry holds for the label - so
 # this pool moves with them. Recorded here rather than passed at run time: `supersedes` is part
 # of what identifies the generation, so a re-run declaring nothing computes a different hash
-# from the row on record and is refused (ml4t/agent-workspace#879).
+# from the row on record and is refused.
 # Left empty, and it stays empty. The registry was reset for the stage-04 holdout rebuild, so
 # every name below is published at generation one and there is nothing to supersede. A
 # declaration is only needed when a re-run changes an existing name's membership: the refusal
@@ -149,7 +149,7 @@ if catalog.height != len(pool.members):
     raise RuntimeError("the backtest catalog does not describe every candidate")
 
 # %% [markdown]
-# The selected configuration, and the pool it was selected from. The stage column says how far
+# The selected configuration, and the pool it came from. The stage column says how far
 # down the funnel the selection came from: a baseline row means neither sizing nor an overlay
 # improved on equal weight for that ranking.
 
@@ -418,7 +418,7 @@ holdout_predictions = study.predictions.table().filter(pl.col("split") == "holdo
 # The second is that the registered result is the replay of that configuration. `stage` says a
 # row was produced from a holdout prediction set and nothing more, so a query keyed on it would
 # also return a run of some other allocator over the same window, or one left by a superseded
-# selection. The resolver matches the holdout backtest to the carrier by strategy
+# selection. The resolver matches the holdout backtest to the selected configuration by strategy
 # specification, which is the link that actually establishes lineage, so the metrics below are
 # restricted to the hash it returns.
 carrier_lineage = resolve_solvent_carrier("crypto_perps_funding")

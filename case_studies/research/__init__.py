@@ -29,6 +29,7 @@ from .execution import (
     expected_prediction_hashes,
     plan_backtests,
     require_resolved_requests_cover_the_catalog,
+    reuse_disclosure,
     run_backtests,
     run_model_population,
     run_models,
@@ -47,6 +48,7 @@ from .model_planning import (
 )
 from .models import ModelRequest, ModelRun, ResolvedModelRequest
 from .population import (
+    SUPERSEDES_LIVE,
     OfficialPopulation,
     RetirementSplit,
     population_supersedes,
@@ -84,7 +86,7 @@ from .selection_field import (
     upstream_plan_hashes,
 )
 from .strategy import Strategy, strategy_warmup_periods
-from .workspace import Study, open_study
+from .workspace import Study, open_study, read_only_study
 
 __all__ = [
     "causal_supersedes",
@@ -132,6 +134,7 @@ __all__ = [
     "narrows_declared_catalog",
     "model_requests",
     "open_study",
+    "read_only_study",
     "register_adapter",
     "registered_adapters",
     "plan_backtests",
@@ -158,9 +161,11 @@ __all__ = [
     "unfinished_sweep_plans",
     "planned_backtests",
     "upstream_plan_hashes",
+    "SUPERSEDES_LIVE",
     "population_supersedes",
     "research_name",
     "resolved_model_plan",
+    "reuse_disclosure",
     "run_backtests",
     "run_model_population",
     "split_retired_members",

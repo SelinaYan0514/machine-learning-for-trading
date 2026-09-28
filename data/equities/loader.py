@@ -126,7 +126,8 @@ def load_us_equities(
     start_date: str | None = None,
     end_date: str | None = None,
     max_symbols: int = 0,
-) -> pl.DataFrame:
+    lazy: bool = False,
+) -> pl.DataFrame | pl.LazyFrame:
     """Load US equities dataset (NASDAQ Data Link, 1962-2018).
 
     Survivorship-bias free dataset with 3,199 US companies including delisted stocks.
@@ -135,10 +136,17 @@ def load_us_equities(
         symbols: Optional list of symbols to filter (e.g., ["AAPL", "MSFT"])
         start_date: Optional start date (YYYY-MM-DD format)
         end_date: Optional end date (YYYY-MM-DD format)
-        max_symbols: Limit to N random symbols (0 = all). Seed-deterministic.
+        max_symbols: Limit to N most-observed symbols (0 = all).
+        lazy: Return the unexecuted plan instead of a collected frame, so a caller's
+            own ``select`` and ``filter`` are pushed into the parquet scan rather than
+            applied to a frame that has already been materialized. The panel is fourteen
+            columns over 14.5M rows: measured on 2026-09-10, a caller that reads six of
+            them collects a 1.40 GB frame at 2.88 GB peak RSS eagerly, and a 0.53 GB
+            frame at 1.66 GB deferring the collect.
 
     Returns:
-        DataFrame with columns: timestamp, symbol, open, high, low, close, volume, adj_close, etc.
+        DataFrame with columns: timestamp, symbol, open, high, low, close, volume, adj_close,
+        etc., or the LazyFrame that produces it when ``lazy=True``.
     """
     path = ML4T_DATA_PATH / "equities" / "market" / "us_equities" / "us_equities.parquet"
     if not path.exists():
@@ -198,8 +206,8 @@ def load_us_equities(
     if time_type != pl.Date:
         lf = lf.with_columns(pl.col("timestamp").cast(pl.Date))
 
-    df = lf.collect()
-    return apply_max_symbols(df, max_symbols)
+    lf = apply_max_symbols(lf, max_symbols)
+    return lf if lazy else lf.collect()
 
 
 # Resampling aggregation specs for group_by_dynamic
@@ -1108,6 +1116,7 @@ def load_nasdaq_itch(
     message_types: list[str] | None = None,
     symbols: list[str] | None = None,
     get_base_path: bool = False,
+    must_exist: bool = True,
 ) -> pl.DataFrame | Path:
     """Load parsed NASDAQ ITCH message data.
 
@@ -1132,6 +1141,10 @@ def load_nasdaq_itch(
         symbols: Optional list of stock symbols to filter (e.g., ["AAPL", "MSFT"])
         get_base_path: If True, return the resolved base path instead of loading data.
             Useful for notebooks that need direct access to message type directories.
+        must_exist: Whether an absent messages directory is an error. True is right for
+            every reader: the directory is the data, so its absence is the download
+            instruction. The parser notebook of Chapter 3 is the one caller that writes
+            the directory, and it passes False to be told where to write.
 
     Returns:
         If get_base_path=False (default): DataFrame with message-type-specific columns.
@@ -1152,7 +1165,15 @@ def load_nasdaq_itch(
     base_path = (
         ML4T_DATA_PATH / "equities" / "market" / "microstructure" / "nasdaq_itch" / "messages"
     )
-    if not base_path.exists():
+    if not must_exist and not get_base_path:
+        raise ValueError("must_exist=False only makes sense with get_base_path=True")
+    # An empty directory counts as absent. A parse that stops before writing anything can
+    # leave one behind, and a caller asking only for the path would then be handed it
+    # instead of the download instruction, to fail later on empty frames.
+    has_messages = base_path.is_dir() and any(
+        d.is_dir() and len(d.name) == 1 and d.name.isupper() for d in base_path.iterdir()
+    )
+    if must_exist and not has_messages:
         raise DataNotFoundError(
             dataset_name="NASDAQ ITCH Parsed Messages",
             path=base_path,

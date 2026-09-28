@@ -356,10 +356,13 @@ def add_message_title(
     subtitle: str | None = None,
     source: str | None = None,
 ) -> None:
-    """Left-aligned takeaway title (a claim, not a label), optional subtitle + source note.
+    """Left-aligned descriptive title, optional subtitle + source note.
 
-    `message` should state the finding ("Momentum decays beyond a 12-month hold"), not
-    label the axes. `subtitle` carries the qualifier the title omits (metric, universe,
+    `message` describes what the figure shows - the quantity, the entities and the axis
+    they sit on ("Classification error metrics"), and then stops. It does not interpret;
+    the interpretation goes in the markdown around the figure, where a reader can argue
+    with it and where correcting it costs no re-run. Ruled 2026-09-09; the parameter name
+    predates the rule. `subtitle` carries the qualifier the title omits (metric, universe,
     frequency, period); `source` is a small bottom-left note. No figure number — the
     publisher captions separately.
     """
@@ -399,9 +402,11 @@ def add_message_title(
         pad=(15 + extra_lines * (SUBTITLE_SIZE + 2)) if subtitle else 8,
     )
     if source:
-        ax.figure.text(
-            0.01, 0.005, source, ha="left", va="bottom", fontsize=8, color=COLORS["neutral"]
-        )
+        # `figure.text` is not a laid-out artist, so constrained layout reserved nothing for
+        # it and the note landed on top of the x-axis label and the rotated tick labels in
+        # all four figures of 18_transaction_costs/01_cost_taxonomy. `supxlabel` is laid
+        # out, so the engine makes room for it; `x`/`ha` keep it bottom-left.
+        ax.figure.supxlabel(source, x=0.01, ha="left", fontsize=8, color=COLORS["neutral"])
 
 
 def show_with_alt(fig: object, alt: str) -> None:
@@ -427,8 +432,20 @@ def show_plotly_with_alt(fig: object, alt: str) -> None:
     directly is what carries it through.
 
     The alt text is a sentence saying what the chart shows, not a repeat of the title.
+
+    `_repr_mimebundle_` renders the PNG through kaleido, which drives a headless browser.
+    When that browser takes longer than three seconds to shut down - which it does on a
+    loaded machine - choreographer logs "Resorting to unclean kill browser." at WARNING,
+    and papermill writes it into the executed notebook as a stderr stream beside a figure
+    that rendered correctly. It reports how the browser exited, not anything about the
+    figure, so the logger is quieted here rather than in each of the notebooks that call
+    this. Errors from the same logger still come through.
     """
+    import logging
+
     from IPython.display import publish_display_data
+
+    logging.getLogger("choreographer").setLevel(logging.ERROR)
 
     bundle = fig._repr_mimebundle_()
     data, metadata = bundle if isinstance(bundle, tuple) else (bundle, {})
@@ -956,8 +973,11 @@ def plot_fidelity_comparison(
     real_tsne = combined_tsne[:n_viz]
     synth_tsne = combined_tsne[n_viz:]
 
-    # Create figure with aligned axes
-    fig, axes = plt.subplots(1, 2, figsize=figsize)
+    # constrained_layout reserves room for the suptitle as part of solving the
+    # layout. tight_layout cannot: called after a suptitle placed above the axes
+    # it warns "The figure layout has changed to tight", and that warning lands
+    # in the output of every notebook that renders this figure.
+    fig, axes = plt.subplots(1, 2, figsize=figsize, constrained_layout=True)
 
     # Style constants for grayscale compatibility
     real_color = COLORS["blue"]
@@ -1021,8 +1041,7 @@ def plot_fidelity_comparison(
     axes[1].set_title("t-SNE Projection")
     axes[1].legend(loc="upper right", framealpha=0.9)
 
-    fig.suptitle(title, fontsize=14, fontweight="semibold", y=1.02)
-    plt.tight_layout()
+    fig.suptitle(title, fontsize=14, fontweight="semibold")
 
     return fig
 

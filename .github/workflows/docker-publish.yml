@@ -14,6 +14,20 @@ name: Docker Publish
 on:
   push:
     tags: ["v3.*"]
+    # A lock bump stales every published image the moment it lands, and until
+    # 2026-09-05 nothing rebuilt them: this workflow ran on a `v3.*` tag or a manual
+    # dispatch and on nothing else. All three Dockerfiles derive their pinned
+    # constraint from the root `uv.lock`, so #740 moved five distributions
+    # (econml, causalml, scikit-learn, shap, statsforecast) and `ml4t/ml4t:latest`
+    # kept the old five. `test-unit-image` is required and correctly refused the
+    # mismatch, so `main` and every open pull request went red and nothing could
+    # merge until someone dispatched a rebuild by hand.
+    #
+    # No `paths:` filter here: a `paths:` under `push` applies to the tag trigger
+    # too, which would make a release tag whose commit touched none of these files
+    # build nothing at all. The `changes` job below does the filtering instead,
+    # which is also what test.yml does.
+    branches: [main]
   workflow_dispatch:
     inputs:
       images:
@@ -35,11 +49,50 @@ env:
 # ML4T MAIN — Multi-arch (amd64 + arm64 native runners)
 # ============================================================================
 jobs:
+  # Which images a push to `main` staled. A tag or a manual dispatch skips this and
+  # builds whatever it was asked for; only a branch push is filtered.
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      ml4t: ${{ steps.filter.outputs.ml4t }}
+      py312: ${{ steps.filter.outputs.py312 }}
+      benchmark: ${{ steps.filter.outputs.benchmark }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            # The root lock and manifest are the resolve every image is built
+            # from, so they stale all three. Each image then adds its own
+            # Dockerfile and, where it has one, its own dependency manifest.
+            ml4t:
+              - 'uv.lock'
+              - 'pyproject.toml'
+              - 'envs/ml4t/Dockerfile'
+            py312:
+              - 'uv.lock'
+              - 'pyproject.toml'
+              - 'envs/py312/Dockerfile'
+              - 'envs/py312/pyproject.toml'
+              - 'envs/py312/bsts-pyproject.toml'
+            benchmark:
+              - 'uv.lock'
+              - 'pyproject.toml'
+              - 'envs/benchmark/Dockerfile'
+              - 'envs/benchmark/pyproject.toml'
+
   build-ml4t:
+    needs: changes
     if: >-
-      github.event_name != 'workflow_dispatch' ||
+      (github.event_name != 'workflow_dispatch' ||
       github.event.inputs.images == 'all' ||
-      github.event.inputs.images == 'ml4t'
+      github.event.inputs.images == 'ml4t') &&
+      (github.event_name == 'workflow_dispatch' ||
+      github.ref_type == 'tag' ||
+      needs.changes.outputs.ml4t == 'true')
     strategy:
       fail-fast: false
       matrix:
@@ -103,9 +156,121 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  # The reader install gate, and it runs BEFORE the public tags move.
+  #
+  # `build-ml4t` pushes each arch by digest with no tag, so nothing a reader can
+  # pull has changed yet; `merge-ml4t` below is what points `:latest` at those
+  # digests. Verifying between the two is what makes this a gate rather than a
+  # detector - a failure here leaves `:latest` on the last image that passed.
+  #
+  # This exists because `smoke-ml4t` could not have prevented the outage it was
+  # meant to catch, twice over. It ran `envs/test_all_imports.py --scan`, which
+  # reduces every import to its top-level name (`envs/scan_imports.py:135,138`),
+  # so `from ml4t.live.brokers.ib import IBBroker` reached it as `ml4t` and
+  # importing `ml4t` never executed `ml4t/live/__init__.py`. And it runs after
+  # `merge-ml4t`, so even a check that saw the break would only have reported it
+  # once readers could already pull it. The image published on 2026-09-04 carried
+  # an `import ml4t.live` that raised on Python 3.14; every Chapter 25 notebook
+  # failed before its first cell, and this workflow was green on both arches.
+  #
+  # `scripts/verify_installation.py` is the same command `docs/installation.md`
+  # tells a Docker reader to run, so a published image is one that passed the
+  # reader's own check. `tests/test_publish_gate_sees_subpackages.py` fails if the
+  # two ever diverge, if this stops being a prerequisite of `merge-ml4t`, or if a
+  # new `ml4t.<sub>` enters the repository without entering the gate.
+  #
+  # Measured 2026-09-08 by reinstalling the defect into the published image:
+  # `--scan` exits 0, `verify_installation.py` exits 1 and names ml4t-live.
+  verify-ml4t:
+    needs: build-ml4t
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      # The candidate is ~13 GB and a default runner has nowhere near that free.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune -af
+          df -h /
+
+      - uses: actions/checkout@v6
+      # buildx for `imagetools inspect` in the resolution step below.
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Platform slug
+        id: slug
+        run: echo "pair=${platform//\//-}" >> "$GITHUB_OUTPUT"
+        env:
+          platform: ${{ matrix.platform }}
+
+      - name: Download this arch's digest
+        uses: actions/download-artifact@v4
+        with:
+          name: ml4t-digest-${{ steps.slug.outputs.pair }}
+          path: /tmp/digest
+
+      # `build-ml4t` records the digest as an empty file named after it.
+      #
+      # What that digest points at depends on whether buildx attached a provenance
+      # attestation: with one, a push-by-digest build publishes an index holding the
+      # platform image plus an `unknown/unknown` attestation manifest; without, it is
+      # the image manifest itself. Resolving explicitly covers both, and turns "the
+      # reference did not resolve" into a failure here with a readable message
+      # instead of `unsupported media type application/vnd.oci.empty.v1+json` from
+      # `docker run` two steps later.
+      - name: Resolve the candidate
+        id: candidate
+        run: |
+          set -euo pipefail
+          files=(/tmp/digest/*)
+          test "${#files[@]}" -eq 1
+          ref="${{ env.ML4T_IMAGE }}@sha256:$(basename "${files[0]}")"
+
+          platform_digest=$(docker buildx imagetools inspect "$ref" --raw \
+            | jq -r --arg arch "${{ matrix.platform }}" '
+                if .manifests then
+                  (.manifests[]
+                    | select((.platform.os + "/" + .platform.architecture) == $arch)
+                    | .digest)
+                else empty end')
+
+          if [ -n "$platform_digest" ]; then
+            ref="${{ env.ML4T_IMAGE }}@${platform_digest}"
+          fi
+
+          echo "verifying $ref"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      # ML4T_DATA_PATH points inside the checkout rather than at /data, which is
+      # not mounted: the gate checks that the data root resolves, and the whole
+      # `utils` and `data` import surface fails behind it when it does not.
+      - name: Reader install gate (${{ matrix.platform }})
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}:/app:ro \
+            -e PYTHONPATH=/app \
+            -e ML4T_PATH=/app \
+            -e ML4T_DATA_PATH=/app/data \
+            ${{ steps.candidate.outputs.ref }} \
+            python /app/scripts/verify_installation.py
+
   merge-ml4t:
     runs-on: ubuntu-latest
-    needs: build-ml4t
+    needs: [build-ml4t, verify-ml4t]
 
     steps:
       - name: Download digests
@@ -162,6 +327,26 @@ jobs:
             ${{ env.ML4T_IMAGE }}:latest \
             python /app/envs/test_all_imports.py --scan
 
+      # The same command as the `verify-ml4t` gate above, and it is not the gate.
+      # That one runs on the candidate digest before the tags move and can stop a
+      # publish; this one runs on the manifest afterwards and can only report. It
+      # is here because the two answer different questions: `verify-ml4t` says the
+      # image is good, this says `:latest` resolves to it on this arch. A manifest
+      # assembled from the wrong digests would pass the first and fail this.
+      #
+      # ML4T_DATA_PATH points inside the checkout rather than at /data, which is not
+      # mounted here: the gate checks that the data root resolves, and the whole
+      # `utils` and `data` import surface fails behind it when it does not.
+      - name: Published manifest runs the reader gate (${{ matrix.arch }})
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}:/app:ro \
+            -e PYTHONPATH=/app \
+            -e ML4T_PATH=/app \
+            -e ML4T_DATA_PATH=/app/data \
+            ${{ env.ML4T_IMAGE }}:latest \
+            python /app/scripts/verify_installation.py
+
       - name: Computation smoke test (${{ matrix.arch }})
         run: |
           docker run --rm ${{ env.ML4T_IMAGE }}:latest python -c "
@@ -183,10 +368,14 @@ jobs:
   # ============================================================================
   build-py312:
     runs-on: ubuntu-latest
+    needs: changes
     if: >-
-      github.event_name != 'workflow_dispatch' ||
+      (github.event_name != 'workflow_dispatch' ||
       github.event.inputs.images == 'all' ||
-      github.event.inputs.images == 'py312'
+      github.event.inputs.images == 'py312') &&
+      (github.event_name == 'workflow_dispatch' ||
+      github.ref_type == 'tag' ||
+      needs.changes.outputs.py312 == 'true')
 
     steps:
       - name: Free disk space (signature stack + ML deps ~5GB)
@@ -247,10 +436,14 @@ jobs:
   # BENCHMARK — Multi-arch (amd64 + arm64 on NATIVE runners)
   # ============================================================================
   build-benchmark:
+    needs: changes
     if: >-
-      github.event_name != 'workflow_dispatch' ||
+      (github.event_name != 'workflow_dispatch' ||
       github.event.inputs.images == 'all' ||
-      github.event.inputs.images == 'benchmark'
+      github.event.inputs.images == 'benchmark') &&
+      (github.event_name == 'workflow_dispatch' ||
+      github.ref_type == 'tag' ||
+      needs.changes.outputs.benchmark == 'true')
     strategy:
       fail-fast: false
       matrix:

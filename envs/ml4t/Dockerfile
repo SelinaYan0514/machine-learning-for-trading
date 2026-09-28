@@ -67,7 +67,7 @@ RUN /opt/ml4t/bin/pip freeze | grep -E '^(torch|torchaudio|torchvision)==' > /tm
 # step below, so this only needs the lower bounds.
 RUN /opt/ml4t/bin/pip install --no-cache-dir \
     "ml4t-data>=0.1.2" \
-    "ml4t-diagnostic>=0.1.2" \
+    "ml4t-diagnostic>=0.1.4" \
     "ml4t-engineer>=0.1.3" \
     "ml4t-live>=0.1.0" \
     "ml4t-backtest>=0.1.3" \
@@ -222,6 +222,19 @@ ENV HOME=/home/ml4t
 WORKDIR /app
 ENV PATH="/opt/ml4t/bin:$PATH"
 ENV PYTHONPATH="/app"
+
+# polars allocates through jemalloc, which by default keeps freed pages mapped - one
+# arena per worker thread, muzzy pages never returned. On the AlgoSeek conversion that
+# retention reached 3.3 GB of anonymous memory against ~100 MB of live data (#558), and
+# it applies to every notebook that loads a panel. Inside a container the ceiling is
+# Docker Desktop's allocation rather than the host's RAM, so the pages nobody can reach
+# are what gets a run killed. Returning them immediately costs 0-4% on dataset loads and
+# more on tight parse loops; a reader whose container is the constraint wants the memory.
+# polars appends this to its own defaults and jemalloc takes the last setting for a key,
+# so this is its supported override. Set in the image rather than in Python because the
+# assignment only counts if it precedes `import polars` - here it covers every notebook
+# and script without each one remembering. Override with `docker run -e`.
+ENV _RJEM_MALLOC_CONF=dirty_decay_ms:0,muzzy_decay_ms:0
 
 # For GPU users: CUDA libraries are bundled in PyTorch wheel
 # nvidia-container-toolkit passes through /dev/nvidia* and sets these:

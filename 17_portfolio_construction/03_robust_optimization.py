@@ -42,7 +42,7 @@
 # - Check whether an allocation fitted to a training drawdown actually has a shallow one later.
 #
 # ## Book reference
-# Chapter 17, Section 17.5 (mean-variance optimization and the Markowitz curse).
+# Chapter 17, Section 17.5 (Mean-variance optimization and the Markowitz curse).
 #
 # ## Prerequisites
 #
@@ -54,10 +54,6 @@
 
 # %%
 """Compare Riskfolio-Lib allocators with Ledoit-Wolf shrinkage, risk contributions, rolling Sharpe, and an execution bridge."""
-
-import warnings
-
-warnings.filterwarnings("ignore")
 
 import cvxpy.reductions.matrix_stuffing as cvxpy_matrix_stuffing
 import numpy as np
@@ -84,11 +80,12 @@ from ml4t.diagnostic.evaluation import (
 
 from data import load_etfs
 from utils.reproducibility import set_global_seeds
-from utils.style import COLORS, ml4t_diverging, ml4t_palette
+from utils.style import COLORS, ml4t_diverging, ml4t_palette, show_plotly_with_alt
 
 # %% [markdown]
-# Riskfolio-Lib depends on a narrow CVXPY interface. Fail early with a clear environment
-# message instead of patching a reader's installed package at runtime.
+# Riskfolio-Lib reaches CVXPY through an interface that changed across CVXPY versions, so the
+# check below reports a version mismatch as an environment problem rather than letting it surface
+# later as an unexplained solver failure.
 
 
 # %%
@@ -118,7 +115,13 @@ set_global_seeds(SEED)
 # %% [markdown]
 # ## 1. Data Acquisition
 #
-# We'll use a diversified portfolio of ETFs spanning multiple asset classes.
+# Eleven exchange-traded funds, one per broad exposure, as `ETF_UNIVERSE` below declares them: the
+# S&P 500, the Nasdaq-100 and the Russell 2000 in US equity; developed and emerging markets outside
+# the US; the US aggregate bond index, long-dated Treasuries and high-yield corporates in fixed
+# income; and gold, property and commodities. Each is already a diversified basket, so allocating across them
+# is an asset-allocation decision and the estimation problem shows up without the separate problem
+# of picking individual securities. The narrower universe is deliberate: eleven assets need 55
+# covariances estimated where the previous notebook's thirty need 435.
 
 # %%
 # Multi-asset ETF universe
@@ -197,7 +200,10 @@ heatmap_values = np.where(mask, np.nan, corr_values)
 heatmap_text = np.where(mask, "", np.round(corr_values, 2).astype(str))
 off_diagonal = corr_matrix.where(~np.eye(len(corr_matrix), dtype=bool)).stack()
 strongest_pair = off_diagonal.idxmax()
-strongest_corr = float(off_diagonal.max())
+print(
+    f"Most correlated pair: {ETF_UNIVERSE[strongest_pair[0]]} and "
+    f"{ETF_UNIVERSE[strongest_pair[1]]}, at {float(off_diagonal.max()):.2f}"
+)
 
 fig = go.Figure(
     data=go.Heatmap(
@@ -221,18 +227,20 @@ fig.update_layout(
     height=550,
     margin=dict(l=135, b=125, r=40),
 )
-fig.show()
+show_plotly_with_alt(
+    fig,
+    "Lower-triangle correlation heatmap of eleven ETFs over the training window, each cell labelled, with warm blocks within the equity funds and cooler values between equities and long Treasuries.",
+)
 
 # %% [markdown]
-# ## 3. Portfolio Optimization Setup
+# ## 3. Six allocations, and what each one has to estimate
 #
-# Riskfolio-Lib receives pandas only at its API boundary. Historical expected returns
-# and Ledoit-Wolf covariance are estimated on the training window; the hurdle is zero.
-
-# %% [markdown]
-# ## 4. Optimization Methods Comparison
+# All six are fitted on the training window and never see a test observation. Expected returns,
+# where a method needs them, are the training-window sample means; the covariance, where a method
+# needs one, is the Ledoit-Wolf shrunk estimate rather than the raw sample matrix. The hurdle rate
+# is zero throughout, so every Sharpe ratio below is a raw return-to-risk ratio.
 #
-# We compare six portfolio optimization approaches. The risk parity objective minimizes
+# The risk parity objective minimizes
 # the dispersion of risk contributions:
 #
 # $$\min_w \sum_{i=1}^{N} \left( w_i \cdot (\Sigma w)_i - \frac{w^\top \Sigma w}{N} \right)^2$$
@@ -240,12 +248,23 @@ fig.show()
 # where $(\Sigma w)_i$ is asset $i$'s marginal risk contribution. At optimality, each asset
 # contributes equally to portfolio variance.
 #
-# 1. **Mean-Variance (Max Sharpe)**
-# 2. **Minimum Variance**
-# 3. **Risk Parity (ERC)**
-# 4. **Hierarchical Risk Parity (HRP)**
-# 5. **Min CDaR** (tail-risk optimization)
-# 6. **Equal Weight (Benchmark)**
+# 1. **Mean-Variance (Max Sharpe)** needs both inputs: the expected-return vector and the
+#    covariance.
+# 2. **Minimum Variance** needs the covariance only.
+# 3. **Risk Parity**, also called equal risk contribution, needs the covariance only.
+# 4. **Hierarchical Risk Parity (HRP)** needs the covariance only, and reads it as a tree of
+#    correlation clusters rather than inverting it. `06_hierarchical_risk_parity` builds it from
+#    parts; here it is one more allocator in the comparison.
+# 5. **Min CDaR** needs neither. **Conditional drawdown at risk** is the average of the worst
+#    drawdowns a return path went through - the tail of the drawdown distribution rather than of
+#    the return distribution - and minimizing it works directly on the realized path, not on a
+#    covariance estimate.
+# 6. **Equal Weight** needs nothing at all, and is the benchmark the other five have to beat.
+#
+# Riskfolio-Lib names an objective by a pair of strings, a risk measure and what to do with it, so
+# the table below is the translation from four of those six into the calls that produce them.
+# Hierarchical risk parity takes a different entry point and equal weight needs no solver, so both
+# are handled separately in the function underneath.
 
 
 # %%
@@ -273,11 +292,6 @@ OPTIMIZATION_SPECS = {
         ),
     },
 }
-
-
-# %% [markdown]
-# Map each optimization label to the Riskfolio-Lib call so the portfolio function can
-# focus on orchestration rather than on a long method-specific branch ladder.
 
 
 # %%
@@ -400,7 +414,10 @@ fig.update_layout(
     height=470,
     margin=dict(l=130, b=120, r=40),
 )
-fig.show()
+show_plotly_with_alt(
+    fig,
+    "Heatmap of portfolio weight, one row per allocation method and one column per ETF, each cell labelled with its weight.",
+)
 
 # %%
 concentration_order = sorted(effective_n, key=effective_n.get)
@@ -425,7 +442,10 @@ fig.update_layout(
     showlegend=False,
     margin=dict(l=135, r=40),
 )
-fig.show()
+show_plotly_with_alt(
+    fig,
+    "Horizontal bars of effective positions per allocation method, sorted from the most concentrated to the least, with equal weight highlighted at the top of the range.",
+)
 
 # %%
 for name, positions in sorted(effective_n.items(), key=lambda item: item[1]):
@@ -497,19 +517,17 @@ for col in cumulative.columns:
         )
     )
 
-final_growth = cumulative.iloc[-1]
-growth_leader = str(final_growth.idxmax())
 fig.update_layout(
-    title=(
-        f"{len(cumulative.columns)} allocations of one universe, "
-        "all weights frozen before the window"
-    ),
+    title="Every weight here was fixed before the window it is scored on",
     xaxis_title="Date",
     yaxis_title="Growth of $1",
     height=500,
     legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01, bgcolor=COLORS["bg_light"]),
 )
-fig.show()
+show_plotly_with_alt(
+    fig,
+    "Six growth-of-one-dollar paths over the test window, one per frozen allocation, with risk parity and equal weight drawn thicker than the rest.",
+)
 
 # %% [markdown]
 # ## 7. Performance Comparison
@@ -623,7 +641,8 @@ def run_daily_target_engine(*, cost_aware: bool, return_column: str) -> pl.DataF
 
 
 # %% [markdown]
-# Execute both cost settings before aligning their return series with the vectorized path.
+# The two engine runs differ only in whether costs are charged, so the difference between them is
+# the cost and nothing else.
 
 
 # %%
@@ -697,6 +716,8 @@ for label, column in bridge_columns.items():
 annual_cost_gap = (
     bridge_stats["Zero-cost engine"].annual_return - bridge_stats["Cost-aware engine"].annual_return
 )
+print(f"Annualized return given up to commission and slippage: {annual_cost_gap:.2%}")
+
 fig.update_layout(
     title="What the declared trading costs take out of the same allocation",
     xaxis_title="Date",
@@ -704,7 +725,10 @@ fig.update_layout(
     height=440,
     legend=dict(bgcolor=COLORS["bg_light"]),
 )
-fig.show()
+show_plotly_with_alt(
+    fig,
+    "Three growth-of-one-dollar paths for the frozen risk-parity allocation: vectorized, zero-cost engine and cost-aware engine.",
+)
 
 # %% [markdown]
 # Vectorized versus zero-cost differences reflect next-bar timing and engine mechanics.
@@ -763,7 +787,10 @@ fig.update_layout(
     margin=dict(l=75, r=85, t=80, b=65),
 )
 
-fig.show()
+show_plotly_with_alt(
+    fig,
+    "Scatter of the six allocations, test-period annualized volatility against annualized return, each point labelled with its method name.",
+)
 
 # %% [markdown]
 # The test window for every allocation fitted on the training window. The ordering describes this
@@ -801,25 +828,49 @@ for col in drawdowns.columns:
 
 max_drawdowns = drawdowns.min()
 shallowest_name = str(max_drawdowns.idxmax())
+deepest_name = str(max_drawdowns.idxmin())
+returns_by_name = {
+    row["portfolio"]: row["annual_return"] for row in metrics_df.iter_rows(named=True)
+}
+print(
+    f"Shallowest fall: {shallowest_name} at {max_drawdowns[shallowest_name]:.1%}, "
+    f"annualized return {returns_by_name[shallowest_name]:.2%}"
+)
+print(
+    f"Deepest fall:    {deepest_name} at {max_drawdowns[deepest_name]:.1%}, "
+    f"annualized return {returns_by_name[deepest_name]:.2%}"
+)
+
 fig.update_layout(
-    title="The shallowest drawdown belongs to the weakest performer",
+    title="Shallower drawdowns are bought with return, not gained for free",
     xaxis_title="Date",
     yaxis_title="Drawdown (%)",
     height=450,
     legend=dict(bgcolor=COLORS["bg_light"]),
 )
-fig.show()
+show_plotly_with_alt(
+    fig,
+    "Six underwater curves over the test window, one per allocation, all at or below zero, with risk parity and equal weight emphasized.",
+)
 
 # %% [markdown]
-# Zero is each allocation's own running peak, so every curve is at or below it. Read it against
-# the Sharpe column above and the trade is plain: the allocation with the shallowest fall is also
-# the one that earned least, and the one that earned most fell furthest. Nothing here is free, and
-# which end of that trade a holder wants is not a question the data answers.
+# Zero is each allocation's own running peak, so every curve is at or below it. The two lines
+# printed above the chart pair each extreme with what it returned, which is the comparison to
+# make: an allocation is not better for falling less if the reason it fell less is that it held
+# less of what moved. Which end of that trade a holder wants is not a question the data answers.
 
 # %% [markdown]
 # ## 9. Risk Contribution Analysis
 #
-# For risk parity, we verify that risk contributions are equalized.
+# An asset's **risk contribution** is $w_i(\Sigma w)_i / (w^\top \Sigma w)$: its weight times its
+# covariance with the portfolio, over portfolio variance. Written that way the shares sum to one,
+# which is what makes them readable as shares. The looser phrasing - weight times the derivative of
+# variance, over variance - does not, because that derivative carries a factor of two and the shares
+# would sum to two. Risk parity is defined by making these shares equal, so the chart below is that
+# definition evaluated. The other allocations carry no such constraint, and where their capital
+# concentrates their risk tends to concentrate further. How much further is not a fixed multiple:
+# raising one weight changes that asset's covariance with the portfolio and the portfolio's total
+# variance at the same time, and the two move the share in opposite directions.
 
 
 # %%
@@ -856,6 +907,12 @@ if not np.allclose(rc_table["Risk Parity"].sum(), 100.0, atol=1e-6):
 rc_values = rc_table.to_numpy().T
 target_contribution = 100 / len(SYMBOLS)
 rp_max_deviation = float(np.abs(rc_table["Risk Parity"].to_numpy() - target_contribution).max())
+print(
+    f"Risk parity's target share is {target_contribution:.2f}% per asset. Its largest deviation "
+    f"from that target in sample is {rp_max_deviation:.1e} percentage points, which is the "
+    "solver's tolerance rather than a residual imbalance."
+)
+
 fig = go.Figure(
     data=go.Heatmap(
         z=rc_values,
@@ -876,7 +933,10 @@ fig.update_layout(
     height=390,
     margin=dict(l=135, b=120, r=40),
 )
-fig.show()
+show_plotly_with_alt(
+    fig,
+    "Heatmap of percentage variance contribution, one row per allocation method and one column per ETF, with the risk-parity row nearly uniform across the assets and the other two rows concentrated.",
+)
 
 # %% [markdown]
 # Risk parity is checked against the same Ledoit-Wolf covariance that generated its
@@ -941,7 +1001,10 @@ fig.update_layout(
     height=450,
     legend=dict(bgcolor=COLORS["bg_light"]),
 )
-fig.show()
+show_plotly_with_alt(
+    fig,
+    "Six rolling 252-day Sharpe ratios against date, crossing each other repeatedly, with reference lines at zero and one.",
+)
 
 # %% [markdown]
 # Rolling estimates use a 252-trading-day window, a 126-observation minimum, daily
@@ -962,6 +1025,19 @@ print(
 # through an engine that charges the declared commission and slippage, and the difference between
 # the two is what implementing the allocation costs. Any ranking computed above it is a ranking of
 # paper portfolios.
+
+# %% [markdown] tags=["results"]
+# ### What this run produced
+#
+# Three tables carry it, and they answer different questions. The weight comparison says where
+# each method put capital; the effective-positions column beside it says how concentrated that is
+# as a number rather than by eye. The performance table scores the six frozen allocations on the
+# test window. The execution bridge at the end repeats one of them - risk parity - through an
+# engine that charges the declared commission and slippage, so the gap between its last row and
+# the paper figure above is what implementing that allocation costs.
+#
+# The ordering in the performance table describes this split. No allocation was retuned against
+# it, and nothing here estimates how the same six would rank on a different train/test cut.
 
 # %% [markdown]
 # ## Key takeaways

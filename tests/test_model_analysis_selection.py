@@ -6,6 +6,7 @@ from case_studies.utils.model_analysis import (
     best_model_per_family_fast,
     load_daily_metrics_series,
     load_fold_metrics_from_registry,
+    load_gbm_feature_importance,
     load_metrics_from_registry,
     load_predictions,
     prediction_correlation_matrix,
@@ -275,3 +276,180 @@ def test_prediction_correlation_averages_daily_cross_sectional_spearman() -> Non
 
 def test_fold_columns_are_sorted_numerically() -> None:
     assert _sorted_fold_columns(["10", "2", "1", "0"]) == ["0", "1", "2", "10"]
+
+
+def _write_booster(booster_dir, fold: int) -> None:
+    import lightgbm as lgb
+
+    booster_dir.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(fold)
+    x = rng.normal(size=(200, 2))
+    y = 3.0 * x[:, 0] + 0.1 * x[:, 1] + rng.normal(scale=0.01, size=200)
+    model = lgb.LGBMRegressor(n_estimators=5, num_leaves=4, min_child_samples=5, verbose=-1)
+    model.fit(x, y, feature_name=["strong", "weak"])
+    model.booster_.save_model(str(booster_dir / f"fold_{fold}.txt"))
+
+
+def _write_dead_booster(booster_dir, fold: int) -> None:
+    """A fold whose booster makes no split, which is what a constant target produces.
+
+    Every feature then carries gain 0.0, so the loader's per-fold normalisation divides
+    zero by zero. This is the only way to build the NaN the ranking rule has to survive,
+    and it is a state a real fold reaches - a target with no variance inside the fold,
+    or `min_child_samples` above the fold's row count.
+    """
+    import lightgbm as lgb
+
+    booster_dir.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(100 + fold)
+    x = rng.normal(size=(200, 2))
+    y = np.full(200, 3.0)
+    model = lgb.LGBMRegressor(n_estimators=5, num_leaves=4, min_child_samples=5, verbose=-1)
+    model.fit(x, y, feature_name=["strong", "weak"])
+    assert model.booster_.feature_importance("split").sum() == 0, "fixture must make no split"
+    model.booster_.save_model(str(booster_dir / f"fold_{fold}.txt"))
+
+
+def _register_gbm(tmp_path, config_name: str) -> str:
+    return register_training_run(
+        "test",
+        {
+            "family": "gbm",
+            "label": "fwd_ret_5d",
+            "config_name": config_name,
+            "params": {},
+            "seed": 42,
+        },
+        case_dir=tmp_path,
+    )
+
+
+def test_gbm_importance_reads_the_boosters_the_training_stage_writes(tmp_path, monkeypatch) -> None:
+    """Boosters live under the run's own `models` directory.
+
+    The loader used to look only beside it and one level up, so every case study
+    fell through to the feature-prediction correlation fallback and published the
+    weaker instrument while the boosters sat on disk.
+    """
+    pytest.importorskip("lightgbm")
+    training_hash = _register_gbm(tmp_path, "probe_config")
+    booster_dir = tmp_path / "run_log" / "training" / training_hash / "models" / "boosters"
+    _write_booster(booster_dir, fold=0)
+    _write_booster(booster_dir, fold=1)
+    monkeypatch.setattr("case_studies.utils.model_analysis.get_case_study_dir", lambda _: tmp_path)
+
+    result = load_gbm_feature_importance("test", label="fwd_ret_5d", top_n=2)
+
+    assert result is not None
+    assert sorted(result["fold_id"].unique().to_list()) == [0, 1]
+    assert result["config_name"].unique().to_list() == ["probe_config"]
+    ordered = (
+        result.group_by("feature")
+        .agg(pl.col("importance_norm").mean())
+        .sort("importance_norm", descending=True)["feature"]
+        .to_list()
+    )
+    # "weak" contributes 0.1 of a target dominated by "strong", so across five trees of
+    # four leaves the booster never splits on it: 15 splits and 5402.9 gain against 0
+    # and 0.0. It is therefore not charted - see the test below, which is what that
+    # asserts. This case is about which directory the boosters were read from.
+    assert ordered == ["strong"]
+
+
+def test_a_feature_no_booster_split_on_is_not_charted(tmp_path, monkeypatch) -> None:
+    """The loader shares Chapter 12's ranking rule rather than cutting on a raw sort.
+
+    Gain is zero exactly when no tree split on the feature, and this fixture has one:
+    `_write_booster` fits `3.0 * strong + 0.1 * weak` with five trees of four leaves, so
+    `weak` takes 0 splits and 0.0 gain in every fold. The loader used to pass it to the
+    figure anyway, because `sort("mean_imp", descending=True).head(top_n)` ranks a
+    zero-gain feature like any other and polars' sort is not stable, so which members of
+    the tied zero block were charted also moved between loads of the same boosters.
+    """
+    pytest.importorskip("lightgbm")
+    training_hash = _register_gbm(tmp_path, "probe_config")
+    booster_dir = tmp_path / "run_log" / "training" / training_hash / "models" / "boosters"
+    _write_booster(booster_dir, fold=0)
+    _write_booster(booster_dir, fold=1)
+    monkeypatch.setattr("case_studies.utils.model_analysis.get_case_study_dir", lambda _: tmp_path)
+
+    charted = load_gbm_feature_importance("test", label="fwd_ret_5d", top_n=2)["feature"]
+    assert charted.unique().to_list() == ["strong"]
+
+    # The rule's other half - that a tied block is cut the same way on every load - is not
+    # testable from here and is not tested from here. Once `weak` is dropped this fixture
+    # has one surviving feature against a `top_n` of 2, so there is no tie to break and no
+    # cut boundary to land inside, and a repeat loop would pass against any tie-break rule
+    # including none. Building two real boosters that tie on pooled gain to reach it would
+    # be a worse test than the direct one:
+    # `tests/test_gbm_importance.py::test_a_tie_block_straddling_the_cut_is_resolved_the_same_way_every_time`.
+
+
+def test_a_fold_that_made_no_split_is_dropped_rather_than_poisoning_the_others(
+    tmp_path, monkeypatch
+) -> None:
+    """One dead fold must not decide the whole figure.
+
+    Its booster has gain 0.0 everywhere, so normalising by the fold's own maximum gives
+    NaN for every feature in it. NaN propagates through the mean the ranking rule takes,
+    polars answers True to `NaN > 0` and sorts NaN above every float, so without the drop
+    the chart becomes the alphabetically first `top_n` names presented as a gain ranking -
+    and `strong`, the only feature any tree split on, is the one excluded. The loader
+    pools every configuration in the case study, so it drops the fold and ranks the rest
+    rather than refusing the run the way `insight_chapter`'s single-configuration loader
+    does.
+    """
+    pytest.importorskip("lightgbm")
+    training_hash = _register_gbm(tmp_path, "probe_config")
+    booster_dir = tmp_path / "run_log" / "training" / training_hash / "models" / "boosters"
+    _write_booster(booster_dir, fold=0)
+    _write_dead_booster(booster_dir, fold=1)
+    monkeypatch.setattr("case_studies.utils.model_analysis.get_case_study_dir", lambda _: tmp_path)
+
+    result = load_gbm_feature_importance("test", label="fwd_ret_5d", top_n=2)
+
+    assert result is not None
+    assert not result["importance_norm"].is_nan().any()
+    assert result["fold_id"].unique().to_list() == [0], "the dead fold contributes nothing"
+    assert result["feature"].unique().to_list() == ["strong"]
+
+
+def test_a_run_whose_every_fold_is_dead_returns_none(tmp_path, monkeypatch) -> None:
+    """Rather than an empty frame the caller would chart as a figure with no bars."""
+    pytest.importorskip("lightgbm")
+    training_hash = _register_gbm(tmp_path, "probe_config")
+    booster_dir = tmp_path / "run_log" / "training" / training_hash / "models" / "boosters"
+    _write_dead_booster(booster_dir, fold=0)
+    monkeypatch.setattr("case_studies.utils.model_analysis.get_case_study_dir", lambda _: tmp_path)
+
+    assert load_gbm_feature_importance("test", label="fwd_ret_5d", top_n=2) is None
+
+
+def test_gbm_importance_still_reads_the_older_booster_layouts(tmp_path, monkeypatch) -> None:
+    """Run logs written before boosters moved keep working."""
+    pytest.importorskip("lightgbm")
+    beside = _register_gbm(tmp_path, "beside_config")
+    one_up = _register_gbm(tmp_path, "one_up_config")
+    _write_booster(tmp_path / "run_log" / "training" / beside / "boosters", fold=0)
+    _write_booster(tmp_path / "run_log" / "models" / one_up / "boosters", fold=0)
+    monkeypatch.setattr("case_studies.utils.model_analysis.get_case_study_dir", lambda _: tmp_path)
+
+    result = load_gbm_feature_importance("test", label="fwd_ret_5d", top_n=2)
+
+    assert result is not None
+    assert sorted(result["config_name"].unique().to_list()) == ["beside_config", "one_up_config"]
+
+
+def test_gbm_importance_returns_none_when_no_booster_layout_is_present(
+    tmp_path, monkeypatch
+) -> None:
+    """The registered run exists but its boosters do not, so the caller's fallback runs.
+
+    Without this the two tests above would pass against a loader that ignored the
+    filesystem entirely.
+    """
+    pytest.importorskip("lightgbm")
+    _register_gbm(tmp_path, "no_boosters")
+    monkeypatch.setattr("case_studies.utils.model_analysis.get_case_study_dir", lambda _: tmp_path)
+
+    assert load_gbm_feature_importance("test", label="fwd_ret_5d", top_n=2) is None

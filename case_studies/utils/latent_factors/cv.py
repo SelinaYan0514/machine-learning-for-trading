@@ -20,6 +20,7 @@ from ml4t.diagnostic.metrics import cross_sectional_ic
 from threadpoolctl import threadpool_limits
 
 from case_studies.utils.backtest_loaders import get_rebalance_step, thin_to_rebalance_dates
+from case_studies.utils.folds import fold_seed
 from case_studies.utils.latent_factors.cae import run_cae_fold
 from case_studies.utils.latent_factors.ipca import run_ipca_fold
 from case_studies.utils.latent_factors.library_bridge import configure_latent_torch_runtime
@@ -32,6 +33,7 @@ from case_studies.utils.latent_factors.pca import run_pca_fold
 from case_studies.utils.latent_factors.sae import run_sae_fold
 from case_studies.utils.latent_factors.sdf import run_sdf_fold
 from case_studies.utils.latent_factors.versions import latent_model_version
+from case_studies.utils.persistent_panel import PERSISTENT_PANEL_MODELS
 from utils.modeling import RANDOM_SEED, seed_everything
 
 _MODEL_RUNNERS = {
@@ -693,12 +695,15 @@ def run_latent_factor_cv(
         state[model_name] = {
             "fold_ics": [],
             "pred_frames": [],
+            "pred_files": [],
             "fold_extras": [],
         }
         log(f"  {model_name} (K={n_factors}):")
 
-    need_pca_inputs = "pca" in active_models
-    need_ragged_inputs = any(model_name != "pca" for model_name in active_models)
+    need_pca_inputs = bool(PERSISTENT_PANEL_MODELS & set(active_models))
+    need_ragged_inputs = any(
+        model_name not in PERSISTENT_PANEL_MODELS for model_name in active_models
+    )
 
     def runner_kwargs(
         model_name: str,
@@ -780,6 +785,7 @@ def run_latent_factor_cv(
             if not checkpoint_preds:
                 raise ValueError(f"{model_name} produced no physical checkpoints")
         checkpoint_ics: dict[int, float] = {}
+        fold_frames: list[pl.DataFrame] = []
         for epoch, predictions in checkpoint_preds.items():
             frame = _build_prediction_frame(
                 predictions=predictions,
@@ -810,7 +816,7 @@ def run_latent_factor_cv(
                 }
             )
             if frame is not None:
-                state[model_name]["pred_frames"].append(frame)
+                fold_frames.append(frame)
         best_epoch, reported_ic = _select_epoch_from_values(
             checkpoint_ics,
             checkpoint_selection_policy=metric_policy["checkpoint_selection_policy"],
@@ -820,13 +826,20 @@ def run_latent_factor_cv(
             f"      fold {split['fold']}: reported_epoch={best_epoch}, "
             f"IC={reported_ic:+.4f}, {fold_elapsed:.1f}s"
         )
-        _write_incremental_fold(
+        # This fold's predictions leave memory here. They used to be kept for the whole run
+        # in `pred_frames` and, separately, rebuilt from `checkpoint_preds` to be written -
+        # every fold of every model resident while the later folds were still fitting, and
+        # every prediction frame built twice.
+        fold_path = _write_incremental_fold(
             model_dir=model_dirs[model_name],
             fold_id=split["fold"],
-            predictions=checkpoint_preds,
-            model_input=model_input,
-            model_name=model_name,
+            frames=fold_frames,
         )
+        if fold_path is None:
+            state[model_name]["pred_frames"].extend(fold_frames)
+        else:
+            state[model_name]["pred_files"].append(fold_path)
+        fold_frames.clear()
 
     if fold_workers > 1 and active_models:
         prepared_folds: list[tuple[dict[str, Any], dict[str, Any]]] = []
@@ -884,7 +897,7 @@ def run_latent_factor_cv(
             {"fold_id": int(split["fold"]), **completed[int(split["fold"])][1]}
             for split, _ in prepared_folds
         ]
-        _require_ipca_convergence("ipca", ordered_extras)
+        _require_fit_convergence("ipca", ordered_extras)
         for split, model_input in prepared_folds:
             checkpoint_preds, extra, fold_elapsed = completed[int(split["fold"])]
             record_fold(
@@ -899,7 +912,9 @@ def run_latent_factor_cv(
         for split in splits:
             if not active_models:
                 break
-            seed_everything(RANDOM_SEED + int(split["fold"]))
+            # The fold's number is an input to the fit, not a label on it: renumbering
+            # the windows reseeds every one of them. See `folds.fold_seed`.
+            seed_everything(fold_seed(RANDOM_SEED, int(split["fold"])))
             fold_inputs = _prepare_fold_inputs(
                 dataset=dataset,
                 split=split,
@@ -944,11 +959,14 @@ def run_latent_factor_cv(
 
     for model_name in active_models:
         fold_ics_df = pl.DataFrame(state[model_name]["fold_ics"])
-        preds_df = (
-            pl.concat(state[model_name]["pred_frames"])
-            if state[model_name]["pred_frames"]
-            else pl.DataFrame()
-        )
+        # Read back in the order the folds were fitted, which is the order the accumulating
+        # list produced.
+        if state[model_name]["pred_files"]:
+            preds_df = pl.read_parquet(state[model_name]["pred_files"])
+        elif state[model_name]["pred_frames"]:
+            preds_df = pl.concat(state[model_name]["pred_frames"])
+        else:
+            preds_df = pl.DataFrame()
         best_epoch, mean_ic = _select_reporting_epoch(
             fold_ics_df,
             checkpoint_selection_policy=metric_policy["checkpoint_selection_policy"],
@@ -971,7 +989,7 @@ def run_latent_factor_cv(
         fold_metrics[model_name] = fold_ics_df
         all_extras[model_name] = state[model_name]["fold_extras"]
 
-        _require_ipca_convergence(model_name, state[model_name]["fold_extras"])
+        _require_fit_convergence(model_name, state[model_name]["fold_extras"])
 
         model_dir = model_dirs[model_name]
         if model_dir is not None:
@@ -1105,6 +1123,57 @@ def _filter_dataset_for_splits(
         )
         used = used | train | validation
     return dataset.filter(used)
+
+
+# Every latent-factor model that iterates towards a fit. `pca` is deliberately absent: it is
+# a deterministic decomposition with nothing to converge, so asking it for a determination
+# would refuse every PCA cohort.
+_CONVERGENCE_GUARDED_MODELS = frozenset({"ipca", "cae", "sae", "sdf"})
+
+
+def _require_fit_convergence(
+    model_name: str,
+    fold_extras: list[dict[str, Any]],
+) -> None:
+    """Refuse to register any iterative latent-factor cohort that did not converge.
+
+    `_require_ipca_convergence` below reads a ``converged`` flag that only the IPCA branch of
+    `library_bridge` wrote, so its name was accurate and its coverage was one model of four.
+    An SDF, CAE or SAE fit that never identified registered anyway: nothing compared the
+    objective at the last step with the one before it, nothing required the terminal Sharpe
+    to be finite, its predictions entered the population, and `require_complete` and the
+    notebook's IC table both passed. The failure was invisible at the point where it
+    happened and showed up only as results that were quietly meaningless.
+
+    The determination is not the same statement for every model, and `library_bridge`'s
+    ``convergence_criterion`` records which one was applied: IPCA reports whether its
+    alternating least squares settled within ``tol``, and the three gradient-descent models
+    report a finite terminal objective, plus a finite terminal Sharpe for the SDF. What the
+    guard requires is identical either way - a determination exists, and it is positive.
+    """
+    if model_name not in _CONVERGENCE_GUARDED_MODELS:
+        return
+    if model_name == "ipca":
+        _require_ipca_convergence(model_name, fold_extras)
+        return
+
+    # An absent flag is a runner that stopped writing the determination, which is how this
+    # guard silently loses a model. It is refused separately from a negative flag so the
+    # message says which of the two happened. IPCA keeps the older reading, where an absent
+    # flag counts as a fit that did not settle, because its stored extras were written
+    # under it.
+    undetermined = [int(extra["fold_id"]) for extra in fold_extras if "converged" not in extra]
+    if undetermined:
+        raise RuntimeError(
+            f"{model_name} recorded no convergence determination for folds {undetermined}; "
+            "refusing to register predictions from a fit that was never checked"
+        )
+    failed = [int(extra["fold_id"]) for extra in fold_extras if not extra["converged"]]
+    if failed:
+        raise RuntimeError(
+            f"{model_name} did not converge for folds "
+            f"{failed}; refusing to register predictions from a fit that did not identify"
+        )
 
 
 def _require_ipca_convergence(
@@ -1521,30 +1590,21 @@ def _write_incremental_fold(
     *,
     model_dir: Path | None,
     fold_id: int,
-    predictions: dict[int, np.ndarray],
-    model_input: dict[str, Any],
-    model_name: str,
-) -> None:
-    if model_dir is None:
-        return
+    frames: list[pl.DataFrame],
+) -> Path | None:
+    """Persist one fold's checkpoint predictions and return where they went.
+
+    Takes the frames the caller already scored rather than rebuilding them from the raw
+    predictions, which is what it used to do: every fold's predictions were constructed
+    twice, once to score and once to write.
+    """
+    if model_dir is None or not frames:
+        return None
     incremental_dir = model_dir / "_incremental"
     incremental_dir.mkdir(parents=True, exist_ok=True)
-    frames: list[pl.DataFrame] = []
-    for epoch, preds in predictions.items():
-        frame = _build_prediction_frame(
-            predictions=preds,
-            returns_val=model_input["returns_val"],
-            eval_returns_val=model_input.get("eval_returns_val"),
-            val_dates=model_input["val_dates"],
-            val_entities=model_input["val_entities"],
-            fold_id=fold_id,
-            model_name=model_name,
-            epoch=epoch,
-        )
-        if frame is not None:
-            frames.append(frame)
-    if frames:
-        pl.concat(frames).write_parquet(incremental_dir / f"fold{fold_id}.parquet")
+    path = incremental_dir / f"fold{fold_id}.parquet"
+    pl.concat(frames).write_parquet(path)
+    return path
 
 
 def _select_epoch_from_values(

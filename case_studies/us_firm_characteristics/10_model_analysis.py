@@ -56,7 +56,6 @@
 """Model Analysis: US Firm Characteristics, comparative evaluation across model families."""
 
 import sqlite3
-import warnings
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -64,6 +63,7 @@ import polars as pl
 import yaml
 from scipy.stats import spearmanr
 
+from case_studies.research import CausalResult, open_study
 from case_studies.utils.latent_factors import load_fold_extras
 from case_studies.utils.model_analysis import (
     best_model_per_family_fast,
@@ -89,11 +89,12 @@ from case_studies.utils.model_viz import (
 from case_studies.utils.notebook_render import (
     conformal_coverage_diagnostic,
 )
+from case_studies.utils.warning_policy import apply_notebook_warning_policy
 from utils.modeling import load_configs
 from utils.paths import get_case_study_dir
 from utils.style import COLORS
 
-warnings.filterwarnings("ignore")
+apply_notebook_warning_policy()
 
 # %% tags=["parameters"]
 CASE_STUDY = "us_firm_characteristics"
@@ -104,8 +105,22 @@ DATE_COL = "timestamp"
 ENTITY_COL = "symbol"
 N_BUCKETS = 10
 TOP_N_FEATURES = 15
+# Both names stay bound here although nothing below reads them: that is what makes the harness
+# force preview and supply a workspace - `_declares_tier_and_workspace` in `tests/pm_helpers.py`
+# looks for exactly this pair. Without them the canonical branch regenerates in place, which
+# needs symlinks a CI checkout does not have.
+EXECUTION_TIER = "canonical"
+WORKSPACE: str = ""
+
+# %% [markdown]
+# The study is opened before anything resolves a path or reads the registry. Under the preview
+# tier, opening it activates a workspace and rewrites `ML4T_OUTPUT_DIR` process-wide, and every
+# later `get_case_study_dir` call resolves against that. A `CASE_DIR` built first would point at
+# the released registry while everything after it reads the preview one.
 
 # %%
+study = open_study(CASE_STUDY, execution_tier=EXECUTION_TIER, workspace=WORKSPACE or None)
+
 CASE_DIR = get_case_study_dir(CASE_STUDY)
 
 with open(CASE_DIR / "config" / "setup.yaml") as f:
@@ -984,7 +999,7 @@ if "ipca" in lf_extras:
 
     n_top = min(10, n_chars)
     n_panels = min(3, n_factors)
-    fig, axes = plt.subplots(1, n_panels, figsize=(5 * n_panels, 5))
+    fig, axes = plt.subplots(1, n_panels, figsize=(5 * n_panels, 5), layout="tight")
     axes = np.atleast_1d(axes)
     for k, ax in enumerate(axes):
         col = gamma[:, k]
@@ -1024,7 +1039,7 @@ else:
 for model_name in ["cae", "sae"]:
     if model_name not in lf_extras:
         continue
-    fig, ax = plt.subplots(figsize=(8, 4))
+    fig, ax = plt.subplots(figsize=(8, 4), layout="tight")
     plotted = 0
     for fold in lf_extras[model_name]:
         # CAE writes two record shapes into one history: per-epoch training points, and
@@ -1075,44 +1090,80 @@ else:
 #
 # A causal identity covers the row cap and the development window as well as the fold
 # and placebo geometry, so re-running under a different cap writes a second row rather
-# than replacing the first. Both rows are real runs, and the table below is read as this
-# case study's causal evidence, so it shows the run under the configuration currently
-# declared and counts the superseded identities rather than mixing them in.
+# than replacing the first. Every such row is a real run, and more than one of them can
+# carry the same configuration name - the name is not the identity. The table below is
+# read as this case study's causal evidence, so it shows the single identity currently
+# in force for each label and counts the superseded rows rather than mixing them in.
 
 # %% tags=["results"]
 declared_causal = load_configs(CASE_STUDY, PRIMARY_LABEL, "causal_dml")[0]
+DECLARED_LABELS = [setup["labels"]["primary"], *setup["labels"].get("variants", [])]
+
+# `causal_runs` is keyed on the causal hash, and that identity covers the row cap, the
+# development cutoff, the seed and the fold and placebo geometry - not the config name
+# alone. This registry holds six rows for one label under two config names, and four of
+# them share the declared name while reporting effects of both signs. Selecting on the
+# config name therefore renders superseded runs beside the current one as though a
+# reader should weigh them together. `CausalResult.one` resolves the single identity in
+# force for a label and tier, which is the run this table is about.
 with sqlite3.connect(str(CASE_DIR / "run_log" / "registry.db")) as conn:
-    conn.row_factory = sqlite3.Row
-    causal_rows = [
-        dict(r)
-        for r in conn.execute(
-            "SELECT label, treatment, dml_effect, dml_se_hac, p_value_hac, naive_effect, "
-            "       confounding_bias_pct, refutation_p, n_folds, n_obs, spec_json "
-            "FROM causal_runs ORDER BY label"
-        ).fetchall()
-    ]
+    recorded = conn.execute("SELECT count(*) FROM causal_runs").fetchone()[0]
+    attempted = {r[0] for r in conn.execute("SELECT DISTINCT label FROM causal_runs")}
+
+
+# A spec written before the structured schema keeps the estimand flat under `params`,
+# and one written after it nests the same three fields under `computation`. Both shapes
+# are still in this table, so read each field from whichever the row carries.
+def _spec_field(spec, section, name):
+    computation = spec.get("computation")
+    if computation is not None:
+        return computation.get(section, {}).get(name)
+    return spec.get("params", {}).get(name, spec.get(name))
+
+
+causal_rows = []
+unresolved = {}
+for label in [lbl for lbl in DECLARED_LABELS if lbl in attempted]:
+    try:
+        result = CausalResult.one(study, label=label, execution_tier=EXECUTION_TIER)
+    except ValueError as exc:
+        unresolved[label] = str(exc)
+        continue
+    causal_rows.append(
+        {
+            "label": label,
+            "causal_hash": result.hash[:12],
+            "treatment": _spec_field(result.spec, "estimand", "treatment"),
+            "n_folds": _spec_field(result.spec, "cv", "n_folds"),
+            "max_samples": _spec_field(result.spec, "analysis_population", "max_samples"),
+            "n_obs": result.metrics["n_obs"],
+            "dml_effect": result.metrics["dml_effect"],
+            "dml_se_hac": result.metrics["dml_se_hac"],
+            "p_value_hac": result.metrics["p_value_hac"],
+            "naive_effect": result.metrics["naive_effect"],
+            "confounding_bias_pct": result.metrics["confounding_bias_pct"],
+            "refutation_p": result.metrics["refutation_p"],
+            "refutation_class": result.metrics["refutation_class"],
+        }
+    )
 
 if causal_rows:
-    all_causal = pl.DataFrame(causal_rows).with_columns(
-        config_name=pl.col("spec_json").str.json_path_match("$.config_name"),
-        max_samples=pl.col("spec_json").str.json_path_match("$.params.max_samples").cast(pl.Int64),
-    )
-    causal_df = (
-        all_causal.filter(pl.col("config_name") == declared_causal["config_name"])
-        .drop("spec_json")
-        .with_columns(
-            significant_hac=pl.col("p_value_hac") < 0.05,
-            refutation_passes=pl.col("refutation_p") < 0.05,
-        )
-    )
+    causal_df = pl.DataFrame(causal_rows).sort("label")
+    causal_df = causal_df.with_columns(significant_hac=pl.col("p_value_hac") < 0.05)
     print(f"declared causal configuration: {declared_causal['config_name']}")
-    print(f"runs recorded under it: {causal_df.height}")
-    print(f"superseded identities also in the table: {all_causal.height - causal_df.height}")
+    print(f"labels carrying a current causal identity: {causal_df.height} of {len(attempted)} run")
+    print(f"superseded rows also in the table: {recorded - causal_df.height}")
     print(f"clearing the HAC inference gate: {causal_df['significant_hac'].sum()}")
-    print(f"clearing the placebo refutation gate: {causal_df['refutation_passes'].sum()}")
+    # The refutation verdict comes from the shared derivation, which withholds one when
+    # the draw count is unknown or too small to have rejected at all. Applying a bare
+    # threshold to the p-value here would publish a pass for a run that was underpowered.
+    for verdict, n in sorted(causal_df["refutation_class"].value_counts().rows()):
+        print(f"clearing the placebo refutation gate - {verdict}: {n}")
     causal_df
 else:
-    print("No causal_runs rows recorded for this case study.")
+    print("No current causal identity for any label the causal stage ran.")
+for label, why in unresolved.items():
+    print(f"unresolved: {label}: {why}")
 
 # %% [markdown]
 # Two gates have to be cleared before a causal claim is made, and they fail in
@@ -1128,7 +1179,11 @@ else:
 # effect sizes in the table above, which are in the same units as each other.
 #
 # The second is the placebo test, which re-estimates the effect on permuted treatment
-# histories and asks where the real estimate falls among them. A placebo p-value near
+# histories and asks where the real run's HAC t-statistic falls among theirs. It compares
+# t-statistics and not effects: permuting the treatment frees it from the controls, so its
+# residual keeps nearly all its variance, and that variance is the denominator of the
+# second-stage effect. Comparing effects divides every placebo by a larger number than the
+# observed one and narrows the null toward a pass. A placebo p-value near
 # one does not mean the effect is absent; it means the estimate sits at the wrong end
 # of the placebo distribution to be read as evidence, and the notebook that produced it
 # says so directly. Neither gate is a substitute for the other, and an estimate that
@@ -1143,19 +1198,33 @@ else:
 # ### Calibration: Are Prediction Intervals Honest?
 #
 # An information coefficient says whether the ordering is right. It says nothing about
-# whether a model knows how wrong it is likely to be. Split-conformal prediction (Vovk
-# and co-authors, 2005; Lei and co-authors, 2018) gives a distribution-free check:
-# take the absolute residuals from one fold as a calibration sample, read off the
-# quantile at the nominal level, and use it to build an interval around every
-# prediction in the remaining folds. If the method is honest, the true label falls
-# inside that interval at close to the nominal rate.
+# whether a model knows how wrong it is likely to be. The width measured here is the one
+# the `conformal_weighted` allocator sizes positions with: calibrated per firm on every
+# absolute residual known at `t - h`, falling back to a quantile pooled over every firm
+# where one has too few residuals of its own. A decision is covered when its absolute
+# residual falls inside that half-width, and `n_uncalibrated` counts the decisions that
+# cleared no warm-up.
+#
+# `h` is the sizing lag, and for this case study it is one step while the label's horizon
+# is zero. The two differ here and nowhere else: a row is dated by the month the return was
+# earned, so nothing about the outcome reaches forward past its own row - but the position
+# that earned it was chosen at the end of the month before, so that row's residual is not
+# available to size it.
 #
 # Two numbers follow. Empirical coverage below nominal means the intervals are too
 # narrow and the model is overconfident. Empirical coverage above nominal means the
 # opposite, which is safer but wasteful. Width, reported as a multiple of the standard
-# deviation of realised returns so families on different scales can be compared, is
-# what separates two models that both cover correctly: the one with narrower intervals
-# at the same coverage is saying more.
+# deviation of the outcomes it was measured against so families on different scales can
+# be compared, is what separates two models that both cover correctly: the one with
+# narrower intervals at the same coverage is saying more.
+#
+# Read it as a diagnostic of residual dispersion rather than a guarantee. Split
+# conformal's finite-sample coverage (Vovk and co-authors, 2005; Lei and co-authors,
+# 2018) needs the calibration and evaluation residuals to be exchangeable and return
+# residuals are not, and nothing in the allocation path reads an interval or a coverage
+# level. Each row is the family's highest-IC configuration for the primary label, which
+# is a model-level ranking and not the funnel's - every selection stage ranks on
+# validation backtest Sharpe - used here because this runs before any backtest exists.
 
 # %%
 conformal_df = conformal_coverage_diagnostic(CASE_STUDY, label=PRIMARY_LABEL)

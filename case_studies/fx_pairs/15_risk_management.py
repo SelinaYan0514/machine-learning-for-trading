@@ -16,15 +16,30 @@
 # %% [markdown]
 # # Position Risk Controls - FX Pairs
 #
+# The two stages before this one decided what to hold and how much. A position risk rule decides
+# when to stop holding it. That makes this the first stage whose effect depends on the price path
+# inside a holding period rather than on its endpoints: a position that ends the period down four
+# percent and one that dipped nine percent on the way to ending down four are indistinguishable
+# to every earlier stage, and a stop separates them.
+#
+# The rules compared here are declared in `config/setup.yaml`, not invented in the notebook: four
+# fixed stop-loss levels and five trailing stops. Portfolio-level controls - a drawdown cap or a
+# daily loss limit applied to the book as a whole - are absent for this case study, so nothing in
+# this stage restrains the aggregate. Each position is governed on its own.
+#
 # This notebook selects one validation strategy per label from the equal-weight and allocation
 # populations, then changes only its predeclared position-risk rule. Cost-sensitivity results are
-# excluded from selection, so an optimistic cost assumption cannot advance a strategy.
+# excluded from selection, and the reason is a selection defect rather than tidiness: a cost sweep
+# re-prices one strategy under several assumptions, so a ranking that included those rows would
+# advance whichever strategy had been measured under the kindest cost model. The comparison would
+# read as a difference between strategies and be a difference between assumptions.
 #
 # **Learning objectives**
 #
 # - Select one parent strategy from an immutable validation cohort.
 # - Compare declared position controls while preserving upstream identity.
 # - Freeze the complete risk population before final strategy selection.
+# - See why the count of variants tried belongs beside any improvement they produce.
 #
 # **Book reference**: Chapter 19
 #
@@ -43,21 +58,22 @@ from case_studies.research import (
     BacktestResult,
     CandidateSet,
     OfficialPopulation,
-    PredictionResult,
     Result,
     candidate_set_supersedes,
     open_study,
     plan_backtests,
     population_supersedes,
     research_name,
+    reuse_disclosure,
     run_backtests,
     superseded_members,
 )
+from case_studies.utils.backtest_presets import EngineBacktestConfig
+from case_studies.utils.strategy_analysis import selectable_validation_candidates
 from case_studies.utils.sweep_config import (
-    get_allocators,
     get_portfolio_risk_controls,
     get_position_risk_controls,
-    get_top_k_values_for,
+    get_top_n_predictions,
 )
 from utils.paths import get_case_study_dir
 from utils.reproducibility import set_global_seeds
@@ -71,22 +87,50 @@ SPLIT = "validation"
 TOP_K = 0
 TOP_N_PREDICTIONS = None
 MAX_RISK_VARIANTS = 0
+# How many parents per label the overlay grid sits on. `None` reads
+# `backtest.sweep.top_n_predictions.risk_overlay`, which every case study declares as 1, and one
+# is narrow on purpose: an overlay is a second search over the same validation folds, so the
+# question the book asks is whether a control improves the configuration the funnel already
+# chose. Until 2026-09-20 that 1 was a literal `min(eligible, ...)` below rather than a number
+# read from the declaration, which left this case study unable to answer at any other width
+# while four others could. A wider run changes the member list of every name published here, so
+# it is narrowing and widening alike that need `POPULATION_NAME`, asserted below.
+TOP_N_COMBOS = None
 SEED = 42
 RUN_SWEEP = True
 FORCE_REBACKTEST = False
 POPULATION_NAME = ""
-SUPERSEDES_RISK_BACKTESTS: str = "cd421f7757e0"
+# `POPULATION_NAME` scopes what this notebook *writes*. The equal-weight baselines it reads are
+# written by `13_backtest` and carry the canonical name, so a scoped run that inherits the scope
+# on that lookup asks for a population no run ever wrote and stops with "resolved to 0 current
+# identities among 0 snapshots". Empty string reads the canonical baselines while the outputs
+# stay scoped, which is the shape a partial re-run needs; None means "same scope as the outputs".
+# `14_portfolio_management` gained the same parameter in #1109 and this is its sibling.
+BASELINE_POPULATION_NAME: str | None = None
+# `df20d72ab319` was the tip of `fx_pairs:risk-overlay-backtests` when it was written, and
+# `create` accepts the tip and nothing else, so the literal was correct exactly until this
+# notebook next published. `"live"` names the lineage and is resolved against it at run time.
+SUPERSEDES_RISK_BACKTESTS: str = "live"
 # A candidate set is immutable under its name, exactly as a population is, so a rebuilt upstream
 # generation has to name the set it replaces. Keyed by the full set name because that is what the
 # refusal prints: pasting back the name it names is the obvious thing to try, and it has to work.
 # Resolved through `candidate_set_supersedes` rather than passed straight to `create`, because a
 # reader's clean clone has no generation to supersede and `create` refuses a first version that
 # claims to replace one.
+#
+# `"live"` names the lineage rather than a generation of it, which is what stops these going
+# stale again. Three of the four hashes it replaces were already dead: the three
+# `pre-risk-strategies` sets moved on 2026-09-09 (`d966caa61faf` -> `669d50f0f525`,
+# `fde7af05fff6` -> `93b56a9dfb42`, `ff269dc95622` -> `f70630285818`), so each named the
+# generation its own successor had replaced and the next membership move here would have been
+# refused at the freeze, after the fit. `bf21ae4c9070` was still the head of
+# `fx_pairs:holdout-candidates` and would have gone the same way on the next publish.
+# See `case_studies.research.population.SUPERSEDES_LIVE`.
 SUPERSEDES_CANDIDATE_SETS: dict[str, str] = {
-    "fx_pairs:fwd_ret_1d:pre-risk-strategies": "208fc4bbc14c",
-    "fx_pairs:fwd_ret_5d:pre-risk-strategies": "ceea3ffc2dd3",
-    "fx_pairs:fwd_ret_21d:pre-risk-strategies": "23087a1081bf",
-    "fx_pairs:holdout-candidates": "4aea5c6c1218",
+    "fx_pairs:fwd_ret_1d:pre-risk-strategies": "live",
+    "fx_pairs:fwd_ret_5d:pre-risk-strategies": "live",
+    "fx_pairs:fwd_ret_21d:pre-risk-strategies": "live",
+    "fx_pairs:holdout-candidates": "live",
 }
 
 # %% [markdown]
@@ -94,6 +138,23 @@ SUPERSEDES_CANDIDATE_SETS: dict[str, str] = {
 #
 # Production uses the same signal-plus-allocation candidate cohort as the cost notebook. Preview
 # mode resolves one deterministic allocation result from the reduced prediction catalog.
+#
+# One parent per label, chosen by best validation backtest Sharpe from the sealed pre-risk cohort.
+# Sharing the cohort with the cost notebook is deliberate: both stages branch from the same
+# strategy, so their results are siblings of one parent and can be read against each other. If
+# each stage picked its own parent, a cost result and a risk result for the same label would
+# describe two different strategies and the comparison between them would mean nothing.
+#
+# The cohort is sealed before it is ranked, which is what makes "best" a statement about a fixed
+# set. A cohort that could still gain members after the selection would let a later run change
+# which strategy this notebook chose, retroactively, with no record that it had changed.
+#
+# The `identity_status == "current"` filter below carries the same trap `13_backtest` documents:
+# it names the schema version a row was written under, not whether its producer still publishes
+# it. A refit leaves the replaced generation in the registry, complete and current, so the filter
+# alone would let a retired prediction set into the cohort - and nothing would fail, because a
+# retired prediction still produces a correct backtest. `superseded_members` reads the lineage,
+# which is where the retirement is recorded.
 
 # %% tags=["results"]
 set_global_seeds(SEED)
@@ -116,20 +177,37 @@ study = open_study(CASE_STUDY_ID, execution_tier=EXECUTION_TIER, workspace=WORKS
 # test suite exercises, then resolved no rows at all.
 include_preview = EXECUTION_TIER == "preview"
 
+
+def _resolve_baseline_scope(output_scope: str, input_scope: str | None) -> str:
+    return output_scope if input_scope is None else input_scope
+
+
+baseline_population_name = _resolve_baseline_scope(POPULATION_NAME, BASELINE_POPULATION_NAME)
+
 # The tier decides the namespace, so a canonical run may legitimately be narrowed -
 # but a narrowed run declares a different set of members than the canonical
 # population does, and a population is immutable once written. Such a run must
 # publish under its own name rather than register a partial snapshot of the risk overlay sweep
 # under the canonical one.
 if (
-    (TOP_K or TOP_N_PREDICTIONS is not None or MAX_RISK_VARIANTS or LABEL)
+    (
+        TOP_K
+        or TOP_N_PREDICTIONS is not None
+        or MAX_RISK_VARIANTS
+        or LABEL
+        or TOP_N_COMBOS is not None
+    )
     and not include_preview
     and not POPULATION_NAME
 ):
     raise ValueError(
-        "this run narrows the risk overlay sweep, so it cannot publish the canonical "
-        "population; pass POPULATION_NAME to give it its own"
+        "this run does not sweep the declared risk overlay population, so it cannot publish "
+        "the canonical one; pass POPULATION_NAME to give it its own"
     )
+if TOP_N_COMBOS is None:
+    TOP_N_COMBOS = get_top_n_predictions(CASE_STUDY_ID, "risk_overlay")
+if TOP_N_COMBOS < 1:
+    raise ValueError("the risk overlay needs at least one parent per label")
 catalog = study.predictions.table(include_preview=include_preview).filter(
     (pl.col("identity_status") == "current")
     & (pl.col("split") == SPLIT)
@@ -141,10 +219,11 @@ catalog = study.predictions.table(include_preview=include_preview).filter(
 # replaced in the registry, complete and current, so this filter alone would carry a retired
 # prediction set into the sweep. `superseded_members` reads the lineage instead - see
 # `13_backtest`, which drops the same set before it freezes the baseline population.
-# `SUPERSEDES_RISK_BACKTESTS` names the snapshot this run replaces under the name it publishes,
-# offered through `population_supersedes` on the same rule. It is empty until that name has a
-# first generation; after that, an upstream refit changes this population's member list and
-# the registry refuses the write without it. `13_backtest` states the reasoning once.
+# `SUPERSEDES_RISK_BACKTESTS` is the sentinel `"live"`, so it names the lineage this run
+# publishes under and `population_supersedes` resolves the generation in force at write time.
+# It resolves to nothing until that name has a first generation, which is also what a reader's
+# clean clone sees; after that, an upstream refit changes this population's member list and the
+# registry refuses the write without the tip. `13_backtest` states the reasoning once.
 retired = superseded_members(study, member_kind="prediction")
 if retired:
     catalog = catalog.filter(~pl.col("prediction_hash").is_in(list(retired)))
@@ -212,7 +291,7 @@ def _preview_leader(rows: pl.DataFrame, registered_allocations: pl.DataFrame) ->
     return result
 
 
-selected_by_label: dict[str, BacktestResult] = {}
+selected_by_label: dict[str, list[BacktestResult]] = {}
 candidate_sets: dict[str, CandidateSet] = {}
 if include_preview:
     # The labels come from what the upstream preview registered, the same rule the
@@ -232,14 +311,16 @@ if include_preview:
             "run 14_portfolio_management at the same reduction first"
         )
     for label in sorted(covered.get_column("label").unique()):
-        selected_by_label[label] = _preview_leader(
-            covered.filter(pl.col("label") == label), registered_allocations
-        )
+        selected_by_label[label] = [
+            _preview_leader(covered.filter(pl.col("label") == label), registered_allocations)
+        ]
 else:
     baselines = _open_backtests(
         OfficialPopulation.one(
             study,
-            name=research_name(CASE_STUDY_ID, "equal-weight-baselines", scope=POPULATION_NAME),
+            name=research_name(
+                CASE_STUDY_ID, "equal-weight-baselines", scope=baseline_population_name
+            ),
         )
     )
     allocations = _open_backtests(
@@ -262,24 +343,45 @@ else:
             f"upstream {upstream_labels}, "
             f"catalog {sorted(catalog.get_column('label').unique())}"
         )
+    # Eligibility and order both come from `selectable_validation_candidates`, the function
+    # `resolve_solvent_carrier` ranks. Re-deriving them here swept the risk variants over a
+    # strategy the case study never publishes: the populations above are read whole, and nothing
+    # applies the retired-prediction test to them, so a backtest whose prediction a later refit
+    # superseded still won on raw Sharpe. `16_costs` carried the same defect.
+    _eligible_order = {
+        row["backtest_hash"]: position
+        for position, row in enumerate(
+            selectable_validation_candidates(CASE_STUDY_ID, labels=[LABEL] if LABEL else None)
+        )
+    }
     for label in upstream_labels:
         members = [result for result in upstream if _label(result) == label]
+        eligible = [result for result in members if result.hash in _eligible_order]
+        if not eligible:
+            raise RuntimeError(
+                f"none of the {len(members)} upstream backtests for {label} is selectable: "
+                "every one is retired on the backtest or the prediction side, or belongs to no "
+                "population its producer publishes. Re-run the validation stages rather than "
+                "sweeping risk controls over a strategy nothing reports."
+            )
         _set_name = research_name(
             CASE_STUDY_ID, f"{label}:pre-risk-strategies", scope=POPULATION_NAME
         )
+        # The frozen set records the field the selection actually saw, so it holds the
+        # selectable members and not every row the three populations list.
         candidates = CandidateSet.create(
             study,
             name=_set_name,
-            members=members,
+            members=eligible,
             supersedes=candidate_set_supersedes(
                 study, name=_set_name, declared=SUPERSEDES_CANDIDATE_SETS.get(_set_name)
             ),
         )
         candidate_sets[label] = candidates
-        leader = candidates.best_validation_sharpe()
-        if not isinstance(leader, BacktestResult):
+        leaders = sorted(eligible, key=lambda result: _eligible_order[result.hash])[:TOP_N_COMBOS]
+        if not all(isinstance(leader, BacktestResult) for leader in leaders):
             raise TypeError("strategy selection did not return a backtest")
-        selected_by_label[label] = leader
+        selected_by_label[label] = leaders
 
 pl.DataFrame(
     [
@@ -289,7 +391,8 @@ pl.DataFrame(
             "prediction_hash": result.registry_record()["prediction_hash"],
             "stage": result.registry_record()["stage"],
         }
-        for label, result in selected_by_label.items()
+        for label, results in selected_by_label.items()
+        for result in results
     ]
 )
 
@@ -300,6 +403,21 @@ pl.DataFrame(
 # this case study. The identity audit removes only the risk block and chapter label; the prediction,
 # signal, allocation, configured costs, and execution contract must remain unchanged. Production
 # freezes every expected risk identity before the first backtest is written.
+#
+# The audit is what makes each result a sibling rather than another strategy. Two backtests that
+# differ in their stop and in nothing else can be subtracted; two that differ in their stop and
+# their cost model cannot, and no field in the output would say which case you are looking at.
+# Removing exactly the risk block and the chapter label, then requiring the remainder to match,
+# is how that is established rather than assumed.
+#
+# How a stop is evaluated is worth knowing before reading its results. `StopLoss` and
+# `TrailingStop` in `ml4t.backtest.risk` trigger on the bar's low or high where the price frame
+# supplies a range, and fall back to the close where it does not, so the same threshold is a
+# different rule depending on what the bars carry. The fill is a separate configured choice:
+# filling at the stop price, at the bar's extreme, or at the close give materially different
+# answers for one triggered stop, and the gap between them widens exactly in the volatile periods
+# a stop is meant to handle. A stop's measured benefit is therefore partly a statement about the
+# fill model, and that is a declared assumption rather than a property of the market.
 
 # %% tags=["results"]
 position_controls = get_position_risk_controls(CASE_STUDY_ID)
@@ -344,35 +462,65 @@ def _non_risk_projection(spec: dict[str, Any]) -> dict[str, Any]:
     metadata = projected.get("backtest_config", {}).get("metadata")
     if isinstance(metadata, dict):
         metadata.pop("chapter", None)
+        # An absolute filesystem path, and already excluded from the identity hash by
+        # `_HASH_EXCLUDED_METADATA` for that reason. Comparing it here makes the notebook
+        # refuse its own siblings from any checkout but the one that registered the parents.
+        metadata.pop("preset_path", None)
+    # The parent allocation row was serialized by whatever engine version registered it and the
+    # risk result by the installed one, so a field `BacktestConfig` has since gained is absent on
+    # one side and present on the other while both describe the same strategy. `ml4t-backtest`
+    # 0.1.3 to 0.1.6 added `account.lock_notional_update_mode` and
+    # `position_sizing.share_rounding`, both previously implicit defaults the schema made
+    # explicit: `NEAREST` is the rounding the engine already did, and `POSITION_LEGS` only bites
+    # under a `lock_notional` short cash policy. Every fx_pairs parent predates them, so this
+    # comparison reported a moved strategy field on two names for one behaviour.
+    #
+    # Round-tripping both sides through the installed schema states the comparison in one
+    # vocabulary, so it answers what this notebook built rather than which engine wrote the row it
+    # is compared against, and it covers the next added field without naming it.
+    # `14_portfolio_management.py`, `16_costs.py` and `19_strategy_analysis.py` already do this;
+    # this projection is the one that was missed. `ensure_backtest_spec` deliberately does NOT
+    # round-trip, because there the result is hashed and a dropped unknown key would move an
+    # identity; here it is compared and discarded. Metadata is merged back over the serialized
+    # view because the dataclass pins a schema and drops keys it does not know.
+    config = projected.get("backtest_config", {})
+    if EngineBacktestConfig is not None and config:
+        original_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        rebuilt = EngineBacktestConfig.from_dict(config).to_dict()
+        rebuilt_metadata = dict(rebuilt.get("metadata") or {})
+        rebuilt_metadata.update(original_metadata)
+        rebuilt["metadata"] = rebuilt_metadata
+        projected["backtest_config"] = rebuilt
     return projected
 
 
 risk_jobs = []
-for label, selected in selected_by_label.items():
-    arguments = _strategy_arguments(selected)
-    for control in position_controls:
-        risk = _risk_payload(control)
-        plan = plan_backtests(
-            study,
-            predictions=_catalog_row(selected),
-            signal=arguments["signal"],
-            allocation=arguments["allocation"],
-            risk=risk,
-            chapter="19",
-            execution_mode=arguments["execution_mode"],
-        )
-        if len(plan.members) != 1:
-            raise RuntimeError("a risk plan must contain exactly one backtest")
-        risk_jobs.append(
-            {
-                "label": label,
-                "selected": selected,
-                "arguments": arguments,
-                "risk": risk,
-                "risk_name": control["name"],
-                "backtest_hash": plan.expected_hashes[0],
-            }
-        )
+for label, selected_results in selected_by_label.items():
+    for selected in selected_results:
+        arguments = _strategy_arguments(selected)
+        for control in position_controls:
+            risk = _risk_payload(control)
+            plan = plan_backtests(
+                study,
+                predictions=_catalog_row(selected),
+                signal=arguments["signal"],
+                allocation=arguments["allocation"],
+                risk=risk,
+                chapter="19",
+                execution_mode=arguments["execution_mode"],
+            )
+            if len(plan.members) != 1:
+                raise RuntimeError("a risk plan must contain exactly one backtest")
+            risk_jobs.append(
+                {
+                    "label": label,
+                    "selected": selected,
+                    "arguments": arguments,
+                    "risk": risk,
+                    "risk_name": control["name"],
+                    "backtest_hash": plan.expected_hashes[0],
+                }
+            )
 
 planned_hashes = [job["backtest_hash"] for job in risk_jobs]
 if len(planned_hashes) != len(set(planned_hashes)):
@@ -447,7 +595,7 @@ for job in risk_jobs:
 
 served = run_status.count("reused")
 print(
-    f"Risk overlays: {len(risk_results) - served} computed, {served} served from the registry, "
+    f"Risk overlays: {reuse_disclosure(len(risk_results) - served, served)}, "
     f"{len(risk_results)} in the population"
 )
 
@@ -467,6 +615,20 @@ pl.DataFrame(risk_rows).sort("label", "risk_name")
 # must agree on, so a candidate fitted against different labels, features or folds cannot silently
 # join a set the holdout will pick from. Only identities are printed here; what the selection is
 # worth is `19_strategy_analysis`'s question.
+#
+# The size of this set is the part that no table above reports and that every number below depends
+# on. Nine position rules were tried for each parent, on top of the allocators tried before them
+# and the configurations tried before those. The best member wins by some margin over the rest, and
+# part of that margin is simply the best of many draws on one validation period. Nothing in a
+# result marks it: the Sharpe, the drawdown and the hit rate of the winning stop are all correctly
+# computed for that stop, and a reader shown only the winner sees a strategy that looks better
+# rather than a maximum taken over a set whose size is not on the page. This is why the count of
+# members matters as much as the leader, why the set is frozen rather than pruned to the winner,
+# and why the holdout is spent once against the whole set rather than against the leader alone.
+#
+# Freezing rather than pruning also keeps the negative results. A stop level that made things
+# worse is a finding about this strategy, and it is only visible while the members that lost are
+# still in the set beside the one that won.
 
 # %%
 if not include_preview:
@@ -491,6 +653,18 @@ else:
 # %% [markdown]
 # ## Key takeaways
 #
-# - Risk variants descend from the same signal-plus-allocation selection cohort as cost variants.
-# - Each comparison changes one declared position-risk rule.
-# - The final candidate set contains signal, allocation, and risk results across every label.
+# - Risk variants descend from the same signal-plus-allocation selection cohort as cost variants,
+#   so a cost result and a risk result for one label describe the same parent strategy.
+# - Each comparison changes one declared position-risk rule. The identity audit enforces that,
+#   because two results differing in a stop and in something else cannot be subtracted and nothing
+#   in the output would say so.
+# - Cost-sensitivity rows are excluded from selection: including them would advance the strategy
+#   measured under the kindest cost assumption, not the best strategy.
+# - A stop reads the path inside a holding period, which no earlier stage does. Its measured
+#   benefit depends on what the bars carry and on the configured fill model.
+# - The final candidate set contains signal, allocation, and risk results across every label, and
+#   its size is the number of trials the eventual winner was drawn from.
+#
+# The improvement a stop shows here is measured on validation, and the stop level was chosen by
+# looking at that same validation period. Whether it survives is the holdout's question, asked
+# once, and it is allowed to answer no.

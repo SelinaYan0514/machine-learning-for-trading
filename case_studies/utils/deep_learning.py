@@ -25,12 +25,9 @@ import importlib.metadata
 import json
 import os
 import platform
-import shutil
-import subprocess
 import time
 import uuid
-import warnings
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -53,14 +50,20 @@ from case_studies.utils.cv_results import (
     combine_cv_results,
     rebuild_cv_result_from_registry,
 )
+from case_studies.utils.folds import fold_seed
 from case_studies.utils.registry.store import (
     _save_parquet,
+    clear_fold_predictions,
     flush_fold_predictions,
     flush_fold_training_log,
+    incremental_prediction_shards,
 )
-from case_studies.utils.runtime import cpu_seconds
+from case_studies.utils.runtime import cpu_seconds, source_commit
 from case_studies.utils.sequence_dataset import (
+    GAP_MASK_FEATURES,
+    GAP_POLICY_ID,
     FoldSequenceDataset,
+    collate_sequences,
     collate_with_metadata,
     materialize_store_metadata,
     prepare_fold_sequence_stores,
@@ -70,20 +73,32 @@ from case_studies.utils.sequence_dataset import (
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
+from utils.artifact_specs import resolve_label_horizon
 from utils.modeling import RANDOM_SEED, seed_everything
 
 if TYPE_CHECKING:
     from case_studies.research.workspace import Study
 
-_SEQUENCE_PREVIEW_FIELDS = {
-    "folds",
-    "max_symbols",
-    "max_train_sequences",
-    "max_predict_sequences",
-}
+from case_studies.utils.preview_fields import (
+    SEQUENCE_PREVIEW_FIELDS as _SEQUENCE_PREVIEW_FIELDS,
+)
 
 SEQUENCE_RUNNER_VERSION = 1
-SEQUENCE_PREPARATION_VERSION = 1
+# 2: #767 (174154ad) changed what a sequence family is fitted on. `np.nan_to_num(..., nan=0.0)`
+# used to run in `_build_symbol_arrays` BEFORE `_compute_feature_stats`, so a missing feature
+# became a raw zero, entered the mean and the standard deviation, and was then standardized like
+# a real observation - on seoa's `garch_cond_vol` landing at -1.64 sd, below anything observed,
+# and skewing every other symbol's normalization on the way. It is now imputed at the training
+# mean. That is a different design matrix, not a rename, so a version-1 run and a run under the
+# corrected fill must not share a training identity.
+# 3: windows are laid out on the panel's expected periods rather than on the symbol's own row
+# order, so a period the symbol has no row for keeps its cell and is described by two channels
+# the model reads - `__observed__` and `__periods_since_observation__`. Eligibility went with it:
+# a window needs `min_observed_fraction` of its cells observed and no missing run longer than
+# `max_consecutive_gap`, where it previously needed every cell. Both the window contents and the
+# set of windows changed, so this is a different design matrix again. Direct `run_dl_cv` callers
+# register through `sequence_identity_params` and see the policy only through this number.
+SEQUENCE_PREPARATION_VERSION = 3
 SEQUENCE_STATE_VERSION = 1
 SEQUENCE_BACKEND_VERSIONS = {"darts": 1, "pytorch": 1}
 SEQUENCE_ARCHITECTURE_VERSIONS = {
@@ -118,6 +133,8 @@ class SequenceResearchContext:
     # Preview-only, and deliberately absent from `sequence_identity_params`: capping how
     # many validation windows are scored changes what the run covers, never what it fits.
     max_predict_sequences: int = 0
+    # Observations between one training window and the next. Zero leaves every window.
+    train_sequence_stride: int = 0
 
 
 def _sha256(path: Path) -> str:
@@ -162,15 +179,7 @@ def _sequence_runtime_identity(config: dict[str, Any]) -> dict[str, str]:
 
 
 def _sequence_runtime_provenance(study: Study, config: dict[str, Any]) -> dict[str, Any]:
-    try:
-        commit = subprocess.check_output(
-            ["git", "-C", str(study.release_root), "rev-parse", "HEAD"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=5,
-        ).strip()
-    except (OSError, subprocess.SubprocessError):
-        commit = "unknown"
+    commit = source_commit(study.release_root)
     return {
         "entry_point": "case_studies.utils.deep_learning",
         "packages": _sequence_runtime_identity(config),
@@ -372,6 +381,57 @@ def resolve_dl_max_train_sequences(
     return (reduction or declared), reduction
 
 
+def resolve_dl_train_sequence_stride(
+    config: Mapping[str, Any] | None,
+    *,
+    horizon: str | None,
+    dates: Any,
+) -> int:
+    """Resolve the training-window stride, in panel observations, that ``modeling.dl`` declares.
+
+    Returns 0 when nothing is declared, which leaves every valid window in the fold.
+
+    ``train_sequence_stride_horizons`` says how many label horizons separate one training
+    window from the next, so ``1`` draws one window per horizon and no two consecutive
+    windows of a symbol carry overlapping labels. It is stated in horizons rather than in
+    observations because one line then covers every label the case study trains: on a minute
+    panel a five-minute label strides five observations and a sixty-minute label sixty, from
+    the same declaration.
+
+    The observation grid is measured from the timestamps rather than divided out of a declared
+    cadence, because the two need not agree - nasdaq100 declares a fifteen-minute decision
+    cadence and trains on the one-minute grid its features are built on.
+
+    Mutually exclusive with ``max_train_sequences``. One says how far apart windows sit and the
+    other how many there are; a run cannot honour both, and a count is what a case study that
+    wants overlapping windows declares instead.
+    """
+    from case_studies.utils.registry.metrics import horizon_in_observations
+
+    declared_raw = (config or {}).get("train_sequence_stride_horizons")
+    if declared_raw is None:
+        return 0
+    declared = int(declared_raw)
+    if declared <= 0:
+        raise ValueError(
+            "modeling.dl.train_sequence_stride_horizons must be a positive number of label "
+            f"horizons, not {declared}"
+        )
+    if (config or {}).get("max_train_sequences") is not None:
+        raise ValueError(
+            "modeling.dl declares both train_sequence_stride_horizons and max_train_sequences. "
+            "The first spaces training windows and the second counts them; declare one."
+        )
+    periods = horizon_in_observations(horizon, dates)
+    if periods is None:
+        raise ValueError(
+            f"train_sequence_stride_horizons needs a sub-daily label horizon to measure "
+            f"against the observation grid, and {horizon!r} does not resolve to one. A daily, "
+            "weekly or monthly horizon has no fixed length in seconds on a trading calendar."
+        )
+    return declared * int(periods)
+
+
 def _sequence_runtime_spec(
     device: str,
     *,
@@ -467,9 +527,19 @@ def resolve_model_request(study: Study, request: dict[str, Any]):
         num_threads=int(request["overrides"].get("num_threads", 8)),
     )
     setup = yaml.safe_load((study.root / "config" / "setup.yaml").read_text()) or {}
+    dl_setup = (setup.get("modeling") or {}).get("dl") or {}
     max_train_sequences, sequence_reduction = resolve_dl_max_train_sequences(
-        (setup.get("modeling") or {}).get("dl") or {},
+        dl_setup,
         int(reductions.get("max_train_sequences", 0)),
+    )
+    # Measured against the observations this run actually trains on, which is what
+    # `_select_sequence_observations` just returned rather than the panel it was given.
+    train_sequence_stride = resolve_dl_train_sequence_stride(
+        dl_setup,
+        horizon=resolve_label_horizon(study.case_study, label_ref.name, setup),
+        dates=dataset.get_column(mds.date_col)
+        if isinstance(dataset, pl.DataFrame)
+        else pl.Series(mds.date_col, dataset[mds.date_col].to_numpy()),
     )
     # Preview-only, with no counterpart under `modeling.dl`: a declared cap on the
     # training sample is a property of the model, while a cap on how much of validation
@@ -527,6 +597,7 @@ def resolve_model_request(study: Study, request: dict[str, Any]):
             case_study=study.case_study,
             input_data_spec=mds.input_lineage,
             max_train_sequences=max_train_sequences,
+            train_sequence_stride=train_sequence_stride,
         )
         preprocessing = {
             "class": "fold_train_standardization",
@@ -536,6 +607,7 @@ def resolve_model_request(study: Study, request: dict[str, Any]):
             "input_chunk_length": sequence_identity["input_chunk_length"],
             "output_chunk_length": sequence_identity["output_chunk_length"],
         }
+        sequence_feature_names = tuple(mds.feature_names)
     else:
         expected = sequence_validation_keys(
             dataset_pd,
@@ -551,20 +623,29 @@ def resolve_model_request(study: Study, request: dict[str, Any]):
             "input_data_spec": mds.input_lineage,
             "lookback": lookback,
             "max_train_sequences": max_train_sequences,
+            # Written only when declared. `computation` is hashed whole, so an
+            # unconditional zero would move the training_hash of every sequence run
+            # already registered, none of which strides its windows.
+            **({"train_sequence_stride": train_sequence_stride} if train_sequence_stride else {}),
         }
         preprocessing = {
             "class": "fold_train_standardization",
             "calendar_id": calendar_id,
-            "gap_policy": "exclude_windows_crossing_missing_expected_periods",
+            "gap_policy": GAP_POLICY_ID,
             "lookback": lookback,
         }
+        # The observation mask and the staleness count are inputs the model
+        # reads, so they are declared alongside the features they qualify
+        # rather than appended inside the loader. Darts presets forecast whole
+        # series through their own windowing and never see them.
+        sequence_feature_names = (*mds.feature_names, *GAP_MASK_FEATURES)
     checkpoints = declared_epoch_checkpoints(
         int(config.get("n_epochs", 100)), int(config.get("checkpoint_interval", 5))
     )
     computation = {
         "label_artifact": {"digest": label_ref.digest, "name": label_ref.name},
         "feature_artifacts": mds.input_lineage["artifacts"],
-        "feature_names": list(mds.feature_names),
+        "feature_names": list(sequence_feature_names),
         "task": {
             "type": "regression",
             "class_values": [],
@@ -625,7 +706,7 @@ def resolve_model_request(study: Study, request: dict[str, Any]):
         dataset_pd=dataset_pd,
         splits=tuple(splits),
         config=config,
-        feature_names=tuple(mds.feature_names),
+        feature_names=tuple(sequence_feature_names),
         label_col=mds.label_col,
         date_col=mds.date_col,
         entity_col=entity_col,
@@ -637,49 +718,51 @@ def resolve_model_request(study: Study, request: dict[str, Any]):
         expected_keys=expected,
         max_train_sequences=max_train_sequences,
         max_predict_sequences=predict_reduction,
+        train_sequence_stride=train_sequence_stride,
         runtime_provenance=runtime_provenance,
     )
     return spec, context
 
 
-def reconstruct_locked_request(
-    study: Study,
-    spec: dict[str, Any],
-    *,
-    checkpoint_kind: str,
-    checkpoint_value: int | None,
-):
-    """Reconstruct a sequence holdout fit without consulting a mutable preset."""
+@dataclass(frozen=True)
+class LockedSequenceInputs:
+    """Everything a locked sequence specification determines about its own inputs.
+
+    Derived from the spec and never from a preset, so an edit to a preset since the run
+    cannot change what is reconstructed. Both callers below need exactly this set, and they
+    need it to be the SAME set: `rekey_holdout_spec` writes the eligibility manifest and
+    `reconstruct_locked_request` checks it, so a second derivation is two statements of one
+    rule that agree until they do not.
+    """
+
+    label_ref: Any
+    mds: Any
+    split: dict[str, Any]
+    config: dict[str, Any]
+    dataset_pd: Any
+    lookback: int
+    decision_cadence: str | None
+    preprocessing: dict[str, Any]
+
+
+def locked_sequence_inputs(study: Study, spec: dict[str, Any]) -> LockedSequenceInputs:
+    """Rebuild a locked sequence run's inputs from its own specification.
+
+    The configuration comes out of the recorded model block rather than out of
+    `load_configs`, for the reason `reconstruct_locked_request` has always given: a preset is
+    mutable and the spec is not, so reading the preset would let an edit since selection
+    change what is refitted without changing anything a reader can see.
+
+    The dataset is thinned to the locked decision cadence before any window is built,
+    because `resolve_model_request` thins it there too. A weekly-cadence lock reconstructed
+    on every session is not a cheaper refit, it is a different model.
+    """
     from case_studies.research.contracts import ExecutionTier
-    from case_studies.research.cv import (
-        require_fold_scoped_temporal_holdout_coverage,
-    )
-    from case_studies.research.models import (
-        ResolvedModelRequest,
-        locked_holdout_split,
-        validate_locked_expected_keys,
-    )
-    from case_studies.utils.artifact_digest import value_digest
-    from case_studies.utils.deep_model_state import declared_epoch_checkpoints
+    from case_studies.research.models import locked_holdout_split
     from case_studies.utils.registry import training_hash_from_spec
     from utils.modeling import load_modeling_dataset
 
-    if checkpoint_kind != "epoch" or checkpoint_value is None:
-        raise ValueError("sequence holdout requires one locked epoch checkpoint")
-    study.require_writable()
-    study.activate(ExecutionTier.CANONICAL)
     computation = spec["computation"]
-    if computation.get("sampling") != {"max_symbols": 0, "max_train_sequences": 0}:
-        raise ValueError("locked sequence holdout requires unreduced canonical inputs")
-    # `sampling` above proves no PREVIEW reduced this run. A cap the configuration
-    # DECLARES is a different thing and has to reach the refit: it is part of the model,
-    # so a holdout drawing a different number of windows than the validation fit is not a
-    # cheaper run, it is a different model answering the holdout - and nothing in the
-    # output would show it. Taken from the stored spec rather than re-read from
-    # setup.yaml, so an edit since selection cannot silently change what is refitted.
-    locked_max_train_sequences = int(
-        (computation.get("input_data_spec") or {}).get("max_train_sequences", 0)
-    )
     label_ref = study.labels.get(spec["label"], execution_tier=ExecutionTier.CANONICAL)
     mds = load_modeling_dataset(study.case_study, label_ref.name, max_symbols=0)
     if mds.date_col != "timestamp" or mds.entity_cols[:1] not in (["symbol"], ["product"]):
@@ -687,20 +770,6 @@ def reconstruct_locked_request(
     if mds.task_type != "regression":
         raise ValueError("locked sequence runner currently supports regression labels only")
     split = locked_holdout_split(spec, mds.dataset, mds.date_col, study.case_study)
-    if mds.temporal_by_fold is not None and mds.temporal_keys and mds.temporal_feature_names:
-        # Coverage, not fold-boundary compatibility - the branch `latent_factors/adapter.py:603`
-        # and `gbm.py` already take, for the same reason. Compatibility asks whether the stage-04
-        # artifact declares a fold with this geometry, and for a holdout that question has no good
-        # answer: the fold is derived after stage 04 ran, so the artifact does not declare it, and
-        # rebuilding it to declare it changes the sha256 the selection was made under. The
-        # features are joined by (entity, date), so what the run needs is rows spanning the dates
-        # it trains and evaluates on, not a fold labelled for it.
-        require_fold_scoped_temporal_holdout_coverage(
-            split,
-            mds.temporal_by_fold,
-            source_timeline=mds.dataset.get_column(mds.date_col),
-            date_col=mds.date_col,
-        )
 
     model = computation.get("model")
     if not isinstance(model, dict) or not isinstance(model.get("params"), dict):
@@ -725,6 +794,195 @@ def reconstruct_locked_request(
         },
         {},
     )
+
+    preprocessing = computation.get("preprocessing")
+    if not isinstance(preprocessing, dict) or not preprocessing.get("calendar_id"):
+        raise ValueError("locked sequence preprocessing omits the exact calendar")
+    decision_cadence = config["params"].get("decision_cadence")
+    locked_cv = computation.get("cv") or {}
+    locked_cv_request = locked_cv.get("request") or {}
+    # Presence, not truth. CVSpec.calendar is None whenever it was left unset, and a
+    # resolved CV record still writes the key, so None is an exactly reproducible
+    # choice rather than a missing one - rejecting it would refuse a canonical weekly
+    # run that simply never named a calendar. Only a block that never mentions the key
+    # leaves nothing to reproduce, and defaulting there would silently thin on a
+    # different calendar than the fit did once resolve_rebalance_timestamps honors it.
+    for block in (locked_cv, locked_cv_request):
+        if "calendar" in block:
+            cadence_calendar = block["calendar"]
+            break
+    else:
+        if decision_cadence is not None:
+            raise ValueError(
+                "locked cadence-selected sequence training does not record its calendar, "
+                "so its observation selection cannot be reproduced"
+            )
+        cadence_calendar = None
+    dataset_pd = _select_sequence_observations(
+        mds.dataset,
+        date_col=mds.date_col,
+        cadence=decision_cadence,
+        calendar=cadence_calendar,
+    ).to_pandas()
+    return LockedSequenceInputs(
+        label_ref=label_ref,
+        mds=mds,
+        split=split,
+        config=config,
+        dataset_pd=dataset_pd,
+        lookback=int(config["params"].get("lookback", 60)),
+        decision_cadence=decision_cadence,
+        preprocessing=dict(preprocessing),
+    )
+
+
+def locked_sequence_expected_keys(
+    study: Study,
+    inputs: LockedSequenceInputs,
+    *,
+    splits: list[dict[str, Any]],
+):
+    """The eligibility manifest for ``splits``, by the branch the locked configuration names.
+
+    One function, two callers, and that is the whole point of it. `rekey_holdout_spec` writes
+    what this returns into the spec; `reconstruct_locked_request` checks the spec against what
+    this returns. Stated twice they would agree until a change touched one of them, and the
+    disagreement would not surface as a failure - `validate_locked_expected_keys` compares the
+    manifest against the rule that wrote it, so a holdout built on a second version of the rule
+    registers, validates, and is wrong where nothing looks.
+
+    A sequence model predicts only where a full lookback of history exists and the window
+    is observed densely enough to be read as a window, so these keys are not every
+    (entity, date) in the fold. That rule lives in `sequence_validation_keys` and
+    `darts_validation_keys`, which the validation path calls, and this calls them rather
+    than restating what they do.
+    """
+    config = inputs.config
+    mds = inputs.mds
+    calendar_id = str(inputs.preprocessing["calendar_id"])
+    if config.get("library") == "darts":
+        from case_studies.utils.darts_forecasting import darts_validation_keys
+
+        return darts_validation_keys(
+            inputs.dataset_pd,
+            splits,
+            config=config,
+            feature_names=list(mds.feature_names),
+            label_col=mds.label_col,
+            date_col=mds.date_col,
+            entity_col=mds.entity_cols[0],
+            case_study=study.case_study,
+            calendar_id=calendar_id,
+            temporal_by_fold=mds.temporal_by_fold,
+            temporal_keys=list(mds.temporal_keys),
+            temporal_feature_names=list(mds.temporal_feature_names),
+        )
+    return sequence_validation_keys(
+        inputs.dataset_pd,
+        splits,
+        label_col=mds.label_col,
+        date_col=mds.date_col,
+        entity_col=mds.entity_cols[0],
+        lookback=inputs.lookback,
+        calendar_id=calendar_id,
+    )
+
+
+def rekey_holdout_spec(
+    study: Study,
+    spec: dict[str, Any],
+    *,
+    validation_spec: dict[str, Any],
+) -> None:
+    """Recompute the fold-derived fields against the holdout fold, in place, before a lock.
+
+    The sequence half of the hook `case_studies.research.holdout._rekey_holdout_spec`
+    dispatches to. Until this existed every sequence holdout refused with
+    `NotImplementedError`, which is what stopped `sp500_options` the day a corrected label
+    buffer moved its selection from `linear/lasso_f0.7` to `deep_learning/patchtst`.
+
+    One field is re-keyed, and only one. `expected_prediction_keys` describes the validation
+    folds on arrival and has to describe the derived holdout fold instead: carrying it forward
+    locks a manifest `validate_locked_run` rejects, and dropping it locks one it rejects
+    differently. There is no second field. A sequence model resolves no parameter from a
+    fold's own training rows - its `model` block is `{class, implementation, objective,
+    params}` and every one of those is declared - so it carries no `effective_params_by_fold`
+    for `linear`'s replay-and-verify step to apply to.
+
+    `validation_spec` is unused for the same reason it is unused in the latent-factor hook: it
+    exists so the dispatch can pass it to every family, and only a family with data-derived
+    parameters has anything to verify against it.
+    """
+    inputs = locked_sequence_inputs(study, spec)
+    expected = locked_sequence_expected_keys(study, inputs, splits=[inputs.split])
+    spec["computation"]["expected_prediction_keys"] = {
+        "digest": value_digest(expected, ("symbol", "timestamp", "fold")),
+        "n_rows": expected.height,
+        "n_folds": expected["fold"].n_unique(),
+    }
+
+
+def reconstruct_locked_request(
+    study: Study,
+    spec: dict[str, Any],
+    *,
+    checkpoint_kind: str,
+    checkpoint_value: int | None,
+):
+    """Reconstruct a sequence holdout fit without consulting a mutable preset."""
+    from case_studies.research.contracts import ExecutionTier
+    from case_studies.research.cv import (
+        require_fold_scoped_temporal_holdout_coverage,
+    )
+    from case_studies.research.models import (
+        ResolvedModelRequest,
+        validate_locked_expected_keys,
+    )
+    from case_studies.utils.deep_model_state import declared_epoch_checkpoints
+
+    if checkpoint_kind != "epoch" or checkpoint_value is None:
+        raise ValueError("sequence holdout requires one locked epoch checkpoint")
+    study.require_writable()
+    study.activate(ExecutionTier.CANONICAL)
+    computation = spec["computation"]
+    if computation.get("sampling") != {"max_symbols": 0, "max_train_sequences": 0}:
+        raise ValueError("locked sequence holdout requires unreduced canonical inputs")
+    # `sampling` above proves no PREVIEW reduced this run. A cap the configuration
+    # DECLARES is a different thing and has to reach the refit: it is part of the model,
+    # so a holdout drawing a different number of windows than the validation fit is not a
+    # cheaper run, it is a different model answering the holdout - and nothing in the
+    # output would show it. Taken from the stored spec rather than re-read from
+    # setup.yaml, so an edit since selection cannot silently change what is refitted.
+    locked_max_train_sequences = int(
+        (computation.get("input_data_spec") or {}).get("max_train_sequences", 0)
+    )
+    # Same rule, other form: a run that spaced its training windows has to space them the
+    # same way on the holdout, or the refit fits a different model.
+    locked_train_sequence_stride = int(
+        (computation.get("input_data_spec") or {}).get("train_sequence_stride", 0)
+    )
+    inputs = locked_sequence_inputs(study, spec)
+    label_ref = inputs.label_ref
+    mds = inputs.mds
+    split = inputs.split
+    config = inputs.config
+    model = spec["computation"].get("model")
+    if mds.temporal_by_fold is not None and mds.temporal_keys and mds.temporal_feature_names:
+        # Coverage, not fold-boundary compatibility - the branch `latent_factors/adapter.py:603`
+        # and `gbm.py` already take, for the same reason. Compatibility asks whether the stage-04
+        # artifact declares a fold with this geometry, and for a holdout that question has no good
+        # answer: the fold is derived after stage 04 ran, so the artifact does not declare it, and
+        # rebuilding it to declare it changes the sha256 the selection was made under. The
+        # features are joined by (entity, date), so what the run needs is rows spanning the dates
+        # it trains and evaluates on, not a fold labelled for it.
+        require_fold_scoped_temporal_holdout_coverage(
+            split,
+            mds.temporal_by_fold,
+            source_timeline=mds.dataset.get_column(mds.date_col),
+            declared_folds=mds.temporal_artifact_splits,
+            date_col=mds.date_col,
+        )
+
     expected_model = {
         "class": config["params"]["architecture"],
         "implementation": config.get("library", "pytorch"),
@@ -758,66 +1016,21 @@ def reconstruct_locked_request(
     if numerics != reproduced_numerics or int(spec["seed"]) != int(numerics["seed"]):
         raise ValueError("locked sequence numerics cannot be reproduced")
 
-    preprocessing = computation.get("preprocessing")
-    if not isinstance(preprocessing, dict) or not preprocessing.get("calendar_id"):
-        raise ValueError("locked sequence preprocessing omits the exact calendar")
-    # resolve_model_request thins the dataset to the decision cadence before it builds
-    # any target or window, so reconstruction has to thin it the same way. Otherwise a
-    # weekly-cadence lock retrains on every session, which is a different model. The
-    # cadence comes from the locked model params, never from the preset.
-    decision_cadence = config["params"].get("decision_cadence")
-    locked_cv = computation.get("cv") or {}
-    locked_cv_request = locked_cv.get("request") or {}
-    # Presence, not truth. CVSpec.calendar is None whenever it was left unset, and a
-    # resolved CV record still writes the key, so None is an exactly reproducible
-    # choice rather than a missing one - rejecting it would refuse a canonical weekly
-    # run that simply never named a calendar. Only a block that never mentions the key
-    # leaves nothing to reproduce, and defaulting there would silently thin on a
-    # different calendar than the fit did once resolve_rebalance_timestamps honors it.
-    for block in (locked_cv, locked_cv_request):
-        if "calendar" in block:
-            cadence_calendar = block["calendar"]
-            break
-    else:
-        if decision_cadence is not None:
-            raise ValueError(
-                "locked cadence-selected sequence training does not record its calendar, "
-                "so its observation selection cannot be reproduced"
-            )
-        cadence_calendar = None
-    dataset_pd = _select_sequence_observations(
-        mds.dataset,
-        date_col=mds.date_col,
-        cadence=decision_cadence,
-        calendar=cadence_calendar,
-    ).to_pandas()
-    lookback = int(config["params"].get("lookback", 60))
+    preprocessing = inputs.preprocessing
+    decision_cadence = inputs.decision_cadence
+    dataset_pd = inputs.dataset_pd
+    lookback = inputs.lookback
+    expected = locked_sequence_expected_keys(study, inputs, splits=[split])
     if config.get("library") == "darts":
-        from case_studies.utils.darts_forecasting import (
-            darts_training_identity,
-            darts_validation_keys,
-        )
+        from case_studies.utils.darts_forecasting import darts_training_identity
 
-        expected = darts_validation_keys(
-            dataset_pd,
-            [split],
-            config=config,
-            feature_names=list(mds.feature_names),
-            label_col=mds.label_col,
-            date_col=mds.date_col,
-            entity_col=mds.entity_cols[0],
-            case_study=study.case_study,
-            calendar_id=str(preprocessing["calendar_id"]),
-            temporal_by_fold=mds.temporal_by_fold,
-            temporal_keys=list(mds.temporal_keys),
-            temporal_feature_names=list(mds.temporal_feature_names),
-        )
         input_data_spec = darts_training_identity(
             config,
             mds.label_col,
             case_study=study.case_study,
             input_data_spec=mds.input_lineage,
             max_train_sequences=locked_max_train_sequences,
+            train_sequence_stride=locked_train_sequence_stride,
         )
         expected_preprocessing = {
             "class": "fold_train_standardization",
@@ -827,32 +1040,30 @@ def reconstruct_locked_request(
             "input_chunk_length": input_data_spec["input_chunk_length"],
             "output_chunk_length": input_data_spec["output_chunk_length"],
         }
+        sequence_feature_names = tuple(mds.feature_names)
     else:
-        expected = sequence_validation_keys(
-            dataset_pd,
-            [split],
-            label_col=mds.label_col,
-            date_col=mds.date_col,
-            entity_col=mds.entity_cols[0],
-            lookback=lookback,
-            calendar_id=str(preprocessing["calendar_id"]),
-        )
         input_data_spec = {
             "input_data_spec": mds.input_lineage,
             "lookback": lookback,
             "max_train_sequences": locked_max_train_sequences,
+            **(
+                {"train_sequence_stride": locked_train_sequence_stride}
+                if locked_train_sequence_stride
+                else {}
+            ),
         }
         expected_preprocessing = {
             "class": "fold_train_standardization",
             "calendar_id": preprocessing["calendar_id"],
-            "gap_policy": "exclude_windows_crossing_missing_expected_periods",
+            "gap_policy": GAP_POLICY_ID,
             "lookback": lookback,
         }
+        sequence_feature_names = (*mds.feature_names, *GAP_MASK_FEATURES)
     validate_locked_expected_keys(spec, expected)
     expected_inputs = {
         "label_artifact": {"digest": label_ref.digest, "name": label_ref.name},
         "feature_artifacts": mds.input_lineage["artifacts"],
-        "feature_names": list(mds.feature_names),
+        "feature_names": list(sequence_feature_names),
         "task": {
             "type": "regression",
             "class_values": [],
@@ -870,7 +1081,7 @@ def reconstruct_locked_request(
         dataset_pd=dataset_pd,
         splits=(split,),
         config=config,
-        feature_names=tuple(mds.feature_names),
+        feature_names=tuple(sequence_feature_names),
         label_col=mds.label_col,
         date_col=mds.date_col,
         entity_col=mds.entity_cols[0],
@@ -881,6 +1092,7 @@ def reconstruct_locked_request(
         temporal_feature_names=tuple(mds.temporal_feature_names),
         expected_keys=expected,
         max_train_sequences=locked_max_train_sequences,
+        train_sequence_stride=locked_train_sequence_stride,
         runtime_provenance=_sequence_runtime_provenance(study, config),
         prediction_split="holdout",
         published_checkpoints=(int(checkpoint_value),),
@@ -978,6 +1190,29 @@ def _predict_reconstructed_sequence(
     return np.concatenate(parts)
 
 
+def _sorted_by_checkpoint(
+    frames: dict[int, list[pl.DataFrame]],
+    context: SequenceResearchContext,
+) -> pl.DataFrame:
+    """Concatenate reconstructed folds, each checkpoint sorted, one checkpoint at a time.
+
+    The whole frame used to be sorted at once by (entity, date, fold, checkpoint). Its only
+    reader is `_publish_sequence_predictions`, which cuts one checkpoint out of it, and
+    inside one checkpoint the fourth key is a constant - so sorting each checkpoint's rows
+    by the first three gives every published slice the same rows in the same order. What it
+    does not do is sort 160 million rows in one go: a sort costs about three times its input
+    (measured 0.69 GB in, 2.13 GB of growth, and the streaming engine is no cheaper), which
+    on a nasdaq reconstruction - twenty checkpoints over two folds of four million
+    validation rows - is around 21 GB to produce a 7 GB frame.
+    """
+    ordered: list[pl.DataFrame] = []
+    for checkpoint in sorted(frames):
+        parts = frames[checkpoint]
+        ordered.append(pl.concat(parts).sort(context.entity_col, context.date_col, "fold_id"))
+        parts.clear()
+    return pl.concat(ordered)
+
+
 def _reconstruct_pytorch_predictions(
     model_root: Path,
     context: SequenceResearchContext,
@@ -986,7 +1221,7 @@ def _reconstruct_pytorch_predictions(
     from case_studies.utils.deep_model_state import deep_checkpoint_path, restore_deep_model
     from case_studies.utils.sequence_dataset import materialize_sequences
 
-    frames = []
+    frames: dict[int, list[pl.DataFrame]] = {}
     lookback = int(context.config["params"].get("lookback", 60))
     calendar_id = str(computation["preprocessing"]["calendar_id"])
     device = torch.device(str(computation["numerics"]["device"]))
@@ -1013,6 +1248,9 @@ def _reconstruct_pytorch_predictions(
             # assertion from materializing millions of sequences on a minute panel.
             max_train_sequences=int(
                 (computation.get("input_data_spec") or {}).get("max_train_sequences", 0)
+            ),
+            train_sequence_stride=int(
+                (computation.get("input_data_spec") or {}).get("train_sequence_stride", 0)
             ),
             temporal_by_fold=context.temporal_by_fold,
             temporal_keys=list(context.temporal_keys),
@@ -1063,7 +1301,7 @@ def _reconstruct_pytorch_predictions(
                 device,
                 batch_size=int(context.config["batch_size"]),
             )
-            frames.append(
+            frames.setdefault(int(value), []).append(
                 pl.DataFrame(
                     {
                         context.date_col: timestamps,
@@ -1078,7 +1316,7 @@ def _reconstruct_pytorch_predictions(
             )
     if not frames:
         raise ValueError("locked sequence fitted state produced no predictions")
-    return pl.concat(frames).sort(context.entity_col, context.date_col, "fold_id", "epoch")
+    return _sorted_by_checkpoint(frames, context)
 
 
 def _reconstruct_darts_predictions(
@@ -1123,7 +1361,7 @@ def _reconstruct_darts_predictions(
         label_col=context.label_col,
         config=config,
     )
-    frames = []
+    frames: dict[int, list[pl.DataFrame]] = {}
     has_temporal = bool(
         context.temporal_by_fold is not None
         and context.temporal_keys
@@ -1183,10 +1421,10 @@ def _reconstruct_darts_predictions(
                 pl.lit(config["config_name"]).alias("config"),
                 pl.lit(value).alias("epoch"),
             )
-            frames.append(frame)
-    if not frames or any(frame.is_empty() for frame in frames):
+            frames.setdefault(int(value), []).append(frame)
+    if not frames or any(part.is_empty() for parts in frames.values() for part in parts):
         raise ValueError("locked Darts fitted state produced incomplete predictions")
-    return pl.concat(frames).sort(context.entity_col, context.date_col, "fold_id", "epoch")
+    return _sorted_by_checkpoint(frames, context)
 
 
 def _reconstruct_sequence_predictions(
@@ -1268,6 +1506,121 @@ def _publish_sequence_predictions(
     return tuple(prediction_results)
 
 
+def _claim_staging_tree(train_dir: Path) -> tuple[Path, Any]:
+    """Adopt a dead attempt's staging tree under `train_dir`, or open a fresh one.
+
+    Nothing prevents two runs of one training hash from being in flight at once -
+    `nb-run.sh` holds slots, not per-hash locks - so a tree can only be adopted once
+    the previous writer is known to be gone. The claim is an `flock` on a lock file
+    beside the tree: the kernel drops it when the holder dies, however it died, so a
+    tree whose lock is free has no live writer and one whose lock is held is skipped.
+    A stale claim file is not evidence of a live run and a missing one is not evidence
+    of a dead one; only the lock decides.
+
+    The lock file sits beside the tree rather than inside it, so `os.replace` promotes
+    the tree without carrying a lock file into `models/`.
+
+    Returns the staging directory and the open lock file, which the caller must hold
+    until the tree is promoted or abandoned.
+    """
+    import fcntl
+
+    train_dir.mkdir(parents=True, exist_ok=True)
+    for candidate in sorted(train_dir.glob(".models.*.tmp")):
+        if not candidate.is_dir():
+            continue
+        handle = (train_dir / f"{candidate.name}.lock").open("a+")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            handle.close()
+            print(f"  staging tree {candidate.name} is held by a live run - not adopting it")
+            continue
+        return candidate, handle
+    staging = train_dir / f".models.{uuid.uuid4().hex}.tmp"
+    staging.mkdir(parents=True)
+    handle = (train_dir / f"{staging.name}.lock").open("a+")
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return staging, handle
+
+
+def _folds_already_fitted(
+    staging: Path,
+    context: SequenceResearchContext,
+    computation: dict[str, Any],
+) -> tuple[int, ...]:
+    """Declared folds the staging tree already holds in full, in declared order."""
+    checkpoints = tuple(int(item["value"]) for item in computation["checkpoint_schedule"])
+    fold_ids = tuple(int(split["fold"]) for split in context.splits)
+    config_name = context.config["config_name"]
+    architecture = context.config["params"]["architecture"]
+    if context.config.get("library") == "darts":
+        from case_studies.utils.darts_forecasting import complete_darts_checkpoint_folds
+
+        return complete_darts_checkpoint_folds(
+            staging,
+            config_name=config_name,
+            fold_ids=fold_ids,
+            checkpoints=checkpoints,
+            architecture=architecture,
+        )
+    from case_studies.utils.deep_model_state import complete_deep_checkpoint_folds
+
+    return complete_deep_checkpoint_folds(
+        staging,
+        config_name=config_name,
+        fold_ids=fold_ids,
+        checkpoints=checkpoints,
+        architecture=architecture,
+    )
+
+
+def _folds_with_prediction_shards(
+    save_dir: Path | None,
+    configs: list[dict[str, Any]],
+    folds: set[int],
+) -> set[int]:
+    """Narrow `folds` to those whose incremental prediction shards are still on disk."""
+    if save_dir is None:
+        return set()
+    incr_dir = Path(save_dir) / "_incremental"
+    if not incr_dir.exists():
+        return set()
+    present: set[int] = set()
+    for cfg in configs:
+        for stem, _checkpoint, _path in incremental_prediction_shards(incr_dir, cfg["config_name"]):
+            _, _, fold = stem.rpartition("_fold")
+            if fold.isdigit():
+                present.add(int(fold))
+    dropped = folds - present
+    if dropped:
+        print(f"  no prediction shards for fold(s) {sorted(dropped)} - refitting them")
+    return folds & present
+
+
+def _clear_partial_folds(staging: Path, config_name: str, folds: Sequence[int]) -> int:
+    """Drop the checkpoints of folds about to be refit, and report how many files went.
+
+    Checkpoints are immutable: `write_deep_checkpoint` raises `FileExistsError` rather
+    than overwrite one whose content differs, and a refit's weights differ from the
+    interrupted attempt's because the resumed run reaches that fold from a different
+    RNG state. So the partial fold a run died inside has to go before it can be refit.
+
+    Only folds this run is about to rewrite, and only inside the staging tree it has
+    claimed. A fold that is already complete is never passed here.
+    """
+    import shutil
+
+    removed = 0
+    for fold in folds:
+        fold_dir = Path(staging) / config_name / f"fold_{int(fold):02d}"
+        if not fold_dir.is_dir():
+            continue
+        removed += sum(1 for path in fold_dir.rglob("*") if path.is_file())
+        shutil.rmtree(fold_dir)
+    return removed
+
+
 def run_resolved_request(
     study: Study,
     spec: dict[str, Any],
@@ -1292,40 +1645,94 @@ def run_resolved_request(
             model_dir, context, computation, study.case_study
         )
     else:
-        staging = train_dir / f".models.{uuid.uuid4().hex}.tmp"
+        # A dead attempt's tree if there is one, otherwise a fresh `.models.<uuid>.tmp`.
+        # The name stays per-attempt: two runs of one training hash can be in flight at
+        # once because `nb-run.sh` holds slots rather than per-hash locks, and a shared
+        # path would interleave two writers into one tree that promotes as a corrupt
+        # `models/` and then validates. `_claim_staging_tree` adopts only a tree whose
+        # `flock` is free, which is exactly the trees whose writer is gone.
+        staging, staging_lock = _claim_staging_tree(train_dir)
+        already_fitted = _folds_already_fitted(staging, context, computation)
+        declared_folds = [int(split["fold"]) for split in context.splits]
+        missing_folds = [fold for fold in declared_folds if fold not in already_fitted]
+        if already_fitted:
+            dropped = _clear_partial_folds(staging, context.config["config_name"], missing_folds)
+            print(
+                f"Resuming {staging.name}: {len(already_fitted)} of {len(declared_folds)} "
+                f"folds already fitted, refitting {missing_folds}"
+                + (f" ({dropped} partial checkpoint file(s) dropped)" if dropped else "")
+            )
         _configure_sequence_runtime(computation["numerics"])
         fit_wall_t0 = time.perf_counter()
         fit_cpu_t0 = cpu_seconds()
         try:
-            result = run_dl_cv(
-                context.dataset_pd,
-                list(context.splits),
-                configs=[context.config],
-                n_features=len(context.feature_names),
-                feature_names=list(context.feature_names),
-                label_col=context.label_col,
-                date_col=context.date_col,
-                entity_col=context.entity_col,
-                device=computation["numerics"]["device"],
-                save_dir=train_dir / "diagnostics",
-                max_train_sequences=context.max_train_sequences,
-                max_predict_sequences=context.max_predict_sequences,
-                register=False,
-                case_study=study.case_study,
-                temporal_by_fold=context.temporal_by_fold,
-                temporal_keys=list(context.temporal_keys),
-                temporal_feature_names=list(context.temporal_feature_names),
-                checkpoint_root=staging,
-                strict=True,
-                seed=int(spec["seed"]),
-                num_threads=int(computation["numerics"]["num_threads"]),
-            )
+            if missing_folds:
+                result = run_dl_cv(
+                    context.dataset_pd,
+                    list(context.splits),
+                    configs=[context.config],
+                    n_features=len(context.feature_names),
+                    feature_names=list(context.feature_names),
+                    label_col=context.label_col,
+                    date_col=context.date_col,
+                    entity_col=context.entity_col,
+                    device=computation["numerics"]["device"],
+                    save_dir=train_dir / "diagnostics",
+                    max_train_sequences=context.max_train_sequences,
+                    max_predict_sequences=context.max_predict_sequences,
+                    train_sequence_stride=context.train_sequence_stride,
+                    register=False,
+                    case_study=study.case_study,
+                    already_fitted_folds=already_fitted,
+                    temporal_by_fold=context.temporal_by_fold,
+                    temporal_keys=list(context.temporal_keys),
+                    temporal_feature_names=list(context.temporal_feature_names),
+                    checkpoint_root=staging,
+                    strict=True,
+                    seed=int(spec["seed"]),
+                    num_threads=int(computation["numerics"]["num_threads"]),
+                )
             os.replace(staging, model_dir)
+            # Only once the tree is gone from `train_dir` under its staging name. Removing
+            # the lock file while the tree is still adoptable would break the claim: a
+            # later run would create a fresh file at the same path, flock that instead,
+            # and adopt a tree another run is writing.
+            (train_dir / f"{staging.name}.lock").unlink(missing_ok=True)
         except Exception:
-            shutil.rmtree(staging, ignore_errors=True)
+            # The tree stays. It holds every checkpoint the run had written - measured on the
+            # 2026-09-13 crash, 139 checkpoints over 7 of 16 folds, 39 MB, last write 90
+            # seconds before the machine died - and deleting it is the reason an interrupted
+            # sequence run costs its whole fit again rather than the folds it had not reached.
+            #
+            # Keeping it cannot make a partial fit look complete. The warm path gates on
+            # `model_dir.exists()` above, `models/` is created only by the `os.replace` on the
+            # line before this, and that promote raises `OSError: Directory not empty` rather
+            # than clobbering a complete one. A `.models.*.tmp` tree is invisible to every
+            # reader here by construction.
+            #
+            # It also cannot make the uncaught death more recoverable than the caught one,
+            # which is what the old handler did: a `SIGKILL` skips this block and orphans the
+            # tree, so anything papermill turned into a Python exception was destroying state
+            # that a power cut would have kept.
+            #
+            # The cost is disk, and it is small: 11 trees orphaned this way across the whole
+            # artifacts root total 63 MB.
             raise
+        finally:
+            # Closing drops the `flock`, so a tree this run failed to promote becomes
+            # adoptable by the next one. The lock file itself stays where it is.
+            staging_lock.close()
         fit_wall_s = time.perf_counter() - fit_wall_t0
         fit_cpu_s = cpu_seconds() - fit_cpu_t0
+        if already_fitted or not missing_folds:
+            # This run fitted `missing_folds` and read the rest off disk, so `result` covers
+            # only the folds it fitted. Reconstructing from the promoted tree is the warm
+            # path, which returns the full declared population and validates it on the way -
+            # the same predictions an uninterrupted run would have published, and a resumed
+            # run must not publish anything narrower.
+            result = _reconstruct_sequence_predictions(
+                model_dir, context, computation, study.case_study
+            )
 
     prediction_results = _publish_sequence_predictions(
         study, computation, context, training, result
@@ -1394,42 +1801,15 @@ def validate_locked_run(
         != (context.prediction_split, "epoch", selected[0])
     ):
         raise ValueError("locked sequence run published the wrong checkpoint")
-    # prediction.load() returns what was published, and publishing renames the entity to
-    # `symbol`; the reconstruction still carries the reader key, so bring it to the
-    # published contract before comparing rather than sorting a column that is not there.
-    published = prediction.load().sort("symbol", "timestamp", "fold")
+    # This used to reload the checkpoint, re-run inference, and compare against the published
+    # predictions at rtol=atol=1e-7. Torch computes in float32 (eps 1.19e-7) and cuDNN may pick
+    # a different algorithm on a re-run, so the comparison failed on rounding. The checkpoint
+    # identity and the fitted-state digest below are what the run records.
+    prediction.load()
     reopened = _cached_sequence_run(study, spec, context)
     if reopened is None or reopened.predictions[0].hash != prediction.hash:
         raise ValueError("locked sequence fitted state cannot be reused exactly")
     model_root = run.training.root / "run_log" / "training" / run.training.hash / "models"
-    reconstructed_all = _reconstruct_sequence_predictions(
-        model_root,
-        context,
-        spec["computation"],
-        study.case_study,
-    )["all_predictions"]
-    reconstructed = (
-        reconstructed_all.filter(
-            (pl.col("config") == context.config["config_name"]) & (pl.col("epoch") == selected[0])
-        )
-        .drop("config", "epoch")
-        .rename({"fold_id": "fold", "y_true": "actual", "y_score": "prediction"})
-    )
-    if context.entity_col != "symbol":
-        reconstructed = reconstructed.rename({context.entity_col: "symbol"})
-    reconstructed = reconstructed.sort("symbol", "timestamp", "fold")
-    key_columns = ["symbol", "timestamp", "fold"]
-    value_columns = ["prediction", "actual"]
-    if not reconstructed.select(key_columns).equals(
-        published.select(key_columns)
-    ) or not np.allclose(
-        reconstructed.select(value_columns).to_numpy(),
-        published.select(value_columns).to_numpy(),
-        rtol=1e-7,
-        atol=1e-7,
-        equal_nan=False,
-    ):
-        raise ValueError("locked sequence fitted state does not reproduce published predictions")
     files = {
         str(path.relative_to(model_root)): _sha256(path)
         for path in sorted(model_root.rglob("*"))
@@ -1577,6 +1957,31 @@ def mc_dropout_predict(
 # ---------------------------------------------------------------------------
 
 
+def _read_prediction_shards(paths: Sequence[Path]) -> pl.DataFrame:
+    """Read incremental prediction shards as one frame, in the order given.
+
+    One read across the whole set, which is both faster than a read per file and leaves a
+    single chunk for the filters downstream. Shards from different folds can disagree on
+    timestamp precision, which a multi-file read rejects; that case falls back to the
+    per-file read the precision cast needs. Both paths cast, because the precision is
+    part of what a registered prediction set hashes.
+    """
+    paths = list(paths)
+    if not paths:
+        return pl.DataFrame()
+    try:
+        frame = pl.read_parquet(paths)
+    except pl.exceptions.PolarsError:
+        return pl.concat(
+            [
+                pl.read_parquet(path).cast({"timestamp": pl.Datetime("us")}, strict=False)
+                for path in paths
+            ],
+            how="diagonal_relaxed",
+        )
+    return frame.cast({"timestamp": pl.Datetime("us")}, strict=False)
+
+
 def _train_one_config(
     model: nn.Module,
     train_loader: DataLoader,
@@ -1588,16 +1993,20 @@ def _train_one_config(
     | None = None,
     epoch_callback: Callable[[dict[str, Any]], None] | None = None,
     state_callback: Callable[[int, nn.Module], None] | None = None,
-) -> tuple[dict[int, float], dict[int, np.ndarray], dict[int, float]]:
-    """Train a single model config, storing predictions at ALL checkpoints.
+) -> tuple[dict[int, float], dict[int, float]]:
+    """Train a single model config, handing each checkpoint's predictions to the caller.
 
-    Trains to completion (no early stopping). Stores predictions at every
-    checkpoint so the caller can select the best epoch after all folds finish.
+    Trains to completion (no early stopping). ``checkpoint_callback`` receives one
+    checkpoint at a time, as it is reached, and owns everything that happens to it.
+    This used to also accumulate every checkpoint's validation predictions and return
+    them, which nothing read: the one caller persists each checkpoint through the
+    callback and deleted the returned dict on the next line. On a nasdaq fold - four
+    million validation rows over a twenty-checkpoint schedule - that dict was 640 MB
+    held to the end of the fold for nothing.
 
     Returns
     -------
     checkpoint_ics : dict[epoch, ic]
-    checkpoint_preds : dict[epoch, np.ndarray]
     epoch_losses : dict[epoch, avg_loss]
     """
     model = model.to(device)
@@ -1606,7 +2015,6 @@ def _train_one_config(
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs)
 
     checkpoint_ics: dict[int, float] = {}
-    checkpoint_preds: dict[int, np.ndarray] = {}
     epoch_losses: dict[int, float] = {}
 
     for epoch in range(1, n_epochs + 1):
@@ -1649,7 +2057,7 @@ def _train_one_config(
                     y_batch_dev = y_batch.to(device, non_blocking=True)
                     pred_batch = model(X_batch)
                     pred_parts.append(pred_batch.cpu().numpy())
-                    y_parts.append(y_batch.numpy())
+                    y_parts.append(y_batch.cpu().numpy())
                     date_parts.append(timestamps)
                     entity_parts.append(entities)
                     val_loss += criterion(pred_batch, y_batch_dev).item()
@@ -1679,11 +2087,10 @@ def _train_one_config(
                 min_obs=5,
             )["ic_mean"]
             checkpoint_ics[epoch] = ic
-            checkpoint_preds[epoch] = val_preds.copy()
             if state_callback is not None:
                 state_callback(epoch, model)
             if checkpoint_callback is not None:
-                checkpoint_callback(checkpoint_preds, y_val, val_dates, val_entities)
+                checkpoint_callback({epoch: val_preds}, y_val, val_dates, val_entities)
             if epoch_callback is not None:
                 epoch_callback(
                     {
@@ -1713,7 +2120,7 @@ def _train_one_config(
                 )
             print(f"      epoch {epoch:3d}/{n_epochs}: train_loss={avg_loss:.6f}", flush=True)
 
-    return checkpoint_ics, checkpoint_preds, epoch_losses
+    return checkpoint_ics, epoch_losses
 
 
 # ---------------------------------------------------------------------------
@@ -1832,6 +2239,7 @@ def sequence_identity_params(
     case_study: str | None,
     max_train_sequences: int,
     device: str,
+    train_sequence_stride: int = 0,
 ) -> dict[str, Any] | None:
     """The identity-bearing fields of one sequence training run.
 
@@ -1847,6 +2255,12 @@ def sequence_identity_params(
 
     params = dict(identity_params or {})
     params["device"] = torch.device(str(device).lower().replace("gpu", "cuda")).type
+    # The preparation version belongs on every sequence identity, not only on the ones assembled
+    # through the runner's own spec. `us_equities_panel/12_dl_weekly.py` registers through this
+    # function directly, so without it that notebook keeps a version-1 identity for a fit whose
+    # design matrix changed under #767 - and it is the notebook Table 13.5 cites, so the stale
+    # identity would be read as a result.
+    params["sequence_preparation"] = SEQUENCE_PREPARATION_VERSION
     if input_data_spec is not None:
         if uses_darts_backend([config]):
             if case_study is None:
@@ -1858,6 +2272,7 @@ def sequence_identity_params(
                     case_study=case_study,
                     input_data_spec=input_data_spec,
                     max_train_sequences=max_train_sequences,
+                    train_sequence_stride=train_sequence_stride,
                 )
             )
         else:
@@ -1867,6 +2282,13 @@ def sequence_identity_params(
                     "input_data_spec": input_data_spec,
                     "lookback": config.get("params", {}).get("lookback", 60),
                     "max_train_sequences": max_train_sequences,
+                    # Written only when declared: `computation` is hashed whole, and no
+                    # registered sequence run strides its windows.
+                    **(
+                        {"train_sequence_stride": train_sequence_stride}
+                        if train_sequence_stride
+                        else {}
+                    ),
                 }
             )
     return params or None
@@ -1886,10 +2308,12 @@ def run_dl_cv(
     save_dir: Path | None = None,
     max_train_sequences: int = 0,
     max_predict_sequences: int = 0,
+    train_sequence_stride: int = 0,
     register: bool = False,
     case_study: str | None = None,
     notebook: str | None = None,
     selected_folds: list[int] | None = None,
+    already_fitted_folds: Sequence[int] | None = None,
     temporal_by_fold=None,
     temporal_keys: list[str] | None = None,
     temporal_feature_names: list[str] | None = None,
@@ -1946,7 +2370,6 @@ def run_dl_cv(
         all_learning_curves: pl.DataFrame — IC × epoch × config
     """
     from case_studies.utils.darts_forecasting import (
-        darts_training_identity,
         run_darts_cv,
         uses_darts_backend,
     )
@@ -1983,6 +2406,7 @@ def run_dl_cv(
             label_col=label_col,
             case_study=case_study,
             max_train_sequences=max_train_sequences,
+            train_sequence_stride=train_sequence_stride,
             device=device,
         )
 
@@ -2109,6 +2533,33 @@ def run_dl_cv(
                     f"checkpoint(s) for {cfg['config_name']}"
                 )
 
+    # Before either backend is dispatched. `run_darts_cv` used to be handed every split
+    # because this ran below it, so a Darts resume refit the folds it had adopted and hit
+    # the immutable-checkpoint conflict on the first one.
+    adopted = {int(fold) for fold in (already_fitted_folds or [])}
+    if adopted and not uses_darts_backend(configs):
+        # A native resume aggregates from the prediction shards under
+        # `save_dir/_incremental`, which the adopted folds wrote during the run that
+        # died and which nothing since has cleared - `clear_fold_predictions` drops one
+        # `(config, fold)` glob at that fold's start, so only a refit fold loses its own.
+        # A fold whose shards have gone cannot contribute a checkpoint metric, and
+        # adopting it anyway leaves every checkpoint short of the expected population,
+        # skipped, and the aggregation with nothing to assemble. Refit it instead, which
+        # costs one fold rather than the failure of the whole resume after it has paid
+        # for the others.
+        adopted = _folds_with_prediction_shards(save_dir, configs, adopted)
+    if selected_folds:
+        selected = {int(fold) for fold in selected_folds}
+        splits = [split for split in splits if int(split["fold"]) in selected]
+        print(f"Selected folds: {sorted(selected)}")
+        if not splits:
+            raise ValueError(f"No splits matched selected_folds={selected_folds}")
+    if adopted:
+        splits = [split for split in splits if int(split["fold"]) not in adopted]
+        print(f"Already fitted, not refitting: {sorted(adopted)}")
+        if not splits:
+            raise ValueError("every declared fold is already fitted; nothing to run")
+
     if uses_darts_backend(configs):
         fresh_result = run_darts_cv(
             dataset_pd,
@@ -2121,6 +2572,7 @@ def run_dl_cv(
             device=device,
             save_dir=save_dir,
             max_train_sequences=max_train_sequences,
+            train_sequence_stride=train_sequence_stride,
             register=register,
             case_study=case_study,
             notebook=notebook,
@@ -2132,6 +2584,7 @@ def run_dl_cv(
             temporal_feature_names=temporal_feature_names,
             checkpoint_root=checkpoint_root,
             strict=strict,
+            already_fitted_folds=sorted(adopted),
         )
         if cached_result is not None:
             return combine_cv_results(
@@ -2144,12 +2597,6 @@ def run_dl_cv(
     if device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested for deep learning, but CUDA is unavailable")
     torch_device = torch.device(device)
-    if selected_folds:
-        selected = {int(fold) for fold in selected_folds}
-        splits = [split for split in splits if int(split["fold"]) in selected]
-        print(f"Selected folds: {sorted(selected)}")
-        if not splits:
-            raise ValueError(f"No splits matched selected_folds={selected_folds}")
 
     seed_everything(seed)
 
@@ -2180,12 +2627,18 @@ def run_dl_cv(
         }
 
     n_valid_folds = 0
-    expected_fold_ids: list[int] = []
+    # The adopted folds belong here. Their shards are read back above and their
+    # checkpoints are in the staging tree, so both the per-checkpoint coverage
+    # comparison and the tree validation have to expect them - the first would skip
+    # every checkpoint without them, the second would call them undeclared artifacts.
+    expected_fold_ids: list[int] = sorted(adopted)
 
     _has_fold_temporal = temporal_by_fold is not None and temporal_keys and temporal_feature_names
 
     for split in splits:
-        seed_everything(seed + split["fold"])
+        # The fold's number is an input to the fit, not a label on it: renumbering the
+        # windows reseeds every one of them. See `folds.fold_seed`.
+        seed_everything(fold_seed(seed, split["fold"]))
 
         train_mask = (dates_series >= split["train_start"]) & (dates_series <= split["train_end"])
         val_mask = (dates_series >= split["val_start"]) & (dates_series <= split["val_end"])
@@ -2202,6 +2655,7 @@ def run_dl_cv(
             lookback=lookback,
             max_train_sequences=max_train_sequences,
             max_predict_sequences=max_predict_sequences,
+            train_sequence_stride=train_sequence_stride,
             temporal_by_fold=temporal_by_fold if _has_fold_temporal else None,
             temporal_keys=temporal_keys,
             temporal_feature_names=temporal_feature_names,
@@ -2231,8 +2685,24 @@ def run_dl_cv(
         )
         print("    creating datasets...")
 
-        train_ds = FoldSequenceDataset(train_store)
-        val_ds = FoldSequenceDataset(val_store, include_metadata=True)
+        train_ds = FoldSequenceDataset(train_store, device=torch_device)
+        val_ds = FoldSequenceDataset(val_store, include_metadata=True, device=torch_device)
+
+        # The architecture's input width is a property of what the loader
+        # actually produced, not of what the caller declared. The store appends
+        # the observation mask and the staleness count to the data features, so
+        # a caller that counted only the latter would build a model narrower
+        # than its own batches and fail inside the first forward pass with a
+        # shape error that names neither the mask nor the caller.
+        store_width = int(train_store.features[0].shape[1])
+        if n_features != store_width:
+            declared = [name for name in feature_names if name not in GAP_MASK_FEATURES]
+            if n_features != len(declared):
+                raise ValueError(
+                    f"n_features={n_features} matches neither the declared data features "
+                    f"({len(declared)}) nor the sequence store's width ({store_width})"
+                )
+            n_features = store_width
 
         n_train_seq = len(train_ds)
         n_val_seq = len(val_ds)
@@ -2254,19 +2724,26 @@ def run_dl_cv(
             t0 = time.perf_counter()
             print(f"    {config_name}:")
 
+            # num_workers stays 0 and the sampler and seed stay exactly as they were:
+            # both decide which sequences land in which batch, and already-registered
+            # results were produced under them. What changed is how a batch is gathered,
+            # which the dataset's __getitems__ does in one indexing operation.
+            # Pinning is for a host tensor awaiting a copy to the card. When the dataset
+            # gathers on the card there is no such copy and nothing to pin.
             train_loader = DataLoader(
                 train_ds,
                 batch_size=cfg_batch_size,
                 shuffle=True,
                 num_workers=0,
-                pin_memory=torch_device.type == "cuda",
+                pin_memory=torch_device.type == "cuda" and not train_ds.returns_device_tensors,
+                collate_fn=collate_sequences,
             )
             val_loader = DataLoader(
                 val_ds,
                 batch_size=cfg_batch_size,
                 shuffle=False,
                 num_workers=0,
-                pin_memory=torch_device.type == "cuda",
+                pin_memory=torch_device.type == "cuda" and not val_ds.returns_device_tensors,
                 collate_fn=collate_with_metadata,
             )
 
@@ -2278,6 +2755,7 @@ def run_dl_cv(
             y_val_store = val_dates_store = val_entities_store = None
             if incr_dir is not None:
                 incr_dir.mkdir(parents=True, exist_ok=True)
+                clear_fold_predictions(incr_dir, config_name, split["fold"])
                 y_val_store, val_dates_store, val_entities_store = materialize_store_metadata(
                     val_store
                 )
@@ -2377,7 +2855,7 @@ def run_dl_cv(
 
                 train_kwargs["state_callback"] = persist_state
 
-            checkpoint_ics, checkpoint_preds, epoch_losses = _train_one_config(
+            checkpoint_ics, epoch_losses = _train_one_config(
                 model=model,
                 train_loader=train_loader,
                 val_loader=val_loader,
@@ -2404,7 +2882,7 @@ def run_dl_cv(
                 row["best_ic"] = float(checkpoint_ics[best_ep])
             acc.setdefault("training_log", []).extend(epoch_rows)
 
-            del model, checkpoint_preds, train_loader, val_loader
+            del model, train_loader, val_loader
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
@@ -2414,36 +2892,42 @@ def run_dl_cv(
                 f"({elapsed:.1f}s, {len(checkpoint_ics)} checkpoints)"
             )
 
-        # Free this fold's data before creating next fold's sequences
+        # Free this fold's data before creating next fold's sequences. The datasets may
+        # hold the fold's features on the card, so release those blocks to the rest of the
+        # machine rather than leaving them reserved until the process exits.
         del train_ds, val_ds, train_store, val_store
         gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     if n_valid_folds == 0:
         raise ValueError("No valid folds created. Check data size vs lookback.")
 
-    # Reassemble all predictions from incremental saves
+    # Post-processing reads one (config, checkpoint) slice back at a time and drops it
+    # again. It used to reassemble every incremental save into one frame first and then cut
+    # slices out of it, so the whole prediction set was resident while a per-config copy and
+    # a per-epoch copy stood beside it, and the assembled result made a fourth. One sequence
+    # configuration is every checkpoint on every fold - twenty checkpoints over two folds
+    # where gradient boosting has ten - and a nasdaq fold is four million validation rows, so
+    # none of those copies is small.
     incr_dir = save_dir / "_incremental" if save_dir is not None else None
+    shards_by_config: dict[str, dict[int, list[Path]]] = {}
     if incr_dir is not None and incr_dir.exists():
-        parquet_files = sorted(incr_dir.glob("*.parquet"))
-        all_predictions = (
-            pl.concat(
-                [
-                    pl.read_parquet(f).cast({"timestamp": pl.Datetime("us")}, strict=False)
-                    for f in parquet_files
-                ],
-                how="diagonal_relaxed",
-            )
-            if parquet_files
-            else pl.DataFrame()
-        )
-    else:
-        all_predictions = pl.DataFrame()
+        for shard_cfg in configs:
+            by_epoch: dict[int, list[Path]] = {}
+            for _stem, shard_epoch, shard_path in incremental_prediction_shards(
+                incr_dir, shard_cfg["config_name"]
+            ):
+                by_epoch.setdefault(shard_epoch, []).append(shard_path)
+            shards_by_config[shard_cfg["config_name"]] = by_epoch
 
     # --- Aggregate results per config (post-processing) ---
     config_results: list[dict[str, Any]] = []
     all_curves: list[dict] = []
     training_log: list[dict] = []
-    complete_prediction_frames: list[pl.DataFrame] = []
+    # (config, epoch) of every checkpoint that covers all folds, in the order the loop finds
+    # them. The assembled result is read back from the shards in this order.
+    complete_slices: list[tuple[str, int]] = []
     log_dir = save_dir / "_incremental_logs" if save_dir is not None else None
     incremental_logs = pl.DataFrame()
     if log_dir is not None and log_dir.exists():
@@ -2456,38 +2940,35 @@ def run_dl_cv(
     for cfg in configs:
         config_name = cfg["config_name"]
         acc = config_acc[config_name]
-        cfg_preds = (
-            all_predictions.filter(pl.col("config") == config_name)
-            if all_predictions.height > 0
-            else pl.DataFrame()
-        )
+        cfg_shards = shards_by_config.get(config_name, {})
 
         epoch_scores: list[tuple[int, float, float, int]] = []
-        if cfg_preds.height > 0:
-            for epoch in sorted(cfg_preds["epoch"].unique().to_list()):
-                ep_df = cfg_preds.filter(pl.col("epoch") == epoch)
-                fold_ids = sorted(ep_df["fold_id"].unique().to_list())
-                if fold_ids != expected_fold_ids:
-                    continue
-                metrics = _decision_time_checkpoint_metrics(
-                    ep_df,
-                    date_col=date_col,
-                    entity_col=entity_col,
-                )
-                ic_mean = float(metrics["ic_mean"])
-                ic_std = float(metrics["ic_std"])
-                ic_n_days = int(metrics["ic_n_days"])
-                all_curves.append(
-                    {
-                        "config": config_name,
-                        "epoch": epoch,
-                        "ic_mean": ic_mean,
-                        "ic_std": ic_std,
-                        "ic_n_days": ic_n_days,
-                    }
-                )
-                complete_prediction_frames.append(ep_df)
-                epoch_scores.append((epoch, ic_mean, ic_std, ic_n_days))
+        for epoch in sorted(cfg_shards):
+            ep_df = _read_prediction_shards(cfg_shards[epoch])
+            fold_ids = sorted(ep_df["fold_id"].unique().to_list())
+            if fold_ids != sorted(expected_fold_ids):
+                del ep_df
+                continue
+            metrics = _decision_time_checkpoint_metrics(
+                ep_df,
+                date_col=date_col,
+                entity_col=entity_col,
+            )
+            del ep_df
+            ic_mean = float(metrics["ic_mean"])
+            ic_std = float(metrics["ic_std"])
+            ic_n_days = int(metrics["ic_n_days"])
+            all_curves.append(
+                {
+                    "config": config_name,
+                    "epoch": epoch,
+                    "ic_mean": ic_mean,
+                    "ic_std": ic_std,
+                    "ic_n_days": ic_n_days,
+                }
+            )
+            complete_slices.append((config_name, int(epoch)))
+            epoch_scores.append((epoch, ic_mean, ic_std, ic_n_days))
 
         if epoch_scores:
             full_coverage = max(item[3] for item in epoch_scores)
@@ -2532,7 +3013,7 @@ def run_dl_cv(
             validate_deep_checkpoint_population(
                 checkpoint_root,
                 config_name=config_name,
-                fold_ids=tuple(expected_fold_ids),
+                fold_ids=tuple(sorted(set(expected_fold_ids) | adopted)),
                 checkpoints=declared_epoch_checkpoints(
                     int(cfg.get("n_epochs", 100)),
                     int(cfg.get("checkpoint_interval", 5)),
@@ -2544,16 +3025,16 @@ def run_dl_cv(
         # aggregation finishes. Registering only the raw-IC peak would prevent a
         # reader from applying the checkpoint-level coverage guard when that peak
         # has undefined daily IC on part of the validation surface.
-        if register and case_study and epoch_scores and cfg_preds.height > 0:
+        if register and case_study and epoch_scores:
             try:
                 from case_studies.utils.registry import register_prediction_set
 
                 arch = resolve_arch_name(config_name)
                 cfg_curves_df = pl.DataFrame([c for c in all_curves if c["config"] == config_name])
                 epoch_ic = {epoch: ic for epoch, ic, _std, _days in epoch_scores}
-                epochs = sorted(cfg_preds["epoch"].unique().to_list())
+                epochs = sorted(cfg_shards)
                 first_ep = best_cp if best_cp in epochs else epochs[0]
-                first_slice = cfg_preds.filter(pl.col("epoch") == first_ep).drop("config", "epoch")
+                first_slice = _read_prediction_shards(cfg_shards[first_ep]).drop("config", "epoch")
                 t_hash = _register_dl_config(
                     case_study=case_study,
                     label=label_col,
@@ -2572,10 +3053,11 @@ def run_dl_cv(
                     prediction_split=prediction_split,
                     identity_params=_config_identity_params(cfg),
                 )
+                del first_slice
                 for epoch, _ic, _epoch_std, _days in epoch_scores:
                     if epoch == first_ep:
                         continue
-                    epoch_preds = cfg_preds.filter(pl.col("epoch") == epoch).drop("config", "epoch")
+                    epoch_preds = _read_prediction_shards(cfg_shards[epoch]).drop("config", "epoch")
                     register_prediction_set(
                         case_study,
                         training_hash=t_hash,
@@ -2585,6 +3067,7 @@ def run_dl_cv(
                         predictions=epoch_preds,
                         metrics={"ic_mean": epoch_ic[epoch]},
                     )
+                    del epoch_preds
                 print(
                     f"    registered {config_name} incrementally "
                     f"({len(epoch_scores)} per-epoch slices)"
@@ -2597,11 +3080,16 @@ def run_dl_cv(
     del config_acc
     gc.collect()
 
-    complete_predictions = (
-        pl.concat(complete_prediction_frames, how="diagonal_relaxed")
-        if complete_prediction_frames
-        else pl.DataFrame()
+    # Read in the order the loop recorded, which is the order a single frame cut by
+    # (config, checkpoint) produced: configuration, then checkpoint, then fold.
+    complete_predictions = _read_prediction_shards(
+        [
+            shard
+            for slice_config, slice_epoch in complete_slices
+            for shard in shards_by_config[slice_config][slice_epoch]
+        ]
     )
+    gc.collect()
 
     learning_curves = pl.DataFrame(all_curves) if all_curves else pl.DataFrame()
     training_log_df = pl.DataFrame(training_log) if training_log else pl.DataFrame()

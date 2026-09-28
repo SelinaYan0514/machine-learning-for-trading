@@ -47,20 +47,17 @@
 import json
 import sqlite3
 import time
-import warnings
 
 import matplotlib.pyplot as plt
 import polars as pl
 
-warnings.filterwarnings("ignore")
-
 # %% [markdown]
 # Shared helpers keep strategy construction, execution, registry access, and
 # paired uncertainty consistent with the preceding pipeline stages.
-
 # %%
 from case_studies.research import (
     PLAN_STAGE_KEYS,
+    SUPERSEDES_LIVE,
     CandidateSet,
     OfficialPopulation,
     Study,
@@ -107,10 +104,12 @@ from case_studies.utils.uncertainty import (
     periods_per_year_from_setup,
 )
 from utils.paths import get_case_study_dir
-from utils.style import COLORS, FIGSIZE, add_message_title
+from utils.style import COLORS, FIGSIZE, add_message_title, show_with_alt
 
 # %% tags=["parameters"]
 CASE_STUDY_ID = "sp500_equity_option_analytics"
+EXECUTION_TIER = "canonical"
+WORKSPACE: str = ""
 LABEL = ""
 MAX_SYMBOLS = 0
 MAX_RISK_VARIANTS = 0
@@ -124,6 +123,29 @@ TOP_N_COMBOS = None
 # parameter wins; otherwise the case study's own declaration does.
 
 # %%
+# A run given a workspace reads and registers there rather than in the released case
+# directory, and `open_study` is what activates that root. Activation rewrites
+# `ML4T_OUTPUT_DIR` for the rest of the process, so it has to happen before the first
+# `get_case_study_dir` rather than beside the registry read further down: `CASE_DIR` has to
+# already answer for the workspace.
+#
+# `WORKSPACE` is read at both tiers. It used to be read on the preview branch only, so a
+# canonical run that passed one was answered with `Study.regenerate` and registered its
+# backtests in the published store while its caller read from the workspace it asked for -
+# no exception, no warning, and an exit status that said the run had refused (#1100). A
+# canonical run with a workspace is the same full-fidelity sweep writing to that root, which
+# is what a rehearsal against a private registry needs. A preview still requires one, because
+# a preview with no workspace has nowhere of its own to write.
+_workspace_study = None
+if EXECUTION_TIER == "preview" and not WORKSPACE:
+    raise ValueError("preview execution requires WORKSPACE")
+if WORKSPACE or EXECUTION_TIER == "preview":
+    _workspace_study = open_study(
+        CASE_STUDY_ID,
+        execution_tier=EXECUTION_TIER,
+        workspace=WORKSPACE or None,
+        entry_point="16_risk_management",
+    )
 CASE_DIR = get_case_study_dir(CASE_STUDY_ID)
 REGISTRY_DB = CASE_DIR / "run_log" / "registry.db"
 bt_config = get_backtest_config(CASE_STUDY_ID)
@@ -139,33 +161,40 @@ if CASE_STUDY_ID in VECTORIZED_CASE_STUDIES:
 print(f"Case study: {CASE_STUDY_ID}; label: {RISK_LABEL}; selected lineages: {TOP_N}; mode: engine")
 
 # %% [markdown]
-# ## 1. Advance the highest-ranked eligible strategy carrier
+# ## 1. Advance the highest-ranked eligible strategy
 #
 # Selection compares the equal-weight baseline with active alternative
 # allocators using validation Sharpe and maximum prediction coverage.
 # Historical rows from removed allocators cannot enter the corrected risk stage.
 
 # %% [markdown]
-# **The carrier is whichever strategy row ranks highest, so the pool it is drawn from decides what
-# is being overlaid.** A population is immutable and the registry keeps every generation of it, so
-# a pool built straight from `backtest_runs` counts retired members beside current ones - nothing
-# in the read path filters on supersession (`case_studies/utils/registry/queries.py` contains no
-# occurrence of `supersed`). A retired generation that outranks its own replacement would carry the
-# risk comparison, and the notebook would report an overlay on a strategy the case study no longer
-# publishes. `prediction_hashes` is passed rather than applied afterwards because it also scopes
-# the full-coverage bar the query ranks against: a retired row with a longer in-window count would
-# otherwise set a bar its live replacement cannot meet.
+# **The selected configuration is whichever strategy row ranks highest, so the pool it is drawn from
+# decides what is being overlaid.** A population is immutable and the registry keeps every
+# generation of it, so a pool built straight from `backtest_runs` counts retired members beside
+# current ones - nothing in the read path filters on supersession
+# (`case_studies/utils/registry/queries.py` contains no occurrence of `supersed`). A retired
+# generation that outranks its own replacement would carry the risk comparison, and the notebook
+# would report an overlay on a strategy the case study no longer publishes. `prediction_hashes` is
+# passed rather than applied afterwards because it also scopes the full-coverage bar the query ranks
+# against: a retired row with a longer in-window count would otherwise set a bar its live
+# replacement cannot meet.
 
 # %%
 # `Study.at` is the read-only form: one root, no activation. These notebooks only read the
 # populations - their backtests reach the registry by their own paths - and every other way in
-# ends in `activate()`, which rewrites `ML4T_OUTPUT_DIR` process-wide. `open_study` with the
-# canonical tier routes to `Study.regenerate`, which refuses unless `features`, `labels` and
-# `run_log` are symlinks: true in a maintainer worktree, false in every clean clone and CI run.
-# `CASE_DIR` is already the directory this notebook resolved, including under a preview, so
+# ends in `activate()`, which rewrites `ML4T_OUTPUT_DIR` process-wide. `open_study` at the
+# canonical tier with no workspace routes to `Study.regenerate`, which refuses unless
+# `features`, `labels` and `run_log` are symlinks: true in a maintainer worktree, false in
+# every clean clone and CI run. Given a workspace it routes to `Study.open` instead, which is
+# why the branch above opens one whenever `WORKSPACE` is set rather than only for a preview.
+# `CASE_DIR` is already the directory this notebook resolved, including under a workspace, so
 # asking it directly answers for the registry the rest of the notebook reads.
-_study = Study.at(CASE_DIR, case_study=CASE_STUDY_ID, entry_point="16_risk_management")
-_members, _population_notes = prediction_members_in_force(_study)
+_study = (
+    _workspace_study
+    if _workspace_study is not None
+    else Study.at(CASE_DIR, case_study=CASE_STUDY_ID, entry_point="16_risk_management")
+)
+_members, _population_notes = prediction_members_in_force(_study, CASE_DIR)
 for _note in _population_notes:
     print(_note)
 CURRENT_MEMBERS = _members
@@ -174,10 +203,11 @@ if CURRENT_MEMBERS is not None:
 
 # %%
 active_allocators = {item["method"] for item in get_allocators(CASE_STUDY_ID)}
-# The carrier is chosen out of the baseline and allocation grids, so both are required before
-# either is ranked: their plans say which backtests the current grids contain, and their
-# attestations say the runs that filled them finished. Ranking the registry unrestricted picks
-# the carrier out of whatever historical rows survive, which is not the same question.
+# The selected configuration is chosen out of the baseline and allocation grids, so both are
+# required before either is ranked: their plans say which backtests the current grids contain, and
+# their attestations say the runs that filled them finished. Ranking the registry unrestricted picks
+# the selected configuration out of whatever historical rows survive, which is not the same
+# question.
 UPSTREAM_PLANS = upstream_plan_hashes(
     _study,
     case_study=CASE_STUDY_ID,
@@ -323,7 +353,7 @@ for combo in top_combos.iter_rows(named=True):
     base_specs.append((combo, prediction_hash, base_spec))
 
 # %% [markdown]
-# Each declared rule changes only the position-risk block of its carrier's
+# Each declared rule changes only the position-risk block of the overlaid configuration's
 # strategy specification.
 
 # %%
@@ -365,7 +395,7 @@ print(f"Planned {len(plans)} risk backtests; {cached} already complete")
 # path. Missing rows fail the production run; cached hashes are reused.
 #
 # A shared weight path isolates the position rule as the only difference among
-# a carrier's risk variants.
+# a selected configuration's risk variants.
 
 
 # %%
@@ -427,8 +457,9 @@ def execute_risk_plans(combo: dict, combo_plans: list[dict]) -> list[str]:
 RISK_POPULATION = sweep_plan_name(
     CASE_STUDY_ID, RISK_LABEL, "risk_overlay", predictions_identity(CURRENT_MEMBERS)
 )
-# The generation this run retires, per population name. A plan that has grown - a new carrier
-# advancing, another risk control declared - is a changed population under a live name and has
+# The generation this run retires, per population name. A plan that has grown - a new
+# configuration advancing, another risk control declared - is a changed population under a live
+# name and has
 # to say which one it replaces; the refusal prints the current hash.
 # All five moved with the allocation plans above them: the risk grid is built over the strategy
 # 15_portfolio_management selects, and that selection changed for the labels whose top-ten was
@@ -436,36 +467,64 @@ RISK_POPULATION = sweep_plan_name(
 # Empty, for the reason `SUPERSEDES_ALLOCATION_POPULATIONS` is: a declaration naming the
 # generation in force pre-authorizes a membership change under that name instead of recording
 # one that happened. Add an entry when a run is refused, with the hash the refusal prints.
-SUPERSEDES_RISK_POPULATIONS: dict[str, str] = {}
+SUPERSEDES_RISK_POPULATIONS: dict[str, str] = {
+    # Re-published 2026-09-19 after the twin-row drop deleted the plans of the 2026-09-18 sweep.
+    # The generation these retire predates that sweep and survived the drop, so the members moved
+    # under a name that already had a tip. `live` rather than the hash the refusal printed: the
+    # hash names the tip, the tip moves whenever these three re-run, and a quoted one is wrong
+    # from the next run onward.
+    "sp500_equity_option_analytics-risk-fwd_ret_5d-fe0f6ceeb71c": SUPERSEDES_LIVE,
+    "sp500_equity_option_analytics-risk-fwd_ret_10d-fe0f6ceeb71c": SUPERSEDES_LIVE,
+    "sp500_equity_option_analytics-risk-fwd_ret_risk_adj_5d-fe0f6ceeb71c": SUPERSEDES_LIVE,
+}
 
 _risk_plan = None
 try:
-    _risk_writable = open_study(CASE_STUDY_ID, entry_point="16_risk_management")
+    _risk_writable = (
+        _workspace_study
+        if _workspace_study is not None
+        else open_study(CASE_STUDY_ID, entry_point="16_risk_management")
+    )
 except PermissionError as exc:
     print(f"Not recording the risk plan here: {exc}")
 else:
-    if _risk_writable.root != CASE_DIR:
+    # `storage_root` is the registry this run writes, which is not always `root`: a preview's
+    # `root` stays the case directory while its writes go to `<workspace>/.preview/<case>`. A
+    # canonical run, with or without a workspace, writes its own root. Either way the guard
+    # compares it against the directory the sweep above read, so a run that reads one registry
+    # and records its plan in another is refused rather than recorded.
+    if _risk_writable.storage_root(EXECUTION_TIER) != CASE_DIR:
         raise RuntimeError(
             f"16 ran its sweep against {CASE_DIR} but opened a study rooted at "
             f"{_risk_writable.root}. Recording the plan there would describe a registry this "
             "run did not write."
         )
-    _risk_plan = OfficialPopulation.create(
-        _risk_writable,
-        name=RISK_POPULATION,
-        member_kind="backtest",
-        members=[plan["backtest_hash"] for plan in plans],
-        supersedes=population_supersedes(
+    if EXECUTION_TIER != "canonical":
+        # `OfficialPopulation.create` refuses a preview, and rightly: a published population is
+        # a durable claim about what this case study publishes, and a preview is discarded with
+        # its workspace. The risk sweep still executes and still registers. `_risk_plan` stays
+        # None, which the attestation below already tests for.
+        print(
+            f"{EXECUTION_TIER} tier: the risk sweep executes and registers, and publishes no "
+            f"official population under {RISK_POPULATION}."
+        )
+    else:
+        _risk_plan = OfficialPopulation.create(
             _risk_writable,
             name=RISK_POPULATION,
-            declared=SUPERSEDES_RISK_POPULATIONS.get(RISK_POPULATION),
-        ),
-    )
-    # Before any member executes; see `sweep_attestation_name`.
-    _attempt = open_sweep_attempt(_risk_writable, _risk_plan, UPSTREAM_PLANS)
-    print(
-        f"Risk plan {RISK_POPULATION}: {_risk_plan.hash}, {len(plans)} planned, attempt {_attempt}"
-    )
+            member_kind="backtest",
+            members=[plan["backtest_hash"] for plan in plans],
+            supersedes=population_supersedes(
+                _risk_writable,
+                name=RISK_POPULATION,
+                declared=SUPERSEDES_RISK_POPULATIONS.get(RISK_POPULATION),
+            ),
+        )
+        # Before any member executes; see `sweep_attestation_name`.
+        _attempt = open_sweep_attempt(_risk_writable, _risk_plan, UPSTREAM_PLANS)
+        print(
+            f"Risk plan {RISK_POPULATION}: {_risk_plan.hash}, {len(plans)} planned, attempt {_attempt}"
+        )
 
 # %%
 failures = []
@@ -532,7 +591,7 @@ if risk_results.filter(pl.col("stage") != "risk_overlay").height:
     raise RuntimeError("A planned risk hash was registered under the wrong stage")
 
 # %% [markdown]
-# A paired comparison aligns each overlay with its exact no-overlay carrier,
+# A paired comparison aligns each overlay with its exact no-overlay parent,
 # drops their shared inactive prefix, and resamples both paths together.
 
 
@@ -551,11 +610,12 @@ def paired_overlay_metrics(row: dict) -> dict:
         raise RuntimeError(f"Degenerate return pair for {row['risk_name']}")
     # The leading inactive sessions are dropped inside `compute_paired_uncertainty`, over both
     # series at once. Trimming per series is what broke this cell: an overlay sits out sessions
-    # its carrier trades, so the two sides arrived at different lengths and the paired bootstrap
+    # the configuration it overlays trades, so the two sides arrived at different lengths and the paired bootstrap
     # refused every one of them.
     #
     # `challenger_overlays_baseline` says which pair this is, and here it is an overlay running
-    # on top of its carrier: both are live from the carrier's first traded session, so a session
+    # on top of the configuration it overlays: both are live from that configuration's first
+    # traded session, so a session
     # the overlay sits out is a position it chose to hold and stays in. It is the effect being
     # measured. The default would drop those rows, which is right for a strategy that has a
     # warmup before its first signal and wrong for every rule below.
@@ -593,7 +653,7 @@ risk_results = risk_results.join(pl.DataFrame(paired_rows), on="backtest_hash").
 
 # %% [markdown]
 # The chart below ranks every overlay by its paired Sharpe difference against
-# its own no-overlay carrier. What separates an overlay worth carrying forward
+# its own no-overlay parent. What separates an overlay worth carrying forward
 # from one that is not is whether its bootstrap interval clears zero, not the
 # size of the point difference. With every declared rule scored on a single
 # validation path, a large point difference whose interval spans zero is what
@@ -629,7 +689,11 @@ add_message_title(
     "Which overlays move Sharpe, and which intervals clear zero",
     "Bars: point difference; whiskers: 95% stationary-block bootstrap",
 )
-fig_delta.show()
+show_with_alt(
+    fig_delta,
+    "Horizontal bars of the paired annualized Sharpe difference between each overlay and no "
+    "overlay, with 95% stationary-block bootstrap whiskers and a dashed line at zero.",
+)
 
 # %%
 fig_tradeoff, ax_tradeoff = plt.subplots(figsize=FIGSIZE["single"], constrained_layout=True)
@@ -665,7 +729,11 @@ add_message_title(
     "Higher is better; farther left means a shallower drawdown",
 )
 
-fig_tradeoff.show()
+show_with_alt(
+    fig_tradeoff,
+    "Scatter of annualized validation Sharpe against maximum drawdown magnitude, with a separate "
+    "colour for each overlay rule.",
+)
 
 # %% [markdown]
 # ## 4. Freeze the field the holdout will choose from
@@ -681,7 +749,7 @@ fig_tradeoff.show()
 # The members are the three stages that competed: the equal-weight baselines,
 # the allocation variants, and the risk overlays laid over them, restricted to
 # the prediction sets currently in force. All three matter. A pool of overlays
-# alone would force an overlay onto the carrier even where every control hurt
+# alone would force an overlay onto the selected configuration even where every control hurt
 # it, because this stage registers a row per named control and none for the
 # strategy it was overlaid on. A pool without the baselines would make a bare
 # equal-weight top-k unreachable, which is a legitimate answer whenever neither
@@ -691,39 +759,29 @@ fig_tradeoff.show()
 # fitted against different labels, features or folds cannot quietly join a set
 # the holdout will pick from.
 #
-# **The field spans every declared label, not the one this run overlaid.** The risk sweep above
-# is per label - it perturbs one carrier, drawn from one label's strategies - but the selection
+# **The field spans every declared label, not the one this run overlaid.** The risk sweep above is
+# per label - it perturbs one configuration, drawn from one label's strategies - but the selection
 # this set exists to make is not: the holdout picks the single highest validation backtest Sharpe
-# the case study produced, and a label that never entered the set cannot be picked no matter how
-# it scored. Resolving the field against `RISK_LABEL` made the membership depend on which label
-# happened to run last, which is both the wrong field and a set that changes under a fixed name
-# on every label - so the second label's run could not publish at all.
+# the case study produced, and a label that never entered the set cannot be picked no matter how it
+# scored. Resolving the field against `RISK_LABEL` made the membership depend on which label
+# happened to run last, which is both the wrong field and a set that changes under a fixed name on
+# every label - so the second label's run could not publish at all.
 
 # %%
 # A candidate set is immutable under its name, so a field whose membership has moved has to name
 # the generation it replaces. Keyed by the full set name because that is what the refusal prints.
 # Resolved through `candidate_set_supersedes` rather than passed straight to `create`: a
 # reader's clean clone has no generation to supersede, and `create` refuses a first version that
-# claims to replace one. Five generations precede this one and all five stay readable by hash,
-# which is what keeps a holdout registered against any of them traceable to the field it saw:
-# `328d2009685c` is the single-label field frozen on 2026-08-30 with 1,097 members, before the
-# four variant labels had baseline, allocation or overlay rows; `aa6b3986124b` replaced it on
-# 2026-09-01 with 3,680 under a per-stage count of advancing configurations, which admitted a
-# label whose sweep had produced one row per configuration and stopped; `04cb35eec43f` replaced
-# that one later the same day and held 3,710, 66 of them allocation backtests from a grid no
-# current sweep plan declares; `37169a5be187` replaced it with the declared grids only and held
-# 3,644; `774c32c6e79b` replaced that with 3,811. All five were frozen over a field that was
-# still being produced: the allocation and risk plans behind them were written at 21:40 UTC on
-# 2026-09-01, while the baseline sweeps that feed them published at 22:34-22:46 and three of the
-# baselines they rank were registered at 22:42. `57cb9eb3133c` is the tip, frozen 2026-09-02
-# over sweeps that ran in stage order and recorded that they finished. It holds 3,811 as well and
-# differs from `774c32c6e79b` in 54 members: the `fwd_ret_10d` allocation backtests registered at
-# 00:55 on 2026-09-01 gave way to the 54 the re-executed 15 registered at 00:30 on 2026-09-02, so
-# every member now rides an attestation that carries its own grid. Only the tip is declarable -
-# `create` refuses anything else and names the tip - so this value moves on every generation, and
-# it is wrong whenever it names a generation the registry has already superseded.
+# claims to replace one.
+#
+# `"live"` names the lineage rather than a generation of it. `create` accepts the head and
+# nothing else, and the head moves on every publish, so a pasted hash is correct only until the
+# next run of whatever freezes this set - the value it replaces here, `57cb9eb3133c`, was in no
+# lineage the registry holds by the time this notebook next ran. Every earlier generation stays
+# readable by its own hash, which is what keeps a holdout registered against any of them
+# traceable to the field it saw. See `case_studies.research.population.SUPERSEDES_LIVE`.
 SUPERSEDES_CANDIDATE_SETS: dict[str, str] = {
-    "sp500_equity_option_analytics:holdout-candidates": "57cb9eb3133c",
+    "sp500_equity_option_analytics:holdout-candidates": "live",
 }
 
 # %% [markdown]
@@ -793,7 +851,11 @@ try:
         raise PermissionError(
             "the sweep plans reported above are not all complete for the predictions in force"
         )
-    writable = open_study(CASE_STUDY_ID, entry_point="16_risk_management")
+    writable = (
+        _workspace_study
+        if _workspace_study is not None
+        else open_study(CASE_STUDY_ID, entry_point="16_risk_management")
+    )
 except PermissionError as exc:
     holdout_candidates = None
     print(
@@ -808,7 +870,12 @@ else:
     # root other than the one they will be read back from - which is how a member that is
     # complete at freeze time is incomplete at read time. Refusing is better than writing a set
     # nobody reads.
-    if writable.root != CASE_DIR:
+    # `storage_root` is the registry this run writes, which is not always `root`: a preview's
+    # `root` stays the case directory while its writes go to `<workspace>/.preview/<case>`. A
+    # canonical run, with or without a workspace, writes its own root. Either way the guard
+    # compares it against the directory the sweep above read, so a run that reads one registry
+    # and records its plan in another is refused rather than recorded.
+    if writable.storage_root(EXECUTION_TIER) != CASE_DIR:
         raise RuntimeError(
             f"16 resolved its candidate field from {CASE_DIR} but opened a study rooted at "
             f"{writable.root}. Freezing here would write the set where the holdout notebooks "
@@ -854,7 +921,7 @@ else:
 #
 # 1. Risk selection is validation-only. It carries the eligible lineage that
 #    ranks first on validation Sharpe forward without consulting the holdout.
-# 2. Every overlay is scored against its own carrier's no-overlay path, so the
+# 2. Every overlay is scored against its own parent's no-overlay path, so the
 #    position rule is the only difference inside a pair.
 # 3. An overlay earns a claim only where its paired bootstrap interval excludes
 #    zero. The ordering of point differences on its own establishes nothing.
@@ -863,16 +930,16 @@ else:
 #    used to score them.
 # 5. The predeclared overlays are a selection cohort, and the winner of one is a
 #    validation result. The holdout is what says whether it survives, and it is
-#    read on the final carrier rather than used to choose among these.
+#    read on the final configuration rather than used to choose among these.
 # 6. The field is frozen here as an immutable candidate set. That is what stops
 #    the four stages after this one from each re-deriving a selection, and what
 #    makes the configuration the holdout was run on a matter of record rather
 #    than a rule four notebooks apply consistently until one of them does not.
 # 7. The overlay sweep is per label; the field it feeds is not. Each label gets
-#    its own carrier and its own controls, and every label's strategies then
+#    its own configuration and its own controls, and every label's strategies then
 #    compete in one set, because the holdout picks one configuration for the
 #    case study rather than one per label.
 #
 # **Next:** [`17_costs`](17_costs.ipynb) stresses whichever configuration this stage
-# advances - the best overlay, or the un-overlaid carrier where no overlay helped -
+# advances - the best overlay, or the un-overlaid parent where no overlay helped -
 # across the cost surface. See Chapter 20 for the strategy synthesis framework.

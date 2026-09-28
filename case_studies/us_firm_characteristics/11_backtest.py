@@ -49,21 +49,23 @@
 # %%
 """Ch16 backtest and equal-weight baseline for US Firm Characteristics."""
 
-import sqlite3
 import time
-import warnings
 from collections import Counter
 from itertools import cycle
 
 import polars as pl
 
-from utils.style import COLORS, add_message_title, apply_ml4t_style
+from utils.style import COLORS, add_message_title, apply_ml4t_style, show_with_alt
 
-warnings.filterwarnings("ignore")
 apply_ml4t_style()
 
+from case_studies.research import open_study, reuse_disclosure
 from case_studies.utils.backtest_loaders import get_backtest_config, load_backtest_prices_for
-from case_studies.utils.backtest_presets import build_backtest_spec, serializable_backtest_spec
+from case_studies.utils.backtest_presets import (
+    build_backtest_spec,
+    serializable_backtest_spec,
+    traded_universe_declaration,
+)
 from case_studies.utils.backtest_runner import (
     normalize_prediction_columns,
     run_backtest,
@@ -98,6 +100,22 @@ TOP_N_PREDICTIONS = None
 # How far a no-edge Sharpe may land from zero before the plumbing test is read as a
 # failure of the engine rather than as sampling noise. The whole fleet uses 1.5.
 PLUMBING_SHARPE_TOLERANCE = 1.5
+# Both names stay bound here although nothing below reads them: that is what makes the harness
+# force preview and supply a workspace - `_declares_tier_and_workspace` in `tests/pm_helpers.py`
+# looks for exactly this pair. Without them the canonical branch regenerates in place, which
+# needs symlinks a CI checkout does not have.
+EXECUTION_TIER = "canonical"
+WORKSPACE: str = ""
+
+# %% [markdown]
+# The study is opened before anything resolves a path or reads the registry. Under the preview
+# tier, opening it activates a workspace and rewrites `ML4T_OUTPUT_DIR` process-wide, and every
+# later `get_case_study_dir` call resolves against that. A `CASE_DIR`, a prediction index or a
+# `BacktestExplorer` built first would address the released registry while the sweep writes to
+# the preview one, and the two never meet.
+
+# %%
+study = open_study(CASE_STUDY_ID, execution_tier=EXECUTION_TIER, workspace=WORKSPACE or None)
 
 # %% [markdown]
 # ## 1. Setup & Plumbing Test
@@ -139,6 +157,32 @@ print(f"""=== Protocol Term Sheet ===
 
 # %%
 prices = load_backtest_prices_for(CASE_STUDY_ID, LABEL, split="validation", max_symbols=MAX_SYMBOLS)
+
+# `MAX_SYMBOLS` reduces the price panel, and until the run says so in its own specification
+# that reduction did not reach `backtest_hash`: a reduced run and the full run over the same
+# predictions hashed alike, so the second was served the first's result and the reduction
+# bought nothing (ml4t/agent-workspace#911). Declaring it here, before anything is hashed,
+# gives a reduced run an identity of its own; `run_backtest` checks the panel against the
+# declaration and narrows the predictions to it, so the sweep ranks the cross-section this
+# says it ranks and `n_assets` above describes that same set. A full run declares nothing and
+# is byte-identical to before.
+# A reduced run is a preview run. Refused on the canonical tier so a narrowed result can
+# never land in the registry the book's numbers come from, and so the two can never sit in
+# one registry to be ranked against each other: `resolve_best_predictions` takes MAX(sharpe)
+# over every backtest of a prediction, and a Sharpe earned over a handful of names would
+# advance a configuration ahead of one earned over the whole panel. `us_equities_panel` 16
+# through 19 already refuse the parameter this way, and `canonically_refused_parameters`
+# reads the refusal out of the source, so the canonical fixture path drops the name rather
+# than handing the notebook something its first cell raises on.
+if EXECUTION_TIER == "canonical" and MAX_SYMBOLS:
+    raise ValueError(
+        "MAX_SYMBOLS narrows the universe this run trades, which makes it a different "
+        "portfolio from the declared one and gives it its own backtest identity "
+        "(ml4t/agent-workspace#911). A canonical run trades the declared universe: set "
+        "MAX_SYMBOLS=0, or run under EXECUTION_TIER='preview' with a WORKSPACE."
+    )
+TRADED_UNIVERSE = traded_universe_declaration(prices) if MAX_SYMBOLS else None
+
 n_assets = prices["symbol"].n_unique()
 print(f"Prices: {len(prices):,} rows, {n_assets} assets")
 
@@ -160,9 +204,11 @@ strategy_spec = build_backtest_spec(
     CASE_STUDY_ID,
     bt_config,
     prices=prices,
+    traded_universe=TRADED_UNIVERSE,
     prediction_hash="plumbing_test",
     initial_cash=bt_config.initial_cash,
     chapter="ch16",
+    label=LABEL,
     signal={
         "method": "score_weighted_top_k",
         "top_k": TOP_K,
@@ -237,6 +283,22 @@ print(
     f"\nTotal grid: {n_predictions} predictions x {n_schemes} schemes = {total_backtests} backtests"
 )
 
+# A grid with no schemes is a configuration error, not a result, and it is silent at the
+# point it happens: `get_entry_schemes_for` drops each declared k that the cross-section
+# cannot realize and returns the empty list, so the sweep below completes in zero seconds
+# reporting zero failures, and every section after it reads a registry this run never wrote
+# to. Refuse here, where the numbers that explain it are still in hand, rather than several
+# cells later on whatever the first empty read happens to raise
+# (ml4t/agent-workspace#1075).
+if n_schemes == 0:
+    raise RuntimeError(
+        f"No entry scheme in backtest.sweep.top_k_grid[{LABEL!r}] is feasible on "
+        f"{n_assets} assets. A scheme needs k < n_assets, because k == n_assets is the "
+        f"whole universe and that is the equal-weight benchmark rather than a "
+        f"prediction-based portfolio; long-short additionally needs 2k <= n_assets so the "
+        f"two legs stay disjoint. Widen the universe (MAX_SYMBOLS) or declare a smaller k."
+    )
+
 # %%
 results = []
 failures: Counter[str] = Counter()
@@ -265,9 +327,15 @@ for pred_row in pred_index.iter_rows(named=True):
             CASE_STUDY_ID,
             bt_config,
             prices=prices,
+            traded_universe=TRADED_UNIVERSE,
             prediction_hash=pred_hash,
             initial_cash=bt_config.initial_cash,
             chapter="ch16",
+            # The step this label declares is part of the backtest identity, and it reaches
+            # the spec only through `label=`. Without it the hash below is one no run
+            # registers, so every one of the registry's baseline rows reads as missing and
+            # the sweep recomputes all of them (ml4t/agent-workspace#1028).
+            label=LABEL,
             signal=signal,
         )
         backtest_hash = backtest_hash_from_parts(pred_hash, serializable_backtest_spec(spec))
@@ -360,9 +428,7 @@ for pred_row in pred_index.iter_rows(named=True):
             )
 
 elapsed = time.time() - t0
-print(
-    f"\nSweep complete: {len(results)} backtests in {elapsed:.0f}s ({failed} failed, {skipped} skipped)"
-)
+print(f"\nSweep complete in {elapsed:.0f}s: {reuse_disclosure(len(results), skipped, failed)}")
 for reason, count in failures.most_common():
     print(f"  {count:>5} x {reason[:150]}")
 
@@ -453,22 +519,16 @@ top = (
 # this sweep, so on its own the table cannot tell a five-name portfolio from a fifty-
 # name one - the dimension the sweep exists to vary. The concentration is in the same
 # spec, one key across, and is joined back here.
-with sqlite3.connect(str(CASE_DIR / "run_log" / "registry.db")) as conn:
-    concentration = (
-        pl.DataFrame(
-            conn.execute(
-                "SELECT backtest_hash, spec_json FROM backtest_runs WHERE stage = 'signal'"
-            ).fetchall(),
-            schema=["backtest_hash", "spec_json"],
-            orient="row",
-        )
-        .with_columns(
-            names_per_side=pl.col("spec_json")
-            .str.json_path_match("$.strategy.signal.top_k")
-            .cast(pl.Int64)
-        )
-        .drop("spec_json")
+concentration = (
+    explorer.specs("signal")
+    .drop("stage")
+    .with_columns(
+        names_per_side=pl.col("spec_json")
+        .str.json_path_match("$.strategy.signal.top_k")
+        .cast(pl.Int64)
     )
+    .drop("spec_json")
+)
 
 top = top.join(concentration, on="backtest_hash", how="left")
 print(top.select("source", "names_per_side", "sharpe", "cagr", "max_drawdown"))
@@ -578,8 +638,15 @@ if not all_signal.is_empty():
         f"| excluded as insolvent: {ruined.height:,}"
     )
 
-fig.tight_layout()
-fig.show()
+# No tight_layout(): matplotlibrc sets `figure.constrained_layout.use: True` repo-wide,
+# and calling tight_layout() over it makes matplotlib switch layout engines and say so in
+# a stderr block under the figure. See ml4t/agent-workspace#1106.
+show_with_alt(
+    fig,
+    "Two panels over the solvent baseline backtests: on the left a histogram of validation Sharpe "
+    "with a dashed line at zero, on the right one point per prediction set and entry scheme "
+    "placing validation Sharpe against mean prediction IC, coloured by model family.",
+)
 
 # %% [markdown]
 # ### Deflated Sharpe Ratio

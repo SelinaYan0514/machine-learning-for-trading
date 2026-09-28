@@ -57,11 +57,8 @@
 """CME Futures: Holdout Predictions."""
 
 import sqlite3
-import warnings
 
 import polars as pl
-
-warnings.filterwarnings("ignore")
 
 from case_studies.research import open_study
 from case_studies.research.holdout import build_holdout_training_spec
@@ -71,7 +68,10 @@ from case_studies.utils.strategy_analysis import (
     resolve_solvent_carrier,
     training_run_fitted_for_the_holdout,
 )
+from case_studies.utils.warning_policy import apply_notebook_warning_policy
 from utils.paths import get_case_study_dir
+
+apply_notebook_warning_policy()
 
 # %% tags=["parameters"]
 CASE_STUDY_ID = "cme_futures"
@@ -148,13 +148,13 @@ def _registered_holdout_generations(case_dir):
 # and a hash written down in one and read in the other agrees only until the sweep is
 # rebuilt.
 #
-# Nothing about the holdout enters this choice. The carrier is the validation rank-1, and
-# it was fixed before this notebook ran.
+# Nothing about the holdout enters this choice. The selected configuration is the validation
+# rank-1, and it was fixed before this notebook ran.
 
 # %%
 carrier = resolve_solvent_carrier(CASE_STUDY_ID)
 print(
-    f"Carrier: {carrier['val_backtest_hash']}  stage={carrier['val_stage']}  "
+    f"Selected configuration: {carrier['val_backtest_hash']}  stage={carrier['val_stage']}  "
     f"family={carrier['family']}  config={carrier['config_name']}  "
     f"label={carrier['label']}"
 )
@@ -164,7 +164,7 @@ print(
 print(f"  fitted by training run {carrier['training_hash']}")
 
 # %% [markdown]
-# The checkpoint is part of the configuration, and it is read from the carrier's own
+# The checkpoint is part of the configuration, and it is read from the selected configuration's own
 # prediction set rather than assumed. Every family this case study fits publishes at the
 # end of training, so the value here is `final` and carries no iteration - but reading it
 # is what keeps that true rather than asserted: a family that later publishes on a
@@ -249,15 +249,15 @@ print(f"Holdout training ends {fold['train_end']}, holdout opens {fold['val_star
 # is not the same as free: every configuration evaluated on it is another look at a period
 # the case study reports as unseen, and two evaluated quietly would make that report false.
 #
-# So the check below is on the carrier rather than on the notebook, and it has exactly two
-# outcomes. With the carrier unchanged this is an idempotent replay: the derivation is
-# deterministic and the training identity covers it, so the same identity comes back and
-# the fit is served from the registry. With the carrier changed it refuses, names both
-# configurations, and stops.
+# So the check below is on the selected configuration rather than on the notebook, and it has
+# exactly two outcomes. With the selected configuration unchanged this is an idempotent replay: the
+# derivation is deterministic and the training identity covers it, so the same identity comes back
+# and the fit is served from the registry. With the selected configuration changed it refuses,
+# names both configurations, and stops.
 #
 # It refuses rather than offering a replacement switch, and the reason is that a replacement
 # would not be one. Deleting the earlier generation's rows does not undo having observed its
-# result: the selection that produced the new carrier may have been informed by the old
+# result: the selection that produced the new configuration may have been informed by the old
 # holdout number, and no deletion reaches that. A switch here would let the case study take a
 # second look at the window while leaving a registry that shows only one, which is the
 # specific thing that would make the out-of-sample claim false rather than merely weak.

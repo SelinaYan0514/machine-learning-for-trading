@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 import subprocess
 from collections.abc import Mapping
@@ -11,10 +12,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ..runtime import worktree_marker
 from .specs import (
     IDENTITY_VERSION,
     _validate_spec,
-    canonical_json,
     training_hash_from_spec,
 )
 
@@ -27,6 +28,19 @@ UTC = UTC
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
+#
+# Keep prose out of the SQL below. SQLite stores a table's CREATE text verbatim in
+# `sqlite_master` and re-parses it on `ALTER TABLE ... DROP COLUMN`; a trailing `--`
+# comment inside the statement makes that re-parse fail with "incomplete input", so a
+# comment written for the next reader breaks a migration years later. Explain a column
+# here, or above the migration that adds it.
+#
+# `prediction_metrics.direction_label_error` says why `direction_label` is NULL when a
+# direction sibling was declared and scoring against it still did not land - a NULL that
+# otherwise reads identically to "this label declares no sibling". It is declared rather
+# than left to `_upsert_wide_metrics`'s auto-add, which types a new column from the first
+# value it sees: on a healthy registry that is the None a successful run writes, which
+# would make the column REAL and put every later message in a numeric one.
 
 REGISTRY_SCHEMA_SQL = """\
 CREATE TABLE IF NOT EXISTS training_runs (
@@ -96,7 +110,8 @@ CREATE TABLE IF NOT EXISTS prediction_metrics (
     ic_mean REAL, ic_std REAL, ic_t REAL, n_folds REAL,
     pct_positive REAL, task_type TEXT,
     accuracy REAL, balanced_accuracy REAL, auc_roc REAL, auc_pr REAL,
-    log_loss REAL, brier_score REAL
+    log_loss REAL, brier_score REAL,
+    direction_label_error TEXT
 );
 
 CREATE TABLE IF NOT EXISTS fold_metrics (
@@ -161,12 +176,32 @@ CREATE TABLE IF NOT EXISTS causal_runs (
     n_obs            INTEGER,
     dml_effect       REAL,
     dml_se_hac       REAL,
+    -- Which estimator produced dml_se_hac: "driscoll_kraay", "newey_west", or
+    -- "failed". Without it the row cannot say what its own standard error is, and
+    -- the two robust estimators differ by whether the caller supplied decision-time
+    -- groups. manual_dml_timeseries used to seed se_hac with the HC0 value and report
+    -- a successful Driscoll-Kraay whatever happened, so a fallback was indistinguishable
+    -- from a robust result in the row, in the p-value, and in the prose.
+    covariance_type  TEXT,
     p_value_hac      REAL,
     naive_effect     REAL,
     confounding_bias_pct REAL,
     refutation_p     REAL,
     refutation_n_successful INTEGER,
     refutation_placebo_json TEXT,
+    -- The placebo t-statistics behind refutation_p, which is the statistic the
+    -- test is computed on since the correction. The thetas
+    -- above stay because they are still what a reader wants to see on the effect scale,
+    -- but a figure drawn from them no longer shows the distribution the p-value came
+    -- from: permuting the treatment inflates var(T_res) and shrinks every placebo theta
+    -- toward zero, which is the defect. Two columns because these are two quantities.
+    refutation_placebo_t_json TEXT,
+    -- The share of treatment rows block permutation could not move, because they sit in
+    -- segments too short to hold two blocks. The runner warns that it must be read
+    -- alongside the p-value - the bias runs toward p = 1 - and the warning fires only on
+    -- a fresh fit, so without the column a reader who regenerates the result from the
+    -- registry gets the p-value and no way to see whether to trust it.
+    refutation_frozen_fraction REAL,
     spec_json        TEXT,
     notebook         TEXT,
     started_at       TEXT,
@@ -218,12 +253,25 @@ CREATE TABLE IF NOT EXISTS cohort_metrics (
     label         TEXT NOT NULL,
     family        TEXT,
     leader_hash   TEXT NOT NULL REFERENCES backtest_runs(backtest_hash),
+    -- The trials the correction was computed over, which is the K a notebook prints
+    -- beside a deflated Sharpe and so has to be the K that deflated it.
     k_variants                  INTEGER NOT NULL,
+    -- The configurations the cohort holds. Larger than k_variants exactly when a
+    -- regularisation grid ran past the point where the penalty stops binding and
+    -- several configurations produced one series; see uncertainty._distinct_trials.
+    k_variants_submitted        INTEGER,
     -- sha256 over the cohort's sorted member backtest hashes. A count cannot say
     -- which variants a stored correction was computed over: swap one retired member
     -- for one live member and k_variants is unchanged, so a reader comparing counts
     -- accepts a correction from a different cohort than the one it asked for.
     member_digest               TEXT,
+    -- The members that digest covers, as a sorted JSON array. The digest is one-way, so
+    -- with it alone verifying a row means rebuilding the member list from the registry
+    -- and re-hashing it - and that rebuild replays every selection rule in force when
+    -- the row was written. When one has moved since, a real membership disagreement is
+    -- indistinguishable from a rule change. Stored, the comparison is against a fact and
+    -- names the members that differ; see uncertainty.cohort_membership_diff.
+    members_json                TEXT,
     periods_per_year            REAL NOT NULL,
     computed_at                 TEXT NOT NULL,
     n_trials_effective_mp       REAL,
@@ -255,6 +303,51 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_cohort_unique
     ON cohort_metrics(cohort_type, COALESCE(stage, ''), label, COALESCE(family, ''));
 CREATE INDEX IF NOT EXISTS idx_cohort_leader ON cohort_metrics(leader_hash);
 
+-- What a sweep found when it measured a member's cross-sectional coverage. The sweep and the
+-- carrier resolver used to answer "which predictions are admissible" separately: the sweep
+-- through `prediction_members_in_force`, which charges every member against the feature panel
+-- it was offered, and the resolver through `full_coverage_prediction_sql`, whose `ic_n_days`
+-- bar counts decision days and cannot see a family that scored every day for half the
+-- universe. The resolver was the looser of the two, so a prediction the sweep refused to
+-- backtest could still carry the case study.
+--
+-- Recording the measurement makes them one object rather than two implementations that agree
+-- by inspection. Only members a sweep actually measured appear here; a member nothing has
+-- measured is absent, which is not the same as admitted and is what the readers treat it as.
+--
+-- The counts are stored beside the verdict because nothing else in the registry holds the
+-- declared denominator. `prediction_coverage.n_expected` is built by the model family's own
+-- adapter from its own prepared fold inputs, so it says the model produced what it set out to
+-- produce and cannot say how much of the declared universe that was. Measured on
+-- sp500_equity_option_analytics: all 140 predictions this table rules `admitted = 0` carry a
+-- `prediction_coverage` row reading `status = 'complete'` and `n_missing = 0`, whose
+-- `n_expected` values (125,119 / 126,458 / 126,478) are exactly the narrowed numerators here
+-- against `n_declared` of 246,641 / 248,460 / 249,373. Both are true of the same predictions,
+-- and only one of them answers "did this cover the cross-section its peers ranked".
+-- The five counts, in the order they narrow: `n_declared` is the (entity, session) pairs the
+-- label declares for the split; `n_delivered` is how many of those this prediction set
+-- carries; `n_offered` is how many of `n_declared` the input feature panel reached, so a
+-- family is charged for what it lost rather than for what it was never given, and is NULL
+-- when no panel was supplied; `n_delivered_offered` is how many of `n_offered` the set
+-- carries, and that over `n_offered` is the ratio the admissibility threshold applies to.
+-- `n_entities_declared` is the width of the declared cross-section. All five are NULL on a
+-- member no sweep has measured, because zero of zero is a measurement and absence is not.
+CREATE TABLE IF NOT EXISTS prediction_admissibility (
+    prediction_hash      TEXT PRIMARY KEY,
+    admitted             INTEGER NOT NULL,
+    reason               TEXT,
+    recorded_at          TEXT NOT NULL,
+    git_commit           TEXT,
+    n_declared           INTEGER,
+    n_delivered          INTEGER,
+    n_offered            INTEGER,
+    n_delivered_offered  INTEGER,
+    n_entities_declared  INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_prediction_admissibility_admitted
+    ON prediction_admissibility(admitted);
+
 CREATE TABLE IF NOT EXISTS candidate_sets (
     set_hash                 TEXT PRIMARY KEY,
     name                     TEXT NOT NULL,
@@ -272,6 +365,22 @@ CREATE TABLE IF NOT EXISTS candidate_set_members (
     PRIMARY KEY (set_hash, ordinal),
     UNIQUE (set_hash, member_hash)
 );
+
+-- A candidate set is identified by its members and its comparison contract, so two names for
+-- the same comparison resolve to one `candidate_sets` row. The binding therefore cannot live
+-- on that row: a union that adds nothing to one of its inputs has the input's identity and its
+-- own name, and both names have to resolve. Lineage is per name, because superseding is a
+-- statement about which generation of a named comparison is in force.
+CREATE TABLE IF NOT EXISTS candidate_set_names (
+    name            TEXT NOT NULL,
+    set_hash        TEXT NOT NULL REFERENCES candidate_sets(set_hash),
+    supersedes_hash TEXT,
+    created_at      TEXT NOT NULL,
+    git_commit      TEXT,
+    PRIMARY KEY (name, set_hash)
+);
+
+CREATE INDEX IF NOT EXISTS idx_candidate_set_names_hash ON candidate_set_names(set_hash);
 
 
 CREATE TABLE IF NOT EXISTS execution_attempts (
@@ -336,6 +445,19 @@ CREATE TABLE IF NOT EXISTS decision_artifacts (
     created_at          TEXT NOT NULL
 );
 
+-- One declared edge per superseded input artifact: "the file registered runs pin as
+-- `supersedes_sha256` was deliberately replaced by `sha256`". A training run fits on
+-- whatever is on disk, so without a declaration a regenerated artifact silently mixes two
+-- vintages into one population. `register_training_run` refuses
+-- an undeclared change and `declare_artifact_supersession` is how an author declares one.
+CREATE TABLE IF NOT EXISTS artifact_supersessions (
+    artifact_name      TEXT NOT NULL,
+    sha256             TEXT NOT NULL,
+    supersedes_sha256  TEXT NOT NULL,
+    declared_at        TEXT NOT NULL,
+    PRIMARY KEY (artifact_name, supersedes_sha256)
+);
+
 """
 
 
@@ -345,8 +467,15 @@ CREATE TABLE IF NOT EXISTS decision_artifacts (
 
 
 def _git_hash() -> str | None:
+    """Return the short commit for the ``git_commit`` column, with a worktree marker.
+
+    Resolved against the process working directory, which is the notebook's own
+    directory, so it names the checkout the run executed in. The marker is what
+    separates a row whose source is addressable from one whose is not; see
+    :func:`case_studies.utils.runtime.worktree_marker`.
+    """
     try:
-        return (
+        commit = (
             subprocess.check_output(
                 ["git", "rev-parse", "--short", "HEAD"],
                 stderr=subprocess.DEVNULL,
@@ -357,6 +486,7 @@ def _git_hash() -> str | None:
         )
     except Exception:
         return None
+    return commit + worktree_marker()
 
 
 def _utc_now() -> str:
@@ -515,8 +645,42 @@ def _open_registry(case_dir: Path) -> sqlite3.Connection:
     # Migrate existing DBs before running CREATE TABLE IF NOT EXISTS
     _migrate_registry(db)
     db.executescript(REGISTRY_SCHEMA_SQL)
+    _backfill_candidate_set_names(db)
     _declare_uncertainty_columns(db)
     return db
+
+
+def _backfill_candidate_set_names(db: sqlite3.Connection) -> None:
+    """Give every stored candidate set the name binding its identity row records.
+
+    `candidate_sets` holds one row per set of members, so its `name` column can only record the
+    first name a set was written under; a second name for the same members had nowhere to go and
+    was dropped. `candidate_set_names` is where a binding lives now, and this carries the
+    existing ones across. It runs after the schema script rather than in `_migrate_registry`,
+    which runs before the table exists.
+
+    One binding per existing row, carrying that row's lineage, so a migrated registry resolves
+    every name it resolved before.
+
+    Probed with a read before writing, and this matters more than it looks. `_open_registry` is
+    on every path that touches a registry, so an unconditional `INSERT ... SELECT` took the
+    write lock on every open - and with `busy_timeout` at 60s, one contended open blocks for a
+    minute rather than proceeding. The probe is a covering read that answers instantly and
+    leaves the lock alone once the backfill has run, which is every open after the first.
+    """
+    pending = db.execute(
+        "SELECT EXISTS (SELECT 1 FROM candidate_sets s WHERE NOT EXISTS ("
+        "  SELECT 1 FROM candidate_set_names n"
+        "  WHERE n.name = s.name AND n.set_hash = s.set_hash))"
+    ).fetchone()[0]
+    if not pending:
+        return
+    db.execute(
+        "INSERT OR IGNORE INTO candidate_set_names "
+        "(name, set_hash, supersedes_hash, created_at, git_commit) "
+        "SELECT name, set_hash, supersedes_hash, created_at, git_commit FROM candidate_sets"
+    )
+    db.commit()
 
 
 # Metric columns the uncertainty layer produces on every run, which the CREATE TABLE statements
@@ -547,10 +711,29 @@ _BACKTEST_UNCERTAINTY_COLUMNS = (
     "bootstrap_n",
 )
 
+# Written on every run by `compute_portfolio_metrics`: whether the path lost its
+# capital, and the index of the period where it did.
+_BACKTEST_RUIN_COLUMNS = ("ruin", "ruin_period")
+
+# Written on every run by `RiskTriggerLog.as_metrics`: how often each declared risk
+# control acted, NULL where none of that kind was declared.
+_BACKTEST_RISK_TRIGGER_COLUMNS = (
+    "risk_triggers",
+    "risk_triggers_stop_loss",
+    "risk_triggers_trailing_stop",
+    "risk_triggers_time_exit",
+    "risk_triggers_max_drawdown",
+    "risk_triggers_daily_loss",
+)
+
 _DECLARED_METRIC_COLUMNS: dict[str, tuple[str, ...]] = {
-    "backtest_metrics": _BACKTEST_UNCERTAINTY_COLUMNS,
+    "backtest_metrics": _BACKTEST_UNCERTAINTY_COLUMNS
+    + _BACKTEST_RUIN_COLUMNS
+    + _BACKTEST_RISK_TRIGGER_COLUMNS,
     # n_periods rides along: the fold table declares n_days, and the metric pass writes both.
-    "backtest_fold_metrics": _BACKTEST_UNCERTAINTY_COLUMNS + ("n_periods",),
+    "backtest_fold_metrics": _BACKTEST_UNCERTAINTY_COLUMNS
+    + _BACKTEST_RUIN_COLUMNS
+    + ("n_periods",),
     "prediction_metrics": tuple(
         f"{metric}_{suffix}"
         for metric in ("ic", "auc")
@@ -697,6 +880,16 @@ def _migrate_registry(db: sqlite3.Connection) -> None:
         cohort_cols = {row[1] for row in db.execute("PRAGMA table_info(cohort_metrics)").fetchall()}
         if "member_digest" not in cohort_cols:
             db.execute("ALTER TABLE cohort_metrics ADD COLUMN member_digest TEXT")
+        # The configurations the cohort holds, which is not the same as the trials the
+        # correction was computed over: a regularisation grid that saturates submits
+        # several and produces one series. `k_variants` is the trial count, because that
+        # is the K printed beside a deflated Sharpe; this is what was submitted, and the
+        # two together say by how much a grid ran past saturation. See
+        # `uncertainty._distinct_trials`.
+        if "k_variants_submitted" not in cohort_cols:
+            db.execute("ALTER TABLE cohort_metrics ADD COLUMN k_variants_submitted INTEGER")
+        if "members_json" not in cohort_cols:
+            db.execute("ALTER TABLE cohort_metrics ADD COLUMN members_json TEXT")
 
     if "prediction_coverage" in tables:
         coverage_cols = {
@@ -706,6 +899,21 @@ def _migrate_registry(db: sqlite3.Connection) -> None:
             db.execute("ALTER TABLE prediction_coverage ADD COLUMN schema_json TEXT")
         if "artifact_digest" not in coverage_cols:
             db.execute("ALTER TABLE prediction_coverage ADD COLUMN artifact_digest TEXT")
+
+    if "prediction_admissibility" in tables:
+        admissibility_columns = {
+            "n_declared": "INTEGER",
+            "n_delivered": "INTEGER",
+            "n_offered": "INTEGER",
+            "n_delivered_offered": "INTEGER",
+            "n_entities_declared": "INTEGER",
+        }
+        existing_admissibility = {
+            row[1] for row in db.execute("PRAGMA table_info(prediction_admissibility)").fetchall()
+        }
+        for column, sql_type in admissibility_columns.items():
+            if column not in existing_admissibility:
+                db.execute(f"ALTER TABLE prediction_admissibility ADD COLUMN {column} {sql_type}")
 
     # Migration 2b: add runtime columns to backtest_runs
     if "backtest_runs" in tables:
@@ -744,6 +952,30 @@ def _migrate_registry(db: sqlite3.Connection) -> None:
     ):
         db.execute("ALTER TABLE candidate_sets ADD COLUMN supersedes_hash TEXT")
 
+    # Additive and outside every hash: registry columns reach no specification, so this
+    # moves no identity and invalidates no registered row. It exists because a NULL
+    # `direction_label` carried two opposite meanings - "no direction sibling is declared
+    # for this label", which `fwd_ret_24h` legitimately produces in every family, and "one
+    # is declared and scoring against it failed", which every `deep_learning` run in
+    # `crypto_perps_funding` produced for months while the only trace was a warning in a
+    # papermill log the harness deletes on success. Declared explicitly for the type: the
+    # auto-add in `_upsert_wide_metrics` would infer REAL from the None a healthy run
+    # writes first.
+    if "prediction_metrics" in tables and not _table_has_column(
+        db, "prediction_metrics", "direction_label_error"
+    ):
+        db.execute("ALTER TABLE prediction_metrics ADD COLUMN direction_label_error TEXT")
+
+    # The share of treatment rows the block permutation could not move. It is computed on
+    # every fit and warned about, and the warning only fires when the fit executes, so a
+    # cache-hit re-run reported the p-value with no way to see whether it was biased toward
+    # 1. Additive and outside the causal computation specification, so it moves no causal
+    # hash and invalidates no registered row.
+    if "causal_runs" in tables and not _table_has_column(
+        db, "causal_runs", "refutation_frozen_fraction"
+    ):
+        db.execute("ALTER TABLE causal_runs ADD COLUMN refutation_frozen_fraction REAL")
+
     # The placebo draws behind refutation_p. Only the scalars were stored, so the
     # permutation-distribution figure every causal notebook draws had no source in the
     # registry and rendered empty behind its guard while the prose described it.
@@ -751,6 +983,24 @@ def _migrate_registry(db: sqlite3.Connection) -> None:
         db, "causal_runs", "refutation_placebo_json"
     ):
         db.execute("ALTER TABLE causal_runs ADD COLUMN refutation_placebo_json TEXT")
+
+    # The placebo t-statistics, which are what refutation_p is computed on
+    # since the correction. Additive and outside the causal computation
+    # specification, so it moves no causal hash. A row written before this column existed
+    # carries NULL, which is the truthful answer: that run's p-value was computed on raw
+    # thetas and the draws behind it are not recoverable on the t scale.
+    if "causal_runs" in tables and not _table_has_column(
+        db, "causal_runs", "refutation_placebo_t_json"
+    ):
+        db.execute("ALTER TABLE causal_runs ADD COLUMN refutation_placebo_t_json TEXT")
+
+    # Which covariance estimator produced dml_se_hac. Additive and outside the causal
+    # computation specification, so it moves no causal hash and invalidates no registered
+    # row. A row written before this column carries NULL, which is the truthful answer:
+    # nothing recorded it at the time, and the number cannot be re-attributed after the
+    # fact because the fallback returned an HC0 value under the robust name.
+    if "causal_runs" in tables and not _table_has_column(db, "causal_runs", "covariance_type"):
+        db.execute("ALTER TABLE causal_runs ADD COLUMN covariance_type TEXT")
 
     # Migration 3: tall → wide metric tables
     if "prediction_metrics" in tables:
@@ -762,28 +1012,32 @@ def _migrate_registry(db: sqlite3.Connection) -> None:
     # ("classification" / "regression"). The schema is now TEXT but legacy
     # rows still carry the float encoding; consumers that filter
     # ``task_type = 'classification'`` would otherwise miss them.
-    if "prediction_metrics" in tables:
-        pm_cols = {row[1] for row in db.execute("PRAGMA table_info(prediction_metrics)").fetchall()}
-        if "task_type" in pm_cols:
-            db.execute(
-                "UPDATE prediction_metrics SET task_type = 'classification' "
-                "WHERE task_type IN (1, 1.0, '1', '1.0')"
-            )
-            db.execute(
-                "UPDATE prediction_metrics SET task_type = 'regression' "
-                "WHERE task_type IN (0, 0.0, '0', '0.0')"
-            )
-    if "fold_metrics" in tables:
-        fm_cols = {row[1] for row in db.execute("PRAGMA table_info(fold_metrics)").fetchall()}
-        if "task_type" in fm_cols:
-            db.execute(
-                "UPDATE fold_metrics SET task_type = 'classification' "
-                "WHERE task_type IN (1, 1.0, '1', '1.0')"
-            )
-            db.execute(
-                "UPDATE fold_metrics SET task_type = 'regression' "
-                "WHERE task_type IN (0, 0.0, '0', '0.0')"
-            )
+    #
+    # Asked before written, because `_open_registry` is on every path that touches a registry
+    # and an `UPDATE` takes the write lock whether or not a row matches. With `busy_timeout` at
+    # 60s that turns one contended open into a minute of waiting, for a rewrite that has had
+    # nothing to do since the last legacy row was converted. The probe is a read over the same
+    # predicate and answers from the table it is about to leave alone.
+    for table in ("prediction_metrics", "fold_metrics"):
+        if table not in tables:
+            continue
+        columns = {row[1] for row in db.execute(f"PRAGMA table_info({table})").fetchall()}  # noqa: S608
+        if "task_type" not in columns:
+            continue
+        legacy = db.execute(
+            f"SELECT EXISTS (SELECT 1 FROM {table} "  # noqa: S608
+            "WHERE task_type IN (1, 1.0, '1', '1.0', 0, 0.0, '0', '0.0'))"
+        ).fetchone()[0]
+        if not legacy:
+            continue
+        db.execute(
+            f"UPDATE {table} SET task_type = 'classification' "  # noqa: S608
+            "WHERE task_type IN (1, 1.0, '1', '1.0')"
+        )
+        db.execute(
+            f"UPDATE {table} SET task_type = 'regression' "  # noqa: S608
+            "WHERE task_type IN (0, 0.0, '0', '0.0')"
+        )
 
     db.commit()
 
@@ -1007,7 +1261,7 @@ def _save_json(path: Path, data: dict) -> None:
 _PREDICTION_TIME_COLUMNS = ("timestamp", "date", "datetime", "ts")
 
 
-def _timestamps_as_utc(predictions):
+def _timestamps_as_utc(predictions, *, widen_dates: bool = False):
     """Give a naive decision-time column an explicit UTC zone before it is written.
 
     `gbm`, `linear` and `tabular_dl` write `Datetime(_, 'UTC')`; `deep_learning` reaches
@@ -1025,6 +1279,19 @@ def _timestamps_as_utc(predictions):
     `value_digest` ignores the zone (it is time-unit sensitive and zone-insensitive), so
     an artifact rewritten through here keeps its digest and no immutable-artifact check
     moves. The time unit is deliberately left alone for the same reason.
+
+    `widen_dates` handles a third dtype the zone rule cannot see. A `pl.Date` column has
+    no zone at all, so the naive branch above skips it and a case study ends up holding
+    both dtypes: us_equities_panel has 688 prediction artifacts on `Date` (gbm, linear,
+    tabular_dl) and 42 on `Datetime(us, 'UTC')` (deep_learning, latent_factors), same
+    decision times, every aware value at midnight. `Date` never equals `Datetime`, so a
+    join on (timestamp, symbol) across those two families returns nothing.
+
+    Widening is read-only and the flag defaults off, because unlike the zone relabel it
+    is NOT digest-neutral: `value_digest` distinguishes `Date` from `Datetime` (measured
+    2026-09-14), so widening on the write path would re-key every artifact those three
+    families have already registered and every immutable-artifact check over them would
+    fail. Callers reading an artifact pass True; `register_prediction_set` must not.
     """
     if predictions is None:
         return predictions
@@ -1041,16 +1308,31 @@ def _timestamps_as_utc(predictions):
             and isinstance(predictions.schema[column], pl.Datetime)
             and predictions.schema[column].time_zone is None
         ]
-        if not naive:
+        dates = (
+            [
+                column
+                for column in _PREDICTION_TIME_COLUMNS
+                if column in predictions.columns and predictions.schema[column] == pl.Date
+            ]
+            if widen_dates
+            else []
+        )
+        if not naive and not dates:
             return predictions
         return predictions.with_columns(
-            pl.col(column).dt.replace_time_zone("UTC") for column in naive
+            *(pl.col(column).dt.replace_time_zone("UTC") for column in naive),
+            *(
+                pl.col(column).cast(pl.Datetime("us")).dt.replace_time_zone("UTC")
+                for column in dates
+            ),
         )
 
     # pandas is handled in place rather than converted. Both the legacy registration branch
     # and the pandas side of the versioned one hand the caller's own frame to the writer,
     # and `pl.from_pandas` on an arbitrary frame is a wider change than this needs. A naive
     # pandas column localizes to UTC the same way; an already-aware one is left alone.
+    # `widen_dates` has no pandas counterpart: there is no date dtype to widen, only
+    # datetime64 with or without a zone, which the naive branch below already covers.
     import pandas as pd
 
     if not isinstance(predictions, pd.DataFrame):
@@ -1103,6 +1385,68 @@ def _save_parquet(path: Path, frame) -> None:
 # ---------------------------------------------------------------------------
 
 
+_INCREMENTAL_SHARD = re.compile(r"^(?P<stem>.+)_ep(?P<epoch>\d+)\.parquet$")
+
+
+def incremental_shard_path(incr_dir: Path, config_name: str, fold: int, epoch: int) -> Path:
+    """The one file a (config, fold, checkpoint) triple ever writes."""
+    return incr_dir / f"{config_name}_fold{int(fold)}_ep{int(epoch)}.parquet"
+
+
+def clear_fold_predictions(incr_dir: Path, config_name: str, fold: int) -> None:
+    """Drop whatever an earlier attempt at this (config, fold) left behind.
+
+    A shard is written once and never rewritten, so a re-fit that produces fewer
+    checkpoints than the attempt before it would otherwise read the leftovers back as
+    its own. Rewriting one file per fold used to truncate them implicitly.
+    """
+    if not incr_dir.exists():
+        return
+    for path in incr_dir.glob(f"{config_name}_fold{int(fold)}_ep*.parquet"):
+        path.unlink()
+    legacy = incr_dir / f"{config_name}_fold{int(fold)}.parquet"
+    if legacy.exists():
+        legacy.unlink()
+
+
+def incremental_prediction_shards(
+    incr_dir: Path,
+    config_name: str | None = None,
+) -> list[tuple[str, int, Path]]:
+    """Return ``(stem, checkpoint, path)`` in the order their rows concatenate.
+
+    The order is the one a single file per fold produced: folds by the lexicographic
+    order of ``<config>_fold<fold>``, and inside a fold the checkpoints ascending, which
+    is the order they were fitted in. Registry identity does not depend on it -
+    ``published_prediction_digest`` sorts its row hashes - but every artifact these
+    runners write does, and holding the order is what let the change be compared against
+    the implementation it replaced.
+    """
+    pattern = "*.parquet" if config_name is None else f"{config_name}_fold*.parquet"
+    shards: list[tuple[str, int, Path]] = []
+    legacy: list[str] = []
+    for path in incr_dir.glob(pattern):
+        match = _INCREMENTAL_SHARD.match(path.name)
+        if match is None:
+            legacy.append(path.name)
+            continue
+        shards.append((match["stem"], int(match["epoch"]), path))
+    if legacy:
+        raise ValueError(
+            f"{incr_dir} holds {len(legacy)} prediction file(s) written one-per-fold by an "
+            f"earlier version ({', '.join(sorted(legacy)[:3])}). They carry every checkpoint "
+            f"the fold reached and would be counted a second time alongside the per-checkpoint "
+            f"shards beside them. Delete the directory and re-fit."
+        )
+    shards.sort(key=lambda item: (item[0], item[1]))
+    return shards
+
+
+def incremental_prediction_files(incr_dir: Path, config_name: str | None = None) -> list[Path]:
+    """The shard paths from :func:`incremental_prediction_shards`, in the same order."""
+    return [path for _stem, _epoch, path in incremental_prediction_shards(incr_dir, config_name)]
+
+
 def flush_fold_predictions(
     incr_dir: Path,
     config_name: str,
@@ -1117,10 +1461,19 @@ def flush_fold_predictions(
     eval_actual: np.ndarray | None = None,
     eval_col: str = "eval_actual",
 ) -> None:
-    """Write one fold's checkpoint predictions to parquet for crash safety.
+    """Write each checkpoint's fold predictions to its own parquet shard.
 
     Shared by deep_learning, tabular_dl, and darts_forecasting runners.
     Handles Object-typed date columns from pandas datetime arrays.
+
+    One shard per (config, fold, checkpoint), written once. The sequence runner calls
+    this at every checkpoint with every checkpoint fitted so far, and this used to
+    rewrite one file per fold from all of them, so both the frames it built and the bytes
+    it wrote grew with the square of the schedule. A nasdaq fold is 3,993,874 validation
+    rows, which is a measured 172 MB a checkpoint: at the twentieth checkpoint of twenty
+    the writer built 3.8 GB of frames to write a file it had already written nineteen
+    times, and wrote 210 checkpoints' worth of parquet over the fold where 20 were new. A
+    shard that already exists is left alone.
     """
     import numpy as np
     import polars as pl
@@ -1131,8 +1484,10 @@ def flush_fold_predictions(
             strict=False
         )
 
-    frames = []
     for ep, preds in checkpoint_preds.items():
+        shard = incremental_shard_path(incr_dir, config_name, fold, ep)
+        if shard.exists():
+            continue
         n = len(preds)
         entities = val_entities if val_entities is not None else np.array(["unknown"] * n)
         df = pl.DataFrame(
@@ -1148,10 +1503,8 @@ def flush_fold_predictions(
         )
         if eval_actual is not None:
             df = df.with_columns(pl.Series(eval_col, eval_actual.astype(np.float64)))
-        frames.append(df)
-
-    if frames:
-        _save_parquet(incr_dir / f"{config_name}_fold{fold}.parquet", pl.concat(frames))
+        _save_parquet(shard, df)
+        del df
 
 
 def flush_fold_training_log(

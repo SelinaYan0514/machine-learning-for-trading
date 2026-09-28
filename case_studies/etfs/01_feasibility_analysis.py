@@ -53,7 +53,6 @@
 """ETF Case Study - Feasibility Analysis."""
 
 import re
-import warnings
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -62,12 +61,13 @@ import yaml
 from IPython.display import display
 
 from case_studies.utils.feasibility import exceedance_curve, fold_timeline, panel_acf
+from case_studies.utils.warning_policy import apply_notebook_warning_policy
 from data import load_etfs, load_etfs_unadjusted
 from utils.cv_splits import generate_cv_splits
 from utils.paths import get_case_study_dir
 from utils.style import COLORS, FIGSIZE, add_message_title, show_with_alt
 
-warnings.filterwarnings("ignore")
+apply_notebook_warning_policy()
 
 # %% tags=["parameters"]
 CASE_STUDY_ID = "etfs"
@@ -667,10 +667,10 @@ print(
 # then draws the boundaries the splitter returned rather than recomputing them, so the picture and
 # the folds cannot disagree.
 #
-# `generate_cv_splits` numbers folds from zero backwards from the most recent, so fold 0 is the last
-# one before the holdout and the highest number is the earliest. The figure draws them earliest-first
-# and labels each with that number, which is why the labels count down; every later stage prints
-# the same ones.
+# `generate_cv_splits` numbers folds chronologically, so fold 0 is the earliest and the highest
+# number is the last one before the holdout. The figure draws them earliest-first and labels each
+# with that number, so the labels count up alongside the dates; every later stage prints the same
+# ones.
 #
 # The splitter is given the whole sample, holdout included, and applies the holdout boundary itself
 # from `evaluation.holdout_start`, which is what every later stage does too. Trimming the data first

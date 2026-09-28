@@ -4,7 +4,8 @@ import json
 import sqlite3
 from collections.abc import Iterable
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import polars as pl
@@ -12,20 +13,72 @@ import polars as pl
 from case_studies.utils.registry.specs import canonical_json, compute_hash
 from case_studies.utils.registry.store import _git_hash, _open_registry, _utc_now
 
+from .population import SUPERSEDES_LIVE, _refuse_preview_activation
 from .results import Result
 
 if TYPE_CHECKING:
     from .workspace import Study
 
 
+def binding_table(db: sqlite3.Connection) -> str:
+    """The table this registry records candidate-set name bindings in.
+
+    ``candidate_set_names`` where the registry has been opened for writing since bindings moved
+    off the identity row, and ``candidate_sets`` where it has not - which is every registry a
+    reader clones and every one an older version wrote. The fallback resolves one name per
+    identity, the only bindings such a registry ever held.
+    """
+    exists = db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'candidate_set_names'"
+    ).fetchone()
+    return "candidate_set_names" if exists is not None else "candidate_sets"
+
+
+def name_bindings(db: sqlite3.Connection, name: str) -> list[tuple[str, str | None]]:
+    """Every ``(set_hash, supersedes_hash)`` recorded under ``name``.
+
+    A name is a binding onto a candidate set, not part of its identity. ``candidate_set_names``
+    holds one row per ``(name, set_hash)``, so one set can carry several names - a union that
+    turns out to equal one of its inputs is the case that forces this - and a name can point at
+    a set first written under a different one.
+
+    Registries written before that table existed keep the binding in ``candidate_sets.name``,
+    one name per identity. Reading it here is what lets :meth:`CandidateSet.one` resolve against
+    a registry no writer has opened since, which is every registry a reader clones.
+    """
+    table = binding_table(db)
+    return db.execute(
+        f"SELECT set_hash, supersedes_hash FROM {table} WHERE name = ?",  # noqa: S608 - fixed set
+        (name,),
+    ).fetchall()
+
+
+def _live_heads(bindings: list[tuple[str, str | None]]) -> list[tuple[str, str | None]]:
+    """The generations of one name that no later generation replaces."""
+    replaced = {supersedes for _, supersedes in bindings if supersedes is not None}
+    return [binding for binding in bindings if binding[0] not in replaced]
+
+
 def _unsuperseded_hash(db: sqlite3.Connection, name: str) -> str | None:
     """The one generation of ``name`` that no later generation replaces, if it is unique."""
-    rows = db.execute(
-        "SELECT set_hash, supersedes_hash FROM candidate_sets WHERE name = ?", (name,)
-    ).fetchall()
-    replaced = {row[1] for row in rows if row[1] is not None}
-    heads = [row[0] for row in rows if row[0] not in replaced]
-    return heads[0] if len(heads) == 1 else None
+    heads = _live_heads(name_bindings(db, name))
+    return heads[0][0] if len(heads) == 1 else None
+
+
+def _comparable_protocol_value(field: str, value):
+    """One protocol field rendered so two producers' statements of it can be compared.
+
+    Only `feature_artifacts` needs it, and why is in
+    :func:`case_studies.research.results.normalized_feature_artifacts`: six producers write a
+    mapping and the latent adapter writes a list, so two members fitted on identical files
+    declared themselves incompatible. Every other field is compared
+    exactly, as before.
+    """
+    if field != "feature_artifacts":
+        return value
+    from .results import normalized_feature_artifacts
+
+    return normalized_feature_artifacts(value)
 
 
 def candidate_set_supersedes(study: Study, *, name: str, declared: str | None) -> str | None:
@@ -48,6 +101,13 @@ def candidate_set_supersedes(study: Study, *, name: str, declared: str | None) -
     - **The refit.** The declaration names the tip itself, and offering it publishes the next
       generation over that tip.
 
+    A declaration of :data:`case_studies.research.population.SUPERSEDES_LIVE` resolves to the tip
+    in all three and is the form that does not decay. It matters more here than on the population
+    path: a candidate set's hash is computed from its members and its contract, not from what it
+    supersedes, so an unchanged re-run is answered by the existing name binding and the
+    declaration is never read at all. The only run that reads it is the one whose membership
+    moved, and that run accepts the tip and nothing else.
+
     Anything else is withheld, and ``create`` then refuses and names the hash it requires, which
     is a better answer than this function guessing.
 
@@ -65,9 +125,38 @@ def candidate_set_supersedes(study: Study, *, name: str, declared: str | None) -
         # name resolves to other than exactly one head, `open` raises `KeyError` for a hash the
         # table does not hold, and a clean clone has no `candidate_sets` table for either to read.
         return None
+    if declared == SUPERSEDES_LIVE:
+        # Same branch as `population_supersedes`, for the same reason and with the same reading
+        # of the two cases above it: a clean clone and an unbound name have already returned
+        # None, so there is a generation here to extend. See `SUPERSEDES_LIVE`.
+        return current.hash
     if declared in (current.supersedes, current.hash):
         return declared
     return None
+
+
+def _candidate_set_root(study: Study) -> Path:
+    """The registry a candidate set is read from and written to, for the tier that is running.
+
+    A ``Study``'s ``root`` is the canonical case directory whatever tier is active, so every
+    read and every write here addressed the shared registry even under a preview. A preview
+    then resolved *canonical* members - so each one's ``execution_tier`` reads ``canonical``
+    and the member check in :meth:`CandidateSet.create` passes - and ``create`` opened the
+    canonical registry and wrote to it. Nothing downstream distinguishes that row from one a
+    canonical run wrote.
+
+    That is not hypothetical. A preview of ``crypto_perps_funding/19_strategy_analysis``
+    failed with ``a changed candidate set named 'crypto-final-selection' must explicitly
+    supersedes a840029e01ed``, and ``a840029e01ed`` is not in the preview workspace: it is in
+    the canonical crypto registry, written by that case study's canonical chain. It raised
+    only because the name was already bound. With the name unbound - a freshly reset registry,
+    which is the state five of six case studies were in on the morning of 2026-09-06 - the
+    same call reaches the write. The failure that exposed this is the case where it is safe.
+
+    :meth:`Study.storage_root` returns the canonical case directory for the canonical tier, so
+    a canonical run resolves to exactly the path it resolved before.
+    """
+    return study.storage_root(study.execution_tier)
 
 
 @dataclass(frozen=True)
@@ -91,6 +180,13 @@ class CandidateSet:
         supersedes: str | None = None,
     ) -> CandidateSet:
         study.require_writable()
+        # `OfficialPopulation.create` refuses a preview here and this did not, though both
+        # perform the same activation into the canonical registry. The tier check further
+        # down refuses preview MEMBERS, which is a different question and passes: under a
+        # preview the members resolved are the canonical ones, so every tier reads
+        # `canonical`. Activation is what `_refuse_preview_activation` is named for and it is
+        # what this does.
+        _refuse_preview_activation(study)
         study.activate()
         resolved = tuple(members)
         if not resolved:
@@ -125,12 +221,21 @@ class CandidateSet:
         comparable_fields = set(contract.get("comparable_fields") or [])
         base = protocols[0]
         for protocol in protocols[1:]:
-            differences = {key for key in base if base.get(key) != protocol.get(key)}
+            differences = {
+                key
+                for key in base
+                if _comparable_protocol_value(key, base.get(key))
+                != _comparable_protocol_value(key, protocol.get(key))
+            }
             undeclared = differences - comparable_fields
             if undeclared:
                 raise ValueError(
                     f"candidate set contains protocol-incompatible results: {sorted(undeclared)}"
                 )
+        # Compared normalized, stored raw. `common_protocol` enters `set_hash`, so rewriting
+        # the rendering here would re-key all 37 candidate sets across the five case studies
+        # that hold one, to change no answer. The comparison above is where the question is
+        # asked, and it is the question that was being answered wrongly.
         common_protocol = {
             key: value for key, value in base.items() if key not in comparable_fields
         }
@@ -151,7 +256,7 @@ class CandidateSet:
                 }
             )
         )
-        db = _open_registry(study.root)
+        db = _open_registry(_candidate_set_root(study))
         try:
             existing = db.execute(
                 "SELECT member_kind, comparison_contract_json FROM candidate_sets WHERE set_hash = ?",
@@ -160,7 +265,18 @@ class CandidateSet:
             expected = (member_kind, canonical_json(contract))
             if existing is not None and existing != expected:
                 raise ValueError(f"immutable candidate-set conflict for {set_hash}")
-            if existing is None:
+
+            # The identity and the name are written under different conditions, so they are
+            # decided apart. A set already stored is not written again; a name not yet bound to
+            # it still has to be. Deciding both on the identity alone is what let a set
+            # requested under a second name return the stored one and bind nothing, so the
+            # caller held an object whose name the registry did not have and the next
+            # `one(name=...)` raised with nothing pointing at the cause.
+            bound = db.execute(
+                "SELECT supersedes_hash FROM candidate_set_names WHERE name = ? AND set_hash = ?",
+                (name, set_hash),
+            ).fetchone()
+            if bound is None:
                 # A candidate set is derived, so re-running the stage that freezes it produces
                 # a second set under the same name whenever the registry or the admission rule
                 # moved. Two live generations make the name unresolvable and every reader of it
@@ -173,6 +289,13 @@ class CandidateSet:
                     )
                 if head is None and supersedes is not None:
                     raise ValueError("first candidate set version cannot supersede another set")
+            else:
+                supersedes = bound[0]
+
+            if existing is None:
+                # `candidate_sets.name` and `.supersedes_hash` record the binding this identity
+                # was first written under. `candidate_set_names` is what resolution reads; these
+                # two columns stay for registries and readers that predate it.
                 db.execute(
                     "INSERT INTO candidate_sets "
                     "(set_hash, name, member_kind, comparison_contract_json, created_at, "
@@ -192,12 +315,13 @@ class CandidateSet:
                     "VALUES (?,?,?)",
                     [(set_hash, value, ordinal) for ordinal, value in enumerate(member_hashes)],
                 )
-                db.commit()
-            else:
-                supersedes = db.execute(
-                    "SELECT supersedes_hash FROM candidate_sets WHERE set_hash = ?",
-                    (set_hash,),
-                ).fetchone()[0]
+            if bound is None:
+                db.execute(
+                    "INSERT INTO candidate_set_names "
+                    "(name, set_hash, supersedes_hash, created_at, git_commit) VALUES (?,?,?,?,?)",
+                    (name, set_hash, supersedes, _utc_now(), _git_hash()),
+                )
+            db.commit()
         except Exception:
             db.rollback()
             raise
@@ -212,21 +336,39 @@ class CandidateSet:
         Earlier generations stay readable by hash, which is what makes recording the lineage
         worth anything: a result registered against a superseded set can still be traced to
         the comparison it was made in.
+
+        One set can carry several names, so this resolves the name rather than the identity:
+        two names for the same members each resolve to it, and superseding one does not retire
+        the other.
         """
-        with closing(sqlite3.connect(study.root / "run_log" / "registry.db")) as db:
-            head = _unsuperseded_hash(db, name)
-            if head is None:
-                count = db.execute(
-                    "SELECT count(*) FROM candidate_sets WHERE name = ?", (name,)
-                ).fetchone()[0]
+        with closing(sqlite3.connect(_candidate_set_root(study) / "run_log" / "registry.db")) as db:
+            bindings = name_bindings(db, name)
+            heads = _live_heads(bindings)
+            if len(heads) != 1:
+                # Heads rather than rows. Every generation of a name is a binding, so counting
+                # them reports a retired one as a live identity and tells a reader the name is
+                # ambiguous when it resolves. Bindings rather than `candidate_sets` rows for
+                # the mirror reason: a name pointing at a set first written under another name
+                # has no identity row of its own and would count zero.
                 raise ValueError(
-                    f"candidate set name {name!r} resolved to {count} unsuperseded identities"
+                    f"candidate set name {name!r} resolved to {len(heads)} unsuperseded identities"
                 )
-        return cls.open(study, head)
+            head, supersedes = heads[0]
+        identity = cls.open(study, head)
+        # The binding the caller asked for, not the one the identity was first written under.
+        # `open` answers by hash and has no way to know which of a set's names was meant, so a
+        # union that shares its members with an input would come back named for the input.
+        return replace(identity, name=name, supersedes=supersedes)
 
     @classmethod
     def open(cls, study: Study, set_hash: str) -> CandidateSet:
-        db_path = study.root / "run_log" / "registry.db"
+        """Read one candidate set by identity.
+
+        ``name`` is the binding the identity was first written under. A set opened by hash has
+        no way to say which of its names the caller meant, and this is the one the registry
+        records on the identity row; :meth:`one` is the way in when the name is what matters.
+        """
+        db_path = _candidate_set_root(study) / "run_log" / "registry.db"
         with closing(sqlite3.connect(db_path)) as db:
             row = db.execute(
                 "SELECT name, member_kind, comparison_contract_json, supersedes_hash "
@@ -279,21 +421,64 @@ class CandidateSet:
         return tuple(Result.open(self.study, result_hash) for result_hash in selected)
 
     def _ranked_validation_hashes(self) -> tuple[str, ...]:
+        """Order this set's members by validation Sharpe, ties broken by identity.
+
+        A null Sharpe used to mean one thing - the run was not measured - and the
+        height check below refusing the whole set was the whole of the right answer.
+        The ruin stop gave it a second meaning: a path
+        whose equity reaches zero registers sharpe, sortino, calmar, omega, stability
+        and tail_ratio as null on purpose, because ranking a bankrupt path is what
+        that issue exists to prevent. So the refusal began firing on the case it was
+        built to protect.
+
+        The `ruin` column separates the two, and a ruined member has to survive the
+        filter rather than merely sort late: the check below counts rows against
+        members, so a member dropped by the filter rejects the set exactly as before.
+
+        * ``ruin = 1.0`` - bankrupt. Last, ahead of nothing, never selected by
+          `best_validation_sharpe`. It does not disqualify the set: a sweep with one
+          bankrupt member and eleven solvent ones has a good ranking of the eleven.
+        * null Sharpe, no ruin flag - not measured. Refused, as before.
+
+        A registry written before #920 has no `ruin` column at all, which is not the
+        same as having no bankrupt member; there the null test stands as the whole
+        rule, which is what it was when those rows were written.
+
+        `rank_by_validation_sharpe` in `cme_futures/research_workflow.py` applies this
+        same rule on the preview path, and the two have to keep agreeing.
+        """
         if self.member_kind != "backtest":
             raise ValueError("validation Sharpe ranking requires backtest members")
+        table = self.study.backtests.table()
+        ruined = (
+            (pl.col("ruin") == 1.0).fill_null(False) if "ruin" in table.columns else pl.lit(False)  # noqa: FBT003
+        )
         rows = (
-            self.study.backtests.table()
-            .filter(
+            table.filter(
                 pl.col("backtest_hash").is_in(self.members)
                 & (pl.col("split") == "validation")
                 & (pl.col("execution_tier") == "canonical")
                 & pl.col("stage").is_in(["signal", "allocation", "risk_overlay"])
-                & pl.col("sharpe").is_not_null()
+                & (pl.col("sharpe").is_not_null() | ruined)
             )
-            .sort("sharpe", "backtest_hash", descending=[True, False])
+            .with_columns(ruined.alias("_ruined"))
+            .sort(
+                "_ruined",
+                "sharpe",
+                "backtest_hash",
+                descending=[False, True, False],
+                nulls_last=True,
+            )
         )
         if rows.height != len(self.members):
             raise ValueError("candidate set contains an ineligible selection member")
+        if rows.height and bool(rows.get_column("_ruined").all()):
+            # Ordering a bankrupt member last protects the selection only while something
+            # solvent is ahead of it. `best_validation_sharpe` takes the head
+            # unconditionally, so a set whose members all went bankrupt would hand back a
+            # bankrupt selection - the outcome #920 exists to prevent, reached through the
+            # fix for it. There is nothing here to select.
+            raise ValueError("candidate set has no solvent member to select")
         if any(not Result.open(self.study, member_hash).complete for member_hash in self.members):
             raise ValueError("candidate set contains an incomplete selection member")
         return tuple(rows.get_column("backtest_hash"))

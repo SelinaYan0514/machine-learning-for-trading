@@ -22,8 +22,8 @@
 # pipeline from signal detection through holdout validation, and which
 # fail — and why?
 #
-# Every gate verdict and metric here is derived from the data produced by
-# NB00–NB05; the HTM cost-cascade figures (which reproduce
+# Every gate outcome and metric here is derived from the data produced by
+# NB01–NB05; the HTM cost-cascade figures (which reproduce
 # htm_cost_sensitivity.parquet) and the S&P 500 Options cost handling are the
 # only hardcoded elements.
 #
@@ -32,15 +32,15 @@
 # - Classify failures into signal, implementation, and evidence-quality buckets
 # - Identify structural features that predict pipeline survival
 #
-# **Book Reference**: Chapter 20, Sections 20.6–20.7
+# **Book Reference**: Chapter 20, Section 20.9 (Next steps after the first
+# research iteration), whose Figure 20.18 is this attrition funnel
 #
-# **Prerequisites**: Run [`00_holdout_predictions`](00_holdout_predictions.ipynb) and [`01_aggregate_synthesis`](01_aggregate_synthesis.ipynb).
+# **Prerequisites**: Run [`01_aggregate_synthesis`](01_aggregate_synthesis.ipynb). The holdout rows it reads come from each case study's own holdout notebooks, not from this chapter.
 
 # %%
 """Ch20 NB06 — Final recommendations derived from pipeline data."""
 
 import json
-import warnings
 from collections import defaultdict
 
 import matplotlib.pyplot as plt
@@ -48,9 +48,8 @@ import numpy as np
 import polars as pl
 from matplotlib.patches import FancyBboxPatch, Patch
 
-warnings.filterwarnings("ignore")
-
 from utils.paths import get_chapter_dir
+from utils.style import COLORS, add_message_title, show_with_alt
 
 # %%
 MAX_SYMBOLS = 0
@@ -74,7 +73,8 @@ NASDAQ_ID = "nasdaq100_microstructure"
 # %% [markdown]
 # ## 1. Load Pipeline Data
 #
-# All data comes from NB00 (holdout predictions) and NB01 (aggregate synthesis).
+# All data comes from NB01 (aggregate synthesis), which is also what writes
+# `holdout_results.parquet` read below.
 # We make no assumptions beyond what the data shows.
 
 # %%
@@ -109,7 +109,7 @@ if missing_holdout:
 # same gates with *independent* per-stage counts — useful for seeing
 # which gate is the largest filter, not which case studies survive end
 # to end. Per-stage independent counts in NB01 can therefore exceed the
-# cumulative count shown here, especially at the cost and risk stages.
+# cumulative count shown here.
 
 # %%
 # Build the attrition data from pipeline evidence
@@ -128,28 +128,33 @@ for cs, data in synthesis.items():
         positive_ic.add(cs)
 stages.append(("Positive IC", positive_ic))
 
-# Gate 2: Positive validation Sharpe (carrier signal-stage SR > 0).
-# Uses the carrier's validation ML Sharpe (`backtest.ml_sharpe`), not
-# `risk.baseline_sharpe` — the latter is null for case studies whose risk
-# stage is not applicable (sp500_options HTM, us_firm vectorized, nasdaq
-# before the ensemble cost/risk pass), which would drop them at the
-# validation gate even though their carrier validation Sharpe is positive.
+# %% [markdown]
+# **Gate 2 - positive validation Sharpe.** The gate reads the selected configuration's
+# validation ML Sharpe rather than the risk stage's baseline Sharpe. The latter is null for
+# case studies whose risk stage does not apply - sp500_options under hold-to-maturity, the
+# vectorized us_firm_characteristics path, and nasdaq before its ensemble cost and risk pass -
+# so reading it would drop them at the validation gate on a stage that does not apply to
+# them.
+
+# %%
 positive_val_sharpe = set()
 for cs in positive_ic:
     bt = synthesis[cs]["pipeline_summary"].get("backtest", {})
     val_sr = bt.get("ml_sharpe")
     # Validation applies to every case study; drop only on a genuine
-    # non-positive carrier Sharpe (FX Pairs, val −0.004).
+    # non-positive selection Sharpe (FX Pairs, val −0.004).
     if val_sr is None or val_sr > 0:
         positive_val_sharpe.add(cs)
 stages.append(("Val Sharpe > 0", positive_val_sharpe))
 
+# %% [markdown]
+# **Gate 3 - transaction costs.** Net Sharpe has to stay positive at the case study's
+# actual cost level. A case study whose cost stage does not apply passes through rather than
+# being eliminated: sp500_options uses the option-native bid-ask accounting of §18.8 rather than
+# a basis-point sweep. A gate drops a case study only on a genuine negative outcome at a stage
+# that applies to it.
+
 # %%
-# Gate 3: Survives transaction costs (net Sharpe > 0 at actual cost level).
-# A case study whose cost stage is not applicable (sp500_options uses §18.8
-# option-native bid-ask accounting, not a bps sweep) passes through rather
-# than being eliminated — a gate drops a case study only on a genuine
-# negative verdict at an applicable stage.
 cost_surviving = set()
 for cs in positive_val_sharpe:
     costs = synthesis[cs]["pipeline_summary"]["costs"]
@@ -170,15 +175,18 @@ for cs in cost_surviving:
         holdout_passing.add(cs)
 stages.append(("Holdout SR > 0", holdout_passing))
 
-# Gate 5: Risk overlay doesn't destroy the edge, and active uncertainty evidence
-# is sufficient for a deployment-facing classification. Case studies whose risk
-# stage is not applicable (sp500_options HTM expiration structure;
-# us_firm_characteristics vectorized path with portfolio overlays purged)
-# pass through rather than being eliminated.
+# %% [markdown]
+# **Gate 5 - the risk overlay leaves an edge, and the uncertainty evidence supports a
+# deployment-facing classification.** As with the cost gate, a case study whose risk stage does
+# not apply passes through rather than being eliminated: sp500_options because of its
+# hold-to-maturity expiration structure, and us_firm_characteristics because its vectorized path
+# has its portfolio overlays purged.
+
+# %%
 all_gates_pass = set()
 for cs in holdout_passing:
     if cs == NASDAQ_ID:
-        # The fixed carrier is positive on point estimate, but both corrected
+        # The fixed configuration is positive on point estimate, but both corrected
         # validation and holdout intervals cross zero. Broad cost and risk grids
         # are also deferred to v3.1, so it cannot clear the evidence gate.
         continue
@@ -241,7 +249,7 @@ for i, (bar, count) in enumerate(zip(bars, stage_counts, strict=False)):
                 f"−{delta}: {', '.join(dropped_names)}",
                 xy=(i - 0.5, (stage_counts[i - 1] + count) / 2),
                 fontsize=7.5,
-                color="#c0392b",
+                color=COLORS["negative"],
                 ha="center",
                 va="center",
                 style="italic",
@@ -251,18 +259,28 @@ ax.set_xticks(range(len(stage_names)))
 ax.set_xticklabels(stage_names, rotation=30, ha="right", fontsize=10)
 ax.set_ylabel("Case Studies Remaining")
 ax.set_ylim(0, 10.5)
-ax.set_title("Pipeline Attrition Across Five Gates")
-ax.axhline(y=0, color="black", linewidth=0.5)
-
-fig.tight_layout()
-fig.show()
+ax.axhline(y=0, color=COLORS["neutral"], linewidth=0.5)
+add_message_title(
+    ax,
+    "Case studies remaining after each of the five gates",
+    subtitle="Each bar is annotated with the count; the drop between bars names who left",
+)
+show_with_alt(
+    fig,
+    "A bar per pipeline gate, left to right in pipeline order, each labelled with the number "
+    "of case studies still passing at that point. The bars step down from left to right and "
+    "never recover, and the gap between consecutive bars carries an italic note naming the "
+    "case studies dropped there.",
+)
 
 # %% [markdown]
-# The funnel tells a clear story: most case studies produce positive IC
-# (the ML signal is real), but the pipeline progressively filters out
-# strategies that cannot translate signal into robust, cost-surviving,
-# out-of-sample economic performance. Each gate eliminates for a
-# different reason.
+# The waterfall counts how many of the nine case studies remain after each
+# cumulative gate and names the ones that drop at each. The five gates ask
+# different questions of the same strategy, in pipeline order: whether the
+# prediction has a positive information coefficient, whether the selected
+# configuration's validation Sharpe is positive, whether it survives its cost
+# regime, whether its holdout Sharpe is positive, and whether the evidence
+# behind that holdout is strong enough to act on.
 
 # %% [markdown]
 # ## 3. Exclusion Taxonomy
@@ -336,10 +354,9 @@ def classify_exclusions():
                 {"cs": display, "detail": f"Max DD = {worst_dd:.0f}%"}
             )
 
-        # A holdout interval that spans zero says the window cannot tell this strategy from one
-        # with no edge. That is a different finding from failing a gate, and it is read from the
-        # row rather than asserted, so it applies to whichever case studies it happens to be true
-        # of rather than to one named in advance.
+        # A holdout interval spanning zero says the window cannot tell this strategy from
+        # one with no edge, which is not the same as failing a gate. Read from the row, so it
+        # names whichever case studies it is true of rather than one fixed in advance.
         if not ho:
             exclusions["No holdout evidence"].append(
                 {"cs": display, "detail": "No holdout row in the registry"}
@@ -461,10 +478,9 @@ def build_evidence_profile():
         modest_decay = holdout_decay is not None and holdout_decay < 0.50
         evidence_resolved = cs != NASDAQ_ID
 
-        # Gate tally as passed/applicable. Not-applicable stages (cost or
-        # risk) are excluded from both numerator and denominator rather than
-        # counted as failures, so a case study is never penalized for a stage
-        # its canonical strategy does not run.
+        # Gate tally as passed/applicable. A stage that does not apply leaves both the
+        # numerator and the denominator rather than counting as a failure, so no case study
+        # is penalized for a stage its canonical strategy never runs.
         gate_flags = [
             (True, positive_ic),
             (not cost_na, survives_costs),
@@ -565,7 +581,7 @@ for cs, data in synthesis.items():
         and ho_sharpe > 0
         and costs.get("survives_costs", False)
         and cs != "sp500_options"  # Known evidence issue: spread overwhelms signal
-        and cs != NASDAQ_ID  # Fixed-carrier intervals cross zero; broad grids deferred
+        and cs != NASDAQ_ID  # Fixed-configuration intervals cross zero; broad grids deferred
     )
 
     structural_rows.append(
@@ -615,24 +631,20 @@ if full_pass.height > 0 and gate_miss.height > 0:
             print(f"  {fam:18s}: {n_pass}/{total} full-pass ({100 * n_pass / total:.0f}%)")
 
 # %% [markdown]
-# The structural comparison reveals patterns that go beyond individual
-# case study results:
+# The comparison splits the nine case studies into those that clear every gate
+# and those that miss at least one, and reports three readings of that split:
+# mean validation IC on each side, and the pass-against-miss counts broken out
+# by rebalancing frequency and by selected model family. The split is binary, so
+# a case study's position says that it missed somewhere and not how far it got;
+# the waterfall above is where the gate a case study left at is read. The
+# question the three readings ask is whether clearing every gate tracks the
+# strength of the signal, a structural property of the market, or the choice of
+# model.
 #
-# - **Daily frequency** case studies most often pass every gate — the
-#   cadence balances signal decay against cost pressure.
-# - **Higher-frequency** case studies split on outcome. One clears the cost gate on its gross
-#   signal and still turns in a negative holdout Sharpe. NASDAQ-100's holdout Sharpe is positive,
-#   and its confidence interval spans zero by a wide margin in both directions - the exclusion
-#   table above prints both. An interval that wide says the holdout window cannot distinguish this
-#   strategy from one with no edge, which is a different statement from having found it wanting.
-# - **Signal strength alone does not drive gate passage** — S&P 500 Options
-#   has positive IC and a positive holdout Sharpe under the bottom-quintile
-#   liquid-universe construction, but the cost cascade turns its highest Sharpe negative even at
-#   the most generous half-spread assumption tested, while CME futures passes the downstream gates
-#   on a moderate IC because its costs are small relative to its edge.
-# - The top-ranked model family is a weaker predictor than frequency and
-#   cost structure. Deep-learning and GBM rank-1 configurations both appear
-#   in the full-pass group.
+# Where a case study's holdout confidence interval spans zero, the exclusion
+# table above prints the interval beside the point estimate. An interval that
+# wide says the holdout window cannot distinguish the strategy from one with no
+# edge, which is a different statement from having found it wanting.
 
 # %% [markdown]
 # ## 6. Evidence Snapshot
@@ -665,20 +677,18 @@ for row in evidence_df.iter_rows(named=True):
 # stability at the cost of a small reduction in peak Sharpe. The
 # experiment was carried out outside this notebook (on the per-fold
 # return series, not on the per-fold Sharpe summaries that the registry
-# stores at the rank-1 level for most case studies in this iteration).
-# The finding documented in the chapter prose: a minority of case
-# studies see lower per-fold dispersion under the blend, the rest do
-# not, and the median peak Sharpe sacrificed is roughly 0.3.
+# stores for the selected configuration in most case studies this iteration).
+# The finding is documented in the chapter prose.
 #
 # The result is not registered, since this is not the iteration in
-# which we are scoring ensembles against single-model rank-1
-# configurations. It belongs in the "next iteration" list at the
-# end of this section.
+# which we are scoring ensembles against single-model selected
+# configurations. The "next iteration" list at the end of this section
+# carries it.
 #
 # NASDAQ-100 is the bounded exception in this release: its ensemble was fixed
 # before holdout scoring as diversification under overlapping validation
-# uncertainty. The corrected positive linear holdout is a comparator only and
-# cannot be used to reselect the carrier or describe the ensemble as an ex-post
+# uncertainty. The corrected linear holdout is a comparator only and
+# cannot be used to reselect the selected configuration or describe the ensemble as an ex-post
 # rescue.
 
 # %% [markdown]
@@ -688,60 +698,56 @@ for row in evidence_df.iter_rows(named=True):
 #    pipeline progressively narrows the set of case studies that pass
 #    each gate. Each gate drops cases for a different reason.
 #
-# 2. **Signal is necessary but not sufficient**: all 9 case studies
-#    show positive IC; 8 of 9 show positive signal-stage Sharpe; the
-#    pipeline gradually narrows the set further through costs, holdout
-#    validation, and evidence-quality checks.
+# 2. **Signal is necessary but not sufficient**: a positive information
+#    coefficient establishes that the prediction problem has structure.
+#    Whether that structure survives costs, the holdout window and the
+#    evidence checks is what the later gates ask, and each asks it
+#    independently.
 #
-# 3. **Costs are the great equalizer**: case studies with the strongest
-#    raw signals (options, high-frequency) face the tightest cost
-#    margins. The edge-to-cost ratio, not IC alone, determines
-#    economic viability.
+# 3. **Costs are the great equalizer**: the cost gate a strategy has to clear
+#    is set by the instrument it trades, not by the strength of its signal.
+#    The edge-to-cost ratio, not IC alone, is what that gate tests.
 #
 # 4. **Failure modes are distinct**: the exclusion taxonomy identifies
 #    three structural failure categories — signal invalidity,
 #    implementation infeasibility, and evidence-quality failure.
 #    Each points to a different second-iteration response.
 #
-# 5. **Evidence quality ≠ headline Sharpe**: a high managed Sharpe paired
-#    with a fatal cost environment (S&P 500 Options: best Sharpe −0.28 even
-#    at the lowest cost rung of the HTM cascade) or a holdout collapse
-#    (S&P 500 Eq+Opt: managed Sharpe 2.39 but holdout −0.73) is not evidence
-#    one would act on. The pipeline's downstream gates flag that gap.
+# 5. **Evidence quality is not the headline Sharpe**: a managed Sharpe is read
+#    alongside the cost environment it was earned in and the holdout that
+#    followed it. The evidence snapshot above prints all three for every case
+#    study, so a Sharpe paired with a fatal cost cascade or with a reversing
+#    holdout is visible as a pair rather than as a single number.
 #
 # 6. **The pipeline matters more than any single model**: the full
 #    journey from data to holdout determines the evidence a case study
-#    produces. The strongest models in prediction (Ch11-15) are not
-#    always the ones whose pipeline outputs most gates (Ch16-20).
+#    produces. Rank in prediction (Ch11-15) and gates passed (Ch16-20)
+#    are reported separately above for that reason.
 #
 # ## What Comes Next
 #
 # These nine case studies used publicly available, low-frequency market
-# data with starter model configurations. The pipeline produced positive
-# IC on all 9 case studies, a cost-surviving managed Sharpe on a subset,
-# and a positive holdout Sharpe on a smaller subset (see the funnel above
-# for exact counts). The chapter's claim is methodological: this is the
+# data with starter model configurations. The funnel above reports what the
+# pipeline produced at each gate. The chapter's claim is methodological: this is the
 # pipeline a practitioner should run to find out whether a candidate
 # strategy works, not a set of deployable strategies.
 #
 # The next-iteration handles inside the same workflow:
 #
-# - **Label refinement**: several case studies showed that horizon
-#   choice changes IC by an order of magnitude (FX: 9x IC from 1d→21d,
-#   US Firms: 9x IC from winsorization, NQ100: classification has higher
-#   IC than regression). Systematic label search is high-leverage.
+# - **Label refinement**: horizon choice, winsorization and the
+#   classification-against-regression framing are the label axes the
+#   `model_analysis` notebooks compare per case study. Systematic label
+#   search across them is the natural next sweep.
 # - **Feature engineering**: the case studies share generic financial
 #   features. Domain-specific features (order flow for NQ100, carry
 #   dynamics for CME, funding structure for crypto) are the natural next
 #   addition to test against the same triage and holdout protocol.
 # - **Model tuning**: hyperparameter grids are deliberately modest in
-#   this iteration. Focused tuning on the families that survive the
-#   holdout gate (primarily GBM and selected DL architectures) with
-#   larger search budgets is the next sweep.
-# - **Ensemble construction**: the prediction correlation analysis
-#   (model_analysis notebooks) shows low inter-family correlation
-#   in several case studies; a simple average ensemble is a candidate
-#   for variance reduction at constant mean IC.
+#   this iteration. Focused tuning with larger search budgets, on whichever
+#   families survive the holdout gate, is the next sweep.
+# - **Ensemble construction**: the `model_analysis` notebooks report
+#   inter-family prediction correlation per case study; a simple average
+#   ensemble is a candidate for variance reduction at constant mean IC.
 # - **Strategy design**: this iteration tests basic long-short with a
 #   few allocation methods. Sector constraints, regime conditioning,
 #   dynamic position sizing, and multi-horizon blending are additional
@@ -749,4 +755,4 @@ for row in evidence_df.iter_rows(named=True):
 #
 # The value of the workflow is the reproducible, auditable process that
 # can be applied to new data, new markets, and new hypotheses, not the
-# specific numbers in any single rank-1 row.
+# specific numbers in any single selected-configuration row.

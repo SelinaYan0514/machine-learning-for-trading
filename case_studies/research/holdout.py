@@ -140,11 +140,11 @@ def build_holdout_cv(
     :func:`case_studies.research.models.locked_holdout_split` checks it again at execution.
 
     The training interval is the whole history available before that window, which is
-    ``min(train_start)`` across the validation folds and never one fold's own start: the fold
-    list runs newest first, so ``folds[0]["train_start"]`` is the *latest* start in the set and
-    would hand the retrain the shortest window it could have had rather than the longest.
-    :func:`utils.cv_splits.earliest_train_start` is that read, and this calls it rather than
-    repeating it.
+    ``min(train_start)`` across the validation folds and never one fold's own start.
+    :func:`utils.cv_splits.earliest_train_start` reads it from the windows, and this calls
+    it rather than repeating it - a read that stays correct across the fold-order change in
+    ml4t-diagnostic 0.1.4, where indexing the list would have silently changed which fold it
+    landed on.
 
     ``train_start_floor`` bounds that below, and exists because "the whole history available"
     is a claim about the FEATURES, not about the calendar. A configuration fitted on fold-scoped
@@ -156,7 +156,7 @@ def build_holdout_cv(
     would evaluate an estimator nobody selected. Clamping to the producer's geometry applies the
     same rule correctly rather than contradicting it: take everything available, where available
     is what the features actually span. Families with no fold-scoped features supply no floor and
-    are unaffected. ml4t/agent-workspace#977 has the measurement and the rejected alternative.
+    are unaffected.
 
     Training ends one label buffer before the holdout opens, using the same buffer the
     validation folds were built with. That gap is what stops the last training label's outcome
@@ -170,7 +170,6 @@ def build_holdout_cv(
     from case_studies.utils.cv_window import canonical_window
     from utils.artifact_specs import (
         load_setup_config,
-        resolve_label_buffer,
         resolve_label_horizon,
     )
     from utils.cv_splits import earliest_train_start, normalize_label_buffer
@@ -231,7 +230,7 @@ def build_holdout_cv(
     # A daily panel is untouched by construction: its last observation of that date IS midnight,
     # so the widening condition is false and the rendering does not move. That matters because
     # this value is inside the hashed fold, so moving it changes the training identity every
-    # holdout refit registers under. ml4t/agent-workspace#986.
+    # holdout refit registers under.
     within_close = [value for value in observations if value.date() <= holdout_close.date()]
     if within_close and within_close[-1] > holdout_close:
         holdout_close = within_close[-1]
@@ -369,7 +368,19 @@ def build_holdout_training_spec(
 # `holdout_start`/`holdout_end`, but `resolve()` passes them to `generate_cv_splits` as boundaries
 # to seal VALIDATION against, so it selects validation folds and cannot emit a holdout fold. That
 # is why the fold is derived here.
-_FOLD_DERIVED_FIELDS = (
+#
+# Public because `utils/strategy_analysis._refit_comparable` reads it. That function decides
+# whether a holdout run is a refit of the validation run, so it must skip exactly the fields
+# named here and no others. Kept as one declaration because it was two: the exemption list was
+# written out by hand and matched two of these three, so `macro_context.resolved_fold_digest`
+# was required to change here and required not to have changed there. cme_futures' holdout
+# `723a305604bb` was rejected by its own lineage check for that reason and no other, with its
+# feature artifacts, feature names and label artifact all identical to the validation run's
+# .
+#
+# Each entry is (container, field). "computation" means the computation mapping itself; any
+# other value names a mapping inside it.
+FOLD_DERIVED_FIELDS = (
     ("computation", "expected_prediction_keys"),
     ("model", "effective_params_by_fold"),
     ("macro_context", "resolved_fold_digest"),

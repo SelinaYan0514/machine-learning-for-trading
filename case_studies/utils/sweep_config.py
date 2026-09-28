@@ -25,6 +25,8 @@ from __future__ import annotations
 import polars as pl
 import yaml
 
+from case_studies.utils.warning_policy import warn_the_reader
+
 # ---------------------------------------------------------------------------
 # MAE/MFE-calibrated risk controls (Ch19)
 # ---------------------------------------------------------------------------
@@ -250,6 +252,26 @@ def get_top_n_predictions(case_study: str, stage: str) -> int:
     return int(block.get(stage, _STAGE_DEFAULTS[stage]))
 
 
+def top_n_cap(top_n: int) -> int | None:
+    """Return the cap ``top_n`` asks for, or ``None`` when it asks for every candidate.
+
+    ``0`` is how ``top_n_predictions`` spells "all of them". ``_STAGE_DEFAULTS["signal"]``
+    is 0, every shipped ``setup.yaml`` declares ``signal: 0`` under the comment "all signal
+    predictions", and the four signal-stage notebooks read it that way, each guarding its
+    truncation with ``if TOP_N_PREDICTIONS > 0``.
+
+    The allocation stage had no such reading, so the same number meant the opposite one stage
+    later: ``0`` reached a SQL ``LIMIT 0`` and a ``.head(0)`` and selected nothing. Taking the
+    cap from here keeps one number meaning one thing at every stage. A negative width is a
+    caller error rather than a second spelling of "all", because SQLite's ``LIMIT -1`` means
+    no limit and a width arithmetic produced would otherwise pass through as one.
+    """
+    width = int(top_n)
+    if width < 0:
+        raise ValueError(f"top_n must be 0 (every candidate) or positive, got {top_n!r}")
+    return width or None
+
+
 def get_checkpoints_per_config(case_study: str) -> int:
     """Return how many checkpoints each advancing model config contributes.
 
@@ -381,30 +403,137 @@ def _periods_per_year_for(case_study: str) -> float:
     return float(ppy)
 
 
+# How many registered prediction sets the width resolver reads before it decides.
+# One is enough where they agree and cannot detect it where they do not.
+_RANKED_WIDTH_SAMPLE = 8
+
+
+def ranked_cross_section_width(
+    case_study: str, label: str, *, split: str = "validation"
+) -> int | None:
+    """Distinct symbols in the predictions an entry-scheme sweep will rank.
+
+    ``None`` when nothing is registered yet for ``(label, split)``, when the
+    artifacts behind the registered sets are missing, or when the sampled sets do
+    not agree on a width. A case study whose model stages have not run has no
+    ranked cross-section, and inventing one would refuse a sweep that has not
+    been set up wrong.
+
+    The registry is sampled rather than asked about the population a particular
+    caller is sweeping, and those are different questions: `cme_futures/13_backtest`
+    selects official or preview candidates, and a width taken from an unrelated
+    set could remove a concentration that is feasible for the ones actually being
+    swept. So the resolver only speaks when the sample is unanimous - up to eight
+    registered sets, all reporting the same width - and otherwise returns ``None``
+    and leaves the caller's own number standing. A caller that knows its
+    population passes ``ranked_width`` and skips this entirely.
+
+    Unanimity is the common case, not a hope: measured 2026-09-07 over six
+    registered sets per label in etfs, us_firm_characteristics,
+    sp500_equity_option_analytics and us_equities_panel, every label had exactly
+    one width - 99, 3,708, 549 and 3,147 respectively.
+
+    Distinct symbols over the window, which is the same count the callers take
+    off the price panel, so the comparison in ``get_entry_schemes_for`` is between
+    two measurements of the same kind. The number that literally bounds a ranking
+    is the per-date cross-section, which is smaller - 88 against 99 for etfs,
+    2,032 against 3,708 for us_firm_characteristics - and moving the rule onto it
+    would change which concentrations are feasible today. That is a separate
+    decision about the rule; this function is about which set the rule reads.
+    """
+    import sqlite3
+
+    from case_studies.utils.registry.store import _case_dir, _registry_db_path, _run_log_dir
+
+    case_dir = _case_dir(case_study)
+    db_path = _registry_db_path(case_dir)
+    if not db_path.is_file():
+        return None
+    try:
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as db:
+            rows = db.execute(
+                """
+                SELECT p.prediction_hash
+                FROM prediction_sets p
+                JOIN training_runs t ON t.training_hash = p.training_hash
+                WHERE t.label = ? AND p.split = ?
+                LIMIT ?
+                """,
+                (label, split, _RANKED_WIDTH_SAMPLE),
+            ).fetchall()
+    except sqlite3.Error:
+        return None
+
+    widths: set[int] = set()
+    for (prediction_hash,) in rows:
+        artifact = _run_log_dir(case_dir) / "predictions" / prediction_hash / "predictions.parquet"
+        if not artifact.is_file():
+            continue
+        try:
+            widths.add(
+                int(pl.scan_parquet(artifact).select(pl.col("symbol").n_unique()).collect().item())
+            )
+        except (pl.exceptions.PolarsError, OSError, ValueError):
+            return None
+    if not widths:
+        return None
+    if len(widths) > 1:
+        warn_the_reader(
+            f"{case_study}/{label}: registered prediction sets disagree on the ranked "
+            f"cross-section ({sorted(widths)}), so the entry-scheme feasibility rule falls "
+            "back to the caller's price-panel width. Pass ranked_width= with the width of "
+            "the population actually being swept.",
+            source="ranked_width_from_registry",
+            key=(case_study, label, tuple(sorted(widths))),
+        )
+        return None
+    return widths.pop()
+
+
 def get_entry_schemes_for(
     case_study: str,
     label: str,
     n_assets: int,
     long_short: bool,
+    *,
+    ranked_width: int | None = None,
 ) -> list[dict]:
     """Synthesize Ch16 entry schemes for ``(case_study, label)`` from setup.yaml.
 
-    Reads ``backtest.sweep.{top_k_grid, percentile_grid, quantile_grid}``
-    keyed by label, produces one scheme dict per (axis × value), filtered for
-    feasibility against ``n_assets``. Output dicts match the shape consumed
-    by ``Ch16 backtest notebooks`` (one scheme per (axis, value)).
+     Reads ``backtest.sweep.{top_k_grid, percentile_grid, quantile_grid}``
+     keyed by label, produces one scheme dict per (axis × value), filtered for
+     feasibility against ``n_assets``. Output dicts match the shape consumed
+     by ``Ch16 backtest notebooks`` (one scheme per (axis, value)).
 
-    Quantile schemes (``quintile_long_short`` / ``decile_long_short``) carry
-    ``long_short=True`` regardless of the ``long_short`` argument — they are
-    inherently long-short by construction. ``long_short`` controls only the
-    sign of top-k / percentile schemes.
+     Quantile schemes (``quintile_long_short`` / ``decile_long_short``) carry
+     ``long_short=True`` regardless of the ``long_short`` argument — they are
+     inherently long-short by construction. ``long_short`` controls only the
+     sign of top-k / percentile schemes.
 
-    When the case study declares a ``backtest.sweep.signal_nasdaq100`` block
-    (the nasdaq100 v4 slot-mechanism sweep), schemes from that block are
-    appended — see ``get_signal_nasdaq100_schemes_for`` for the cross-product.
+     When the case study declares a ``backtest.sweep.signal_nasdaq100`` block
+     (the nasdaq100 v4 slot-mechanism sweep), schemes from that block are
+     appended — see ``get_signal_nasdaq100_schemes_for`` for the cross-product.
+
+     ``n_assets`` is the width of the price panel. What bounds a ranked selection
+     is the prediction cross-section, and the two are not the same number: every
+     caller measures ``n_assets`` off the panel it loaded, while the ranking runs
+     over whatever the fitting stages scored. ``ranked_width`` is that second
+     number, resolved from the registry when the caller does not supply it, and
+     the feasibility rule below applies to the narrower of the two.
+
+     They agree on `main` today, which is why nothing is currently wrong and why
+     the check could not fire on the condition it exists to catch
+    . Any change that narrows the fitting stages
+     without narrowing the panel - a new preview tier, a per-notebook
+     ``max_symbols``, a family that scores a subset - reproduces the same
+     failure: twelve backtests with a Sharpe, zero trades, and
+     four notebooks failing several stages downstream of the cause.
     """
     sweep = load_sweep(case_study)
     schemes: list[dict] = []
+    if ranked_width is None:
+        ranked_width = ranked_cross_section_width(case_study, label)
+    tradeable = n_assets if ranked_width is None else min(n_assets, ranked_width)
 
     top_k_by_label = sweep.get("top_k_grid") or {}
     pct_by_label = sweep.get("percentile_grid") or {}
@@ -430,17 +559,18 @@ def get_entry_schemes_for(
             f"pct={sorted(pct_by_label)}, qnt={sorted(qnt_by_label)}"
         )
 
-    for k in top_k_by_label.get(label, []):
-        k = int(k)
-        # k == n_assets holds the whole universe = equal-weight benchmark, not a
-        # prediction-based portfolio; exclude it to match get_top_k_values_for.
-        if k >= n_assets:
+    declared_top_k = [int(k) for k in top_k_by_label.get(label, [])]
+    top_k_schemes: list[dict] = []
+    for k in declared_top_k:
+        # k == tradeable holds the whole cross-section = equal-weight benchmark, not
+        # a prediction-based portfolio; exclude it to match get_top_k_values_for.
+        if k >= tradeable:
             continue
         # Long and short selections must be disjoint. Keep the declared grid and
         # exclude only members that the available cross-section cannot realize.
-        if long_short and 2 * k > n_assets:
+        if long_short and 2 * k > tradeable:
             continue
-        schemes.append(
+        top_k_schemes.append(
             {
                 "name": f"ew_top{k}",
                 "method": "equal_weight_top_k",
@@ -448,6 +578,23 @@ def get_entry_schemes_for(
                 "long_short": long_short,
             }
         )
+    # Raised here rather than left to the caller's empty-list guard, because only
+    # this scope holds both numbers. A caller that reports `n_assets` back is
+    # reporting the number the check did not use, which is how the original
+    # failure presented. The panel-too-narrow case (`tradeable == n_assets`) is
+    # left to that guard, which names the right number for it.
+    if declared_top_k and not top_k_schemes and tradeable < n_assets:
+        raise ValueError(
+            f"no concentration declared for {case_study}/{label} can be realized: "
+            f"backtest.sweep.top_k_grid declares {sorted(declared_top_k)}, and the "
+            f"predictions this sweep ranks carry {tradeable} symbols against a price "
+            f"panel of {n_assets}. Every k is at or above the ranked cross-section, so "
+            "each would hold all of it rather than select from it, and every backtest "
+            "in the sweep would record num_trades = 0 while still reporting a Sharpe. "
+            "Narrow the price panel and the fitting stages together, or declare a "
+            "smaller concentration."
+        )
+    schemes.extend(top_k_schemes)
 
     for p in pct_by_label.get(label, []):
         p = float(p)
@@ -674,37 +821,45 @@ def get_top_k_values_for(
     n_assets: int,
     *,
     long_short: bool | None = None,
+    ranked_width: int | None = None,
 ) -> list[int]:
     """Return the top-K grid for ``(case_study, label)`` used by Ch17.
 
-    Filters out k >= n_assets (holding everything is the equal-weight
-    benchmark, not a prediction-based portfolio). Raises ``KeyError`` if
-    ``backtest.sweep.top_k_grid[label]`` is not declared, and ``ValueError``
-    when the filter empties the grid.
+     Filters out k >= n_assets (holding everything is the equal-weight
+     benchmark, not a prediction-based portfolio). Raises ``KeyError`` if
+     ``backtest.sweep.top_k_grid[label]`` is not declared, and ``ValueError``
+     when the filter empties the grid.
 
-    A long-short strategy takes ``k`` names on each side, so its ceiling is half
-    the universe, not all of it. ``signals.py`` clamps ``eff_k`` to
-    ``n_assets // 2`` when ``long_short`` is set, and ``top_k`` is identity-bearing
-    through ``plan_backtests(signal=...)`` - so a ``k`` in the half-open interval
-    ``(n_assets // 2, n_assets)`` passes this filter, registers under the declared
-    ``k``, and runs at the clamped one. Two such values register distinct identities
-    over a byte-identical weight series. ``get_entry_schemes_for`` has excluded that
-    interval since it took a ``long_short`` argument; this function is the other half
-    of the same grid and has to agree with it.
+     A long-short strategy takes ``k`` names on each side, so its ceiling is half
+     the universe, not all of it. ``signals.py`` clamps ``eff_k`` to
+     ``n_assets // 2`` when ``long_short`` is set, and ``top_k`` is identity-bearing
+     through ``plan_backtests(signal=...)`` - so a ``k`` in the half-open interval
+     ``(n_assets // 2, n_assets)`` passes this filter, registers under the declared
+     ``k``, and runs at the clamped one. Two such values register distinct identities
+     over a byte-identical weight series. ``get_entry_schemes_for`` has excluded that
+     interval since it took a ``long_short`` argument; this function is the other half
+     of the same grid and has to agree with it.
 
-    ``long_short`` defaults to the case study's declared selection mode - the same
-    ``mapping.position_state_space`` that ``get_backtest_config`` reads, which is what
-    every caller already passes to ``get_entry_schemes_for`` as ``bt_config.long_short``.
-    Not ``account.allow_short_selling``: that is an execution permission, and
-    ``sp500_options`` holds it while selecting long-only. Pass it explicitly to override.
+     ``long_short`` defaults to the case study's declared selection mode - the same
+     ``mapping.position_state_space`` that ``get_backtest_config`` reads, which is what
+     every caller already passes to ``get_entry_schemes_for`` as ``bt_config.long_short``.
+     Not ``account.allow_short_selling``: that is an execution permission, and
+     ``sp500_options`` holds it while selecting long-only. Pass it explicitly to override.
 
-    An empty grid is never a legitimate result: the caller multiplies it into
-    a sweep size, so zero concentrations means zero backtests, and the sweep
-    loop then completes without registering anything while still reporting
-    itself done. The downstream risk-overlay notebook is the only thing that
-    notices, and it blames the operator for not having run this stage. Raise
-    here instead, where the cause - a universe cap smaller than the smallest
-    declared k - is still visible.
+     An empty grid is never a legitimate result: the caller multiplies it into
+     a sweep size, so zero concentrations means zero backtests, and the sweep
+     loop then completes without registering anything while still reporting
+     itself done. The downstream risk-overlay notebook is the only thing that
+     notices, and it blames the operator for not having run this stage. Raise
+     here instead, where the cause - a universe cap smaller than the smallest
+     declared k - is still visible.
+
+     ``ranked_width`` is the prediction cross-section, resolved from the registry
+     when not supplied, and the filter runs against the narrower of it and
+     ``n_assets`` for the reason given under ``get_entry_schemes_for``
+    . The two functions are halves of one grid and
+     have to filter it the same way or a sweep and its plumbing test disagree
+     about which concentrations exist.
     """
     sweep = load_sweep(case_study)
     grid = (sweep.get("top_k_grid") or {}).get(label)
@@ -715,9 +870,12 @@ def get_top_k_values_for(
         )
     if long_short is None:
         long_short = get_declared_long_short(case_study)
-    ceiling = n_assets // 2 if long_short else n_assets
+    if ranked_width is None:
+        ranked_width = ranked_cross_section_width(case_study, label)
+    tradeable = n_assets if ranked_width is None else min(n_assets, ranked_width)
+    ceiling = tradeable // 2 if long_short else tradeable
     values = [
-        int(k) for k in grid if int(k) < n_assets and not (long_short and 2 * int(k) > n_assets)
+        int(k) for k in grid if int(k) < tradeable and not (long_short and 2 * int(k) > tradeable)
     ]
     if not values:
         smallest = min(int(k) for k in grid)
@@ -734,7 +892,8 @@ def get_top_k_values_for(
         side = f"long-short ceiling ({ceiling})" if long_short else "universe"
         raise ValueError(
             f"top_k_grid[{label!r}] = {list(grid)} is empty after filtering against "
-            f"n_assets={n_assets} for case_studies/{case_study}: every declared k holds "
+            f"{tradeable} tradeable names for case_studies/{case_study} (price panel "
+            f"{n_assets}, ranked cross-section {ranked_width}): every declared k holds "
             f"the whole {side}. A cross-sectional sweep here needs {needed}. Raise the "
             f"universe cap (MAX_SYMBOLS) if the panel has them, widen the panel if it "
             f"does not, or declare a smaller k."
@@ -830,8 +989,10 @@ def get_universe_filters_for(case_study: str) -> list[str | None]:
     ``apply_universe_filter`` returning predictions unchanged). Other values
     are passed through to ``apply_universe_filter`` in ``backtest_runner.py``
     where they drive a spec-declared universe restriction at the
-    rebalance-date grain (currently only ``"liquid"`` is supported, for the
-    sp500_options bottom-quantile half-spread subset).
+    rebalance-date grain. Two names are supported there: ``"liquid"`` (the
+    sp500_options bottom-quantile half-spread subset) and ``"cost_feasible"``
+    (the nasdaq100_microstructure frozen per-split symbol list under
+    ``setup.yaml::universe.cost_feasible``); anything else raises.
 
     Sourced from ``backtest.sweep.universe_filter`` in ``setup.yaml``: a
     single scalar value pinning the canonical sweep to one universe. For
@@ -863,3 +1024,65 @@ def get_portfolio_risk_controls(case_study: str) -> list[dict]:
     """Return the Ch19 portfolio-level risk controls (all case studies)."""
     risk = load_sweep(case_study).get("risk_controls") or {}
     return list(risk.get("portfolio") or [])
+
+
+def get_signal_passes_for(case_study: str) -> dict | None:
+    """Return the declared two-pass plan for the signal stage, or ``None``.
+
+    Shape, from ``backtest.sweep.signal_passes`` in ``setup.yaml``::
+
+        signal_passes:
+          baseline_schemes: [ew_top5, ew_top10, ew_top20]
+          baseline_universe: cost_feasible
+          mechanism_top_n: 8
+          reference_schemes: [ew_top5, ew_top10, ew_top20]
+          reference_universe: full
+
+    Pass 1 runs ``baseline_schemes`` on ``baseline_universe`` over every
+    admissible prediction. Pass 2 runs every remaining entry scheme on
+    ``baseline_universe``, plus ``reference_schemes`` on ``reference_universe``,
+    over the ``mechanism_top_n`` predictions with the highest pass-1 Sharpe.
+
+    A case study that declares no block gets ``None`` and its sweep is the
+    single pass over the full cross-product, which is what every case study
+    other than ``nasdaq100_microstructure`` runs.
+
+    Universe names are normalized the way ``get_universe_filters_for``
+    normalizes them: ``full`` and ``none`` become ``None``, because a ``None``
+    written into a spec is not the same thing as an absent key and every row
+    registered before the universe axis existed carries the absent one.
+
+    Raises on a block that is present but unusable, rather than returning a
+    plan that quietly sweeps nothing: an empty ``baseline_schemes`` would run
+    pass 1 over zero arms, rank nothing, and hand pass 2 an empty selection,
+    which reports a completed sweep and registers no rows.
+    """
+    sweep = load_sweep(case_study)
+    block = sweep.get("signal_passes")
+    if block is None:
+        return None
+
+    def _universe(key: str) -> str | None:
+        raw = block.get(key)
+        if raw is None:
+            return None
+        return None if str(raw).lower() in ("full", "none") else str(raw)
+
+    baseline = [str(x) for x in (block.get("baseline_schemes") or [])]
+    reference = [str(x) for x in (block.get("reference_schemes") or [])]
+    top_n = int(block.get("mechanism_top_n") or 0)
+    if not baseline or top_n <= 0:
+        msg = (
+            f"backtest.sweep.signal_passes for {case_study} declares "
+            f"baseline_schemes={baseline} and mechanism_top_n={top_n}; both must be "
+            "non-empty or the sweep ranks nothing and pass 2 selects nothing. Remove "
+            "the block to sweep the full cross-product instead."
+        )
+        raise ValueError(msg)
+    return {
+        "baseline_schemes": baseline,
+        "baseline_universe": _universe("baseline_universe"),
+        "mechanism_top_n": top_n,
+        "reference_schemes": reference,
+        "reference_universe": _universe("reference_universe"),
+    }

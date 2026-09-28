@@ -170,7 +170,12 @@ if catalog.is_empty():
 # on the catalog alone, the second refuses once the family has registered rows.
 declared, population_notes = declared_population_members(
     study,
-    study.root,
+    # The registry this study reads, not the case directory it was opened from. Under a preview
+    # those differ: `study.root` stays the canonical directory, which does publish populations,
+    # so asking it took the broken-lineage branch - the resolver then found none of the declared
+    # names in the preview registry and refused, on the state the comment below says is the
+    # tolerated one. Measured 2026-09-06, smoke job 59.
+    study.storage_root(EXECUTION_TIER),
     {model: f"{CASE_STUDY_ID}-{model}-validation-v1" for model in sorted(declared_models)},
     produced={model: catalog.height for model in declared_models},
 )
@@ -230,9 +235,9 @@ coverage
 # looking; neither is answered by ranking.
 #
 # **`peak_ic` here is the maximum of `ic_mean`, which for this family is a mean over folds rather
-# than over days.** `case_studies/utils/registry/metrics.py:52-53` states the convention and says
-# which statistic is inferential: "The fold-based `ic_t` is a diagnostic: the inferential statistic
-# is `ic_t_hac`, computed below on the daily IC". The two readings can disagree here specifically -
+# than over days.** The registry's metric layer states the convention and says which statistic is
+# inferential: the fold-based `ic_t` is a diagnostic, and the inferential statistic is `ic_t_hac`,
+# computed on the daily IC series with its confidence interval. The two readings can disagree here specifically -
 # `cme_futures/12_model_analysis` records a case in this same family where ranking on `ic_mean`
 # selects an SDF checkpoint whose daily-pooled HAC interval straddles zero.
 #

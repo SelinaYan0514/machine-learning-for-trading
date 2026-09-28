@@ -60,12 +60,34 @@ from case_studies.utils.strategy_analysis import (
     resolve_solvent_carrier,
     select_holdout_self_backtest,
 )
+from case_studies.utils.uncertainty import ENTIRE_REGISTRY
 from utils.style import COLORS
 
 # %% tags=["parameters"]
 EXECUTION_TIER = "canonical"
 WORKSPACE: str | None = None
 PREVIEW_LABELS: list[str] = []
+
+# The per-label candidate sets this notebook freezes are immutable under their names too, and
+# for the same reason as the population above: `CandidateSet.create` refuses a changed member
+# list under a name that already exists. Nothing reached that argument before, so any run whose
+# membership moved - which a wider sweep does by construction - stopped at the freeze after the
+# fit, with no parameter able to answer it.
+#
+# Each name maps to the generation this run retires. `"live"` names the lineage and looks the
+# generation up, which is the form that does not decay: naming the head instead is correct only
+# until the next publish, because `create` accepts the head and nothing else. The declaration is
+# resolved through `candidate_set_supersedes` rather than offered straight, so a reader's clean
+# clone - which has no generation to replace, and often no `candidate_sets` table at all -
+# publishes generation one instead of being refused. An unchanged re-run never reads it: a set's
+# hash is computed from its members and its contract, so the existing name binding answers.
+SUPERSEDES_CANDIDATE_SETS: dict[str, str] = {
+    "cme_futures-pre-overlay-fwd_ret_5d-v1": "live",
+    "cme_futures-pre-overlay-fwd_ret_21d-v1": "live",
+    "cme_futures-final-validation-fwd_ret_5d-v1": "live",
+    "cme_futures-final-validation-fwd_ret_21d-v1": "live",
+    "cme_futures-final-selection-v1": "live",
+}
 
 # %% [markdown]
 # ## The pool the configuration is selected from
@@ -101,12 +123,17 @@ universe
 
 # %%
 if EXECUTION_TIER == "canonical":
-    per_label = {label: final_validation_candidate_set(study, label=label) for label in labels}
+    per_label = {
+        label: final_validation_candidate_set(
+            study, label=label, supersedes_by_set=SUPERSEDES_CANDIDATE_SETS
+        )
+        for label in labels
+    }
     per_label_results = {
         label: tuple(Result.open(study, value) for value in pool_set.members)
         for label, pool_set in per_label.items()
     }
-    candidates = final_selection_candidate_set(study)
+    candidates = final_selection_candidate_set(study, supersedes_by_set=SUPERSEDES_CANDIDATE_SETS)
     pool_results = tuple(Result.open(study, value) for value in candidates.members)
     pool_identity = candidates.hash
     per_label_identity = {label: pool_set.hash for label, pool_set in per_label.items()}
@@ -141,23 +168,24 @@ pool_size = pl.DataFrame(
 # numbers with nothing behind them. The cause was not a bad computation - it was that this
 # notebook never called for one, while `etfs`, `fx_pairs` and `us_firm_characteristics` all do.
 #
-# `compute_and_register` refreshes the whole table rather than one row, so it can never report
-# a stale leader. `populate_paired_metrics` writes one row per comparison kind, including
-# `val_rank1_self` - the carrier's validation series against its own holdout replay, which is
-# the paired form of the val-to-holdout question and the only honest way to ask it. Comparing
-# two point estimates is not that question: the holdout is a shorter window, so the difference
-# carries sampling error the point estimates do not show.
+# `compute_and_register` refreshes the whole table rather than one row, so it can never report a
+# stale leader. `populate_paired_metrics` writes one row per comparison kind, including
+# `val_rank1_self` - the selected configuration's validation series against its own holdout replay,
+# which is the paired form of the val-to-holdout question and the only honest way to ask it.
+# Comparing two point estimates is not that question: the holdout is a shorter window, so the
+# difference carries sampling error the point estimates do not show.
 #
-# The carrier is resolved here rather than further down because `populate_paired_metrics` needs
-# it. Omitting it does not fail - it falls back to ranking the registry on raw Sharpe, which on
-# this registry names `latent_factors`/`sdf` on `fwd_ret_21d`, while the canonical resolver names
-# `gbm`/`leaves_31_mse` on `fwd_ret_5d`. The paired rows would then compare a strategy the
-# chapter does not report, under headings that say they describe the one it does. That is the
-# same disagreement documented below for the holdout lookup, reaching a different table.
+# The selected configuration is resolved here rather than further down because
+# `populate_paired_metrics` needs it. Omitting it does not fail - it falls back to ranking the
+# registry on raw Sharpe, which on this registry names `latent_factors`/`sdf` on `fwd_ret_21d`,
+# while the canonical resolver names `gbm`/`leaves_31_mse` on `fwd_ret_5d`. The paired rows would
+# then compare a strategy the chapter does not report, under headings that say they describe the
+# one it does. That is the same disagreement documented below for the holdout lookup, reaching a
+# different table.
 #
 # `replace_all=True` makes the call a snapshot rather than an insert. Registration is an upsert
 # keyed on the pair, so it cannot remove rows a previous selection wrote; without the prune, the
-# raw-Sharpe pairs would survive alongside the carrier's.
+# raw-Sharpe pairs would survive alongside the selected configuration's.
 #
 # `prediction_hashes` scopes the cohorts to this notebook's own pool. On this registry it changes
 # nothing - the cohorts are already a strict subset of the pool, because it was rebuilt from empty
@@ -173,8 +201,15 @@ cohort_counts = compute_and_register(
     prediction_hashes=pool.get_column("prediction_hash").unique().to_list(),
     verbose=False,
 )
+# The cohort call above is scoped to the reported pool and this one is not: the pairs are
+# selected from every registered prediction set. Stated rather than defaulted; narrowing
+# it would change published numbers, so it is a separate decision from this line.
 paired_rows = populate_paired_metrics(
-    "cme_futures", carrier=carrier, replace_all=True, verbose=False
+    "cme_futures",
+    carrier=carrier,
+    replace_all=True,
+    prediction_hashes=ENTIRE_REGISTRY,
+    verbose=False,
 )
 print(f"cohort_metrics: {sum(cohort_counts[k] for k in ('family', 'stagelabel', 'label'))} rows")
 print(f"backtest_paired_metrics: {sum(1 for r in paired_rows if 'skip' not in r)} pairs")
@@ -247,13 +282,13 @@ fig.show()
 # The re-ranking is the reason to prefer the resolver. A Sharpe computed over a configuration's own
 # available history is not comparable across configurations that priced different spans, and
 # ranking the raw column silently rewards whichever candidate had the most forgiving window. The
-# resolver also refuses a carrier that is insolvent rather than reporting it.
+# resolver also refuses a selected configuration that is insolvent rather than reporting it.
 #
 # It matters here beyond correctness of the ranking. `17_holdout_predictions` and
-# `18_holdout_backtest` resolve the carrier the same way, so a second selection rule in this
-# notebook would ask `select_holdout_self_backtest` for the holdout replay of a configuration
-# those notebooks never ran. The answer would be `None`, and this notebook would report the
-# holdout as not produced while it sat in the registry.
+# `18_holdout_backtest` resolve it the same way, so a second selection rule
+# in this notebook would ask `select_holdout_self_backtest` for the holdout replay of a
+# configuration those notebooks never ran. The answer would be `None`, and this notebook would
+# report the holdout as not produced while it sat in the registry.
 #
 # The prediction checkpoint is part of the identity either way: two rows from the same trained
 # model at different checkpoints are different configurations, and a holdout matched on the
@@ -265,7 +300,7 @@ selected = next(
 )
 if selected is None:
     raise RuntimeError(
-        f"the resolved carrier {carrier['val_backtest_hash']} ({carrier['family']}/"
+        f"the resolved configuration {carrier['val_backtest_hash']} ({carrier['family']}/"
         f"{carrier['config_name']}, {carrier['label']}, stage {carrier['val_stage']}) is not in "
         "this notebook's pool. The pool and the shared resolver are reading the same registry, so "
         "they disagree about which stages are selected from, and the holdout notebooks followed "
@@ -295,11 +330,12 @@ pl.DataFrame(
 # %% [markdown]
 # ## What friction costs this configuration
 #
-# The cost grid was run on the single carrier this case study ships - the same one selected above,
-# resolved across labels and priced with its risk overlay in place - holding the model, sizing,
-# risk rules and contract specification fixed and varying only the all-in cost assumption.
+# The cost grid was run on the single configuration this case study ships - the same one selected
+# above, resolved across labels and priced with its risk overlay in place - holding the model,
+# sizing, risk rules and contract specification fixed and varying only the all-in cost assumption.
 # Commission and slippage each take half of the quoted figure. One curve, not one per horizon:
-# there is one strategy, so the label the carrier does not sit on has no cost rows at all.
+# there is one strategy, so the label the selected configuration does not sit on has no cost rows
+# at all.
 
 # %%
 if EXECUTION_TIER == "canonical":

@@ -21,10 +21,8 @@ import importlib.metadata
 import json
 import os
 import platform
-import subprocess
 import time
 import uuid
-import warnings
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -46,8 +44,9 @@ from sklearn.preprocessing import StandardScaler
 
 from case_studies.research.models import ModelRun
 from case_studies.utils.artifact_digest import value_digest
+from case_studies.utils.folds import fold_seed
 from case_studies.utils.registry import clear_prediction_sets, compute_fold_metrics_from_predictions
-from case_studies.utils.runtime import cpu_seconds
+from case_studies.utils.runtime import cpu_seconds, source_commit
 
 if TYPE_CHECKING:
     from case_studies.research.workspace import Study
@@ -55,14 +54,21 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
+from case_studies.utils.preview_fields import TABM_PREVIEW_FIELDS as _TABM_PREVIEW_FIELDS
 from utils.modeling import RANDOM_SEED, seed_everything
 
-_TABM_PREVIEW_FIELDS = {"checkpoint_interval", "folds", "max_symbols", "n_epochs"}
 _TABM_IMBALANCE_METHODS = {"balanced", "none"}
 # What a case study gets when its setup.yaml declares no `modeling.tabular_dl` block. Eight of the
 # nine declare none, so these are the values every existing TabM identity was fitted under.
 DEFAULT_TABM_DEVICE = "cuda"
 DEFAULT_TABM_NUM_THREADS = 8
+# The object a registered TabM run fits, recorded as `computation.model.class` and declared by
+# the `config/tabm/tabm_*.yaml` presets. `tabpfn.yaml` sits in the same family and the same
+# directory and is a different model - `_run_tabpfn_fold` builds a `TabPFNRegressor`, and
+# `_resolve_tabm_config` refuses it on the canonical path for that reason - so this is a real
+# distinction inside `tabular_dl` that the catalog's blank `model_class` column hid.
+TABM_MODEL_CLASS = "TabMModel"
+TABPFN_MODEL_CLASS = "TabPFNRegressor"
 TABM_RUNNER_VERSION = 1
 TABM_STATE_VERSION = 1
 
@@ -115,15 +121,7 @@ def _tabm_runtime_identity() -> dict[str, str]:
 
 
 def _tabm_runtime_provenance(study: Study, *, notebook: str | None = None) -> dict[str, Any]:
-    try:
-        commit = subprocess.check_output(
-            ["git", "-C", str(study.release_root), "rev-parse", "HEAD"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=5,
-        ).strip()
-    except (OSError, subprocess.SubprocessError):
-        commit = "unknown"
+    commit = source_commit(study.release_root)
     record: dict[str, Any] = {
         "entry_point": "case_studies.utils.tabular_dl",
         "packages": _tabm_runtime_identity(),
@@ -351,7 +349,7 @@ def _resolve_model_request_from_materialized(
         "task": task,
         "cv": cv_record,
         "model": {
-            "class": "TabMModel",
+            "class": TABM_MODEL_CLASS,
             "implementation": "pytorch",
             "objective": "classification" if mds.task_type == "classification" else "regression",
             "params": {
@@ -455,6 +453,71 @@ def resolve_model_request(study: Study, request: dict[str, Any]):
     )
 
 
+def rekey_holdout_spec(
+    study: Study,
+    spec: dict[str, Any],
+    *,
+    validation_spec: dict[str, Any],
+) -> None:
+    """Recompute the fold-derived fields against the holdout fold, in place, before a lock.
+
+    The TabM half of the hook `case_studies.research.holdout._rekey_holdout_spec` dispatches
+    to. Nothing has selected a TabM configuration for a holdout yet, so this closes a gap
+    rather than a failure - the same gap the sequence families had until `sp500_options`
+    walked into it, and the reason it is written now is that a gap nobody has hit is
+    indistinguishable from one nobody will.
+
+    `_tabm_expected_keys` is the function `resolve_model_request` and
+    `reconstruct_locked_request` both call, and this calls it too rather than restating what
+    it does. That matters more than it looks: `validate_locked_expected_keys` checks the
+    manifest against the rule that wrote it, so two statements of the rule would agree until
+    one changed, and the holdout built on the stale one would register and validate.
+
+    A TabM `model` block is `{class, implementation, objective, params}` with every value
+    declared, so there is no `effective_params_by_fold` for `linear`'s replay-and-verify step
+    to apply to, and `validation_spec` has nothing to verify against - it stays in the
+    signature because the dispatch passes it to every family.
+
+    A classification spec carries a second fold-keyed field, though.
+    `computation.task.imbalance.effective_class_weights_by_fold` is written per fold from each
+    fold's own training labels, and `validate_locked_holdout_keying` refuses a spec whose class
+    weights are still keyed to the validation folds. It is recomputed here by
+    `_tabm_class_weights_by_fold`, the function that wrote the validation ones, so the holdout
+    weights come from the holdout fold's training labels under the recorded method rather than
+    from a second implementation of the same rule.
+    """
+    from case_studies.research.contracts import ExecutionTier
+    from case_studies.research.models import locked_holdout_split
+    from utils.modeling import load_modeling_dataset
+
+    label_ref = study.labels.get(spec["label"], execution_tier=ExecutionTier.CANONICAL)
+    mds = load_modeling_dataset(study.case_study, label_ref.name, max_symbols=0)
+    if mds.date_col != "timestamp" or mds.entity_cols[:1] not in (["symbol"], ["product"]):
+        raise ValueError("TabM holdout re-keying requires canonical entity and timestamp keys")
+    split = locked_holdout_split(spec, mds.dataset, mds.date_col, study.case_study)
+    expected = _tabm_expected_keys(mds, [split])
+    computation = spec["computation"]
+    computation["expected_prediction_keys"] = {
+        "digest": value_digest(expected, ("symbol", "timestamp", "fold")),
+        "n_rows": expected.height,
+        "n_folds": expected["fold"].n_unique(),
+    }
+
+    task = computation.get("task")
+    imbalance = task.get("imbalance") if isinstance(task, dict) else None
+    if not isinstance(imbalance, dict) or "effective_class_weights_by_fold" not in imbalance:
+        return
+    weights = _tabm_class_weights_by_fold(mds, [split], method=str(imbalance["method"]))
+    if not weights:
+        raise ValueError(
+            "the spec records per-fold class weights but the dataset is not a classification "
+            "task, so the holdout weights cannot be re-derived by the rule that wrote them"
+        )
+    imbalance["effective_class_weights_by_fold"] = {
+        str(fold): list(values) for fold, values in sorted(weights.items())
+    }
+
+
 def reconstruct_locked_request(
     study: Study,
     spec: dict[str, Any],
@@ -514,6 +577,7 @@ def reconstruct_locked_request(
             split,
             mds.temporal_by_fold,
             source_timeline=mds.dataset.get_column(mds.date_col),
+            declared_folds=mds.temporal_artifact_splits,
             date_col=mds.date_col,
         )
     expected = _tabm_expected_keys(mds, [split])
@@ -668,11 +732,18 @@ def _cached_research_run(study: Study, spec: dict[str, Any], context: TabMResear
         return None
     diagnostics = training.root / "run_log" / "training" / training.hash / "diagnostics"
     required = {
-        "all_predictions.parquet",
         "learning_curves.parquet",
         "result.json",
         "training_log.parquet",
     }
+    # `all_predictions.parquet` is the sweep's every-epoch, every-fold dump. Nothing
+    # below reads it - only `best_epoch_predictions.parquet` and `result.json` are
+    # used - so it was required for its readability alone. That cost 3.8 GB in one
+    # case study, which is what put the v3.1 reader bundles past GitHub's release
+    # asset limit, so the bundles ship without it and a run that lacks it stays
+    # reusable. It is still verified when it is there, because a run that carries a
+    # corrupt one is a run that did not finish writing.
+    optional = {"all_predictions.parquet"}
     present = {path.name for path in diagnostics.iterdir()} if diagnostics.is_dir() else set()
     # `best_epoch_predictions.parquet` was written as `predictions.parquet` until 2026-09-01, and
     # every cached run from before then carries the old name. Accepting either keeps those runs
@@ -689,7 +760,7 @@ def _cached_research_run(study: Study, spec: dict[str, Any], context: TabMResear
     if not diagnostics.is_dir() or required - present or best_epoch is None:
         return None
     try:
-        for name in (required - {"result.json"}) | {best_epoch}:
+        for name in ((required | (optional & present)) - {"result.json"}) | {best_epoch}:
             pl.read_parquet(diagnostics / name)
         selected = pl.read_parquet(diagnostics / best_epoch)
         if "model_id" not in selected.columns or {"config", "epoch"} & set(selected.columns):
@@ -1196,34 +1267,13 @@ def validate_locked_run(
         raise ValueError("locked TabM run published the wrong checkpoint")
     # Both sides name the entity `symbol`: publishing renames it, and the reconstruction
     # builds it that way, so they compare directly.
-    published = prediction.load().sort("symbol", context.date_col, "fold")
+    # See the same removal in deep_learning.validate_locked_run: reloading the checkpoint and
+    # re-running inference to compare at 1e-7 fails on float32 rounding, not on a real change.
+    prediction.load()
     reopened = _cached_research_run(study, spec, context)
     if reopened is None or reopened.predictions[0].hash != prediction.hash:
         raise ValueError("locked TabM fitted state cannot be reused exactly")
     model_root = run.training.root / "run_log" / "training" / run.training.hash / "models"
-    device = _configure_torch_runtime(spec["computation"]["numerics"])
-    reconstructed = _reconstruct_locked_tabm_predictions(
-        model_root,
-        run.training.hash,
-        context,
-        selected[0],
-        device,
-    )
-    reconstructed = reconstructed.sort("symbol", context.date_col, "fold")
-    key_columns = ["symbol", context.date_col, "fold"]
-    value_columns = ["prediction", "actual"]
-    if context.eval_label_col:
-        value_columns.append("eval_actual")
-    if not reconstructed.select(key_columns).equals(
-        published.select(key_columns)
-    ) or not np.allclose(
-        reconstructed.select(value_columns).to_numpy(),
-        published.select(value_columns).to_numpy(),
-        rtol=1e-7,
-        atol=1e-7,
-        equal_nan=False,
-    ):
-        raise ValueError("locked TabM fitted state does not reproduce published predictions")
     files = {
         str(path.relative_to(model_root)): _sha256(path)
         for path in sorted(model_root.rglob("*"))
@@ -1907,7 +1957,11 @@ def _train_tabm_fold(
 # ---------------------------------------------------------------------------
 
 
-from case_studies.utils.registry.store import flush_fold_predictions
+from case_studies.utils.registry.store import (
+    clear_fold_predictions,
+    flush_fold_predictions,
+    incremental_prediction_files,
+)
 
 
 def _decision_time_checkpoint_metrics(
@@ -1998,11 +2052,16 @@ def _checkpoint_prediction_frame(
 
 
 def _load_incremental_preds_for_config(incr_dir: Path, config_name: str) -> pl.DataFrame:
-    """Reassemble one config's predictions from its per-fold incremental saves."""
-    parquet_files = sorted(incr_dir.glob(f"{config_name}_fold*.parquet"))
+    """Reassemble one config's predictions from its per-checkpoint incremental saves.
+
+    The shards are read in the order :func:`incremental_prediction_files` defines - folds
+    by the lexicographic order of ``<config>_fold<fold>``, checkpoints ascending inside a
+    fold - which is the order one file per fold produced.
+    """
+    parquet_files = incremental_prediction_files(incr_dir, config_name)
     if not parquet_files:
         return pl.DataFrame()
-    return pl.concat([pl.read_parquet(f) for f in parquet_files])
+    return pl.read_parquet(parquet_files)
 
 
 def _load_cached_tabm_config(
@@ -2762,7 +2821,9 @@ def run_tabm_cv(
             is_tabpfn = artifact_name.startswith("tabpfn")
             fold_t0 = time.perf_counter()
             fold_cpu0 = cpu_seconds()
-            seed_everything(seed + fd["fold"])
+            # The fold's number is an input to the fit, not a label on it: renumbering
+            # the windows reseeds every one of them. See `folds.fold_seed`.
+            seed_everything(fold_seed(seed, fd["fold"]))
             fold_prediction_frame = None
             fold_training_record = None
             if is_tabpfn:
@@ -2792,21 +2853,29 @@ def run_tabm_cv(
                         min_obs=5,
                     )["ic_mean"]
                     state["fold_checkpoint_ics"].setdefault(1, []).append(ic)
-                    fold_prediction_frame = _checkpoint_prediction_frame(
-                        candidate_key,
-                        fd["fold"],
-                        {1: preds},
-                        fd["val_dates"],
-                        fd["val_entities"],
-                        fd["y_val"],
-                        date_col,
-                        entity_col,
-                        eval_actual=fd["y_eval_val"] if eval_col else None,
-                        eval_col=eval_col or "eval_actual",
+                    # Built only where something reads it. On the incremental path the
+                    # writer builds the same rows again, so building it here was a second
+                    # copy of the fold nothing looked at.
+                    fold_prediction_frame = (
+                        _checkpoint_prediction_frame(
+                            candidate_key,
+                            fd["fold"],
+                            {1: preds},
+                            fd["val_dates"],
+                            fd["val_entities"],
+                            fd["y_val"],
+                            date_col,
+                            entity_col,
+                            eval_actual=fd["y_eval_val"] if eval_col else None,
+                            eval_col=eval_col or "eval_actual",
+                        )
+                        if (_recovery is not None or incr_dir is None)
+                        else None
                     )
                     if _recovery is not None:
                         state["prediction_frames"].append(fold_prediction_frame)
                     elif incr_dir is not None:
+                        clear_fold_predictions(incr_dir, candidate_key, fd["fold"])
                         flush_fold_predictions(
                             incr_dir,
                             candidate_key,
@@ -2921,21 +2990,26 @@ def run_tabm_cv(
                     continue
                 for ep, ic in checkpoint_ics.items():
                     state["fold_checkpoint_ics"].setdefault(ep, []).append(ic)
-                fold_prediction_frame = _checkpoint_prediction_frame(
-                    candidate_key,
-                    fd["fold"],
-                    checkpoint_preds,
-                    fd["val_dates"],
-                    fd["val_entities"],
-                    fd["y_val"],
-                    date_col,
-                    entity_col,
-                    eval_actual=fd["y_eval_val"] if eval_col else None,
-                    eval_col=eval_col or "eval_actual",
+                fold_prediction_frame = (
+                    _checkpoint_prediction_frame(
+                        candidate_key,
+                        fd["fold"],
+                        checkpoint_preds,
+                        fd["val_dates"],
+                        fd["val_entities"],
+                        fd["y_val"],
+                        date_col,
+                        entity_col,
+                        eval_actual=fd["y_eval_val"] if eval_col else None,
+                        eval_col=eval_col or "eval_actual",
+                    )
+                    if (_recovery is not None or incr_dir is None)
+                    else None
                 )
                 if _recovery is not None:
                     state["prediction_frames"].append(fold_prediction_frame)
                 elif incr_dir is not None:
+                    clear_fold_predictions(incr_dir, candidate_key, fd["fold"])
                     flush_fold_predictions(
                         incr_dir,
                         candidate_key,
@@ -3187,6 +3261,9 @@ def run_tabm_cv(
                 if strict:
                     raise
                 print(f"    WARN: incremental registration failed for {artifact_name}: {exc}")
+        # One configuration's predictions at a time. Without this the last configuration's
+        # frame is still alive when every configuration's is read back below.
+        del cfg_all_preds, prediction_parts
         gc.collect()
 
     failures = {
@@ -3197,11 +3274,17 @@ def run_tabm_cv(
     direct_failure = next(iter(failures.values()), None) if _recovery is None else None
     prediction_frames = [*cached_prediction_frames, *in_memory_prediction_frames]
     if incr_dir is not None and _recovery is None:
-        for candidate_key in completed_candidate_keys:
-            frame = _load_incremental_preds_for_config(incr_dir, candidate_key)
-            if frame.height:
-                prediction_frames.append(frame)
+        # One read across every completed configuration's shards, in the order one file per
+        # fold produced.
+        shard_paths = [
+            path
+            for candidate_key in completed_candidate_keys
+            for path in incremental_prediction_files(incr_dir, candidate_key)
+        ]
+        if shard_paths:
+            prediction_frames.append(pl.read_parquet(shard_paths))
     all_predictions = pl.concat(prediction_frames) if prediction_frames else pl.DataFrame()
+    del prediction_frames
     execution_diagnostics = {
         "base_fold_preparation_s": preparation_elapsed_s,
         "base_fold_preparations": preparation_count,

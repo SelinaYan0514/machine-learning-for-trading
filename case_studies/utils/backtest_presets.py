@@ -7,8 +7,12 @@ from typing import Any
 import polars as pl
 import yaml
 
+from case_studies.utils.backtest_loaders import (
+    VECTORIZED_CASE_STUDIES,
+    declared_rebalance_step,
+    declares_rebalance_step,
+)
 from case_studies.utils.backtest_loaders import BacktestConfig as CaseStudyBacktestConfig
-from case_studies.utils.backtest_loaders import declared_rebalance_step
 from utils.paths import get_case_study_dir
 
 try:
@@ -29,6 +33,81 @@ _EXECUTION_MODE_BY_DELAY = {
     "1_BAR": "next_bar",
     "AT_FUNDING_TIMESTAMP": "same_bar",
 }
+
+
+def traded_universe_declaration(prices: pl.DataFrame) -> dict[str, Any]:
+    """Describe the symbol set a run can hold, for the caller to put in its spec.
+
+    ``MAX_SYMBOLS`` reduces the price panel and nothing else. On the engine path that
+    bounds what the run can trade, because the engine cannot fill an unpriced name; on
+    the vectorized path it bounds nothing, because ``gross_ret = weight * y_true`` is
+    computed from the predictions and ``prices`` supplies only the rebalance calendar.
+    Either way the reduction never reached ``backtest_hash``, so a reduced run and a
+    full run over the same predictions hashed alike and the second was served the
+    first's result. Measured on us_firm_characteristics/11_backtest, 2026-08-24: 8
+    predictions x 4 schemes at 300 symbols and at 3,708 gave bit-identical Sharpe, CAGR
+    and drawdown across all 32 backtests.
+
+    The declaration carries a digest of the sorted symbol list rather than its length,
+    because ``{A, B}`` and ``{A, C}`` are two symbols each and two different portfolios.
+    It goes in ``strategy.signal``, which is hashed whole, so a caller that declares one
+    gets an identity of its own and can neither be served nor serve a full-universe row.
+    ``run_backtest`` reads it back through ``apply_traded_universe``: it checks the panel
+    it was handed against this digest and narrows the predictions to it, so the run
+    trades what its identity says on both paths.
+
+    Call it only when the panel was deliberately reduced. A caller that declares nothing
+    produces byte-identical specs to before this key existed, which is what leaves every
+    registered backtest at the identity it was written under.
+    """
+    from case_studies.utils.registry.specs import canonical_json, compute_hash
+
+    if "symbol" not in prices.columns:
+        raise ValueError(
+            "traded_universe_declaration needs a 'symbol' column on the price panel; "
+            f"got columns={list(prices.columns)}"
+        )
+    symbols = sorted(prices.get_column("symbol").drop_nulls().unique().to_list())
+    if not symbols:
+        raise ValueError("traded_universe_declaration was handed an empty price panel")
+    return {
+        "n_symbols": len(symbols),
+        "digest": compute_hash(canonical_json({"symbols": symbols})),
+    }
+
+
+def prediction_age_declaration(
+    *, max_age_sessions: int, dropped: int, kept: int, symbols_dropped: int
+) -> dict[str, Any]:
+    """Describe a prediction-age bound that removed rows, for the caller to put in its spec.
+
+    The sibling of :func:`traded_universe_declaration`, and the same defect it exists for.
+    Aligning predictions onto a coarser bar with a backward as-of join reuses a symbol's last
+    score for as long as the panel runs after its series ends, and bounding that age changes
+    what the backtest is computed from while ``prediction_hash`` and the strategy spec stay
+    identical - so a run with the bound and a run without it hash alike, and the second is
+    served the first's result. Measured on `nasdaq100_microstructure/17_costs`: the bound
+    removes 19,667 of 303,641 aligned rows at 30-minute cadence.
+
+    Carries the counts and not only the bound, because two runs can declare the same bound
+    and drop different rows: the prediction set behind them moves on every refit, and a run
+    whose universe left earlier is a different portfolio at the same tolerance.
+
+    Declare it only when the bound actually removed something. A caller that drops nothing
+    passes ``None`` and produces byte-identical specs to before this key existed, which is
+    what leaves every registered backtest at the identity it was written under.
+    """
+    if dropped <= 0:
+        raise ValueError(
+            "prediction_age_declaration is for a bound that removed rows; a bound that "
+            "removed none must declare nothing, so the run keeps the identity it had."
+        )
+    return {
+        "max_age_sessions": int(max_age_sessions),
+        "dropped": int(dropped),
+        "kept": int(kept),
+        "symbols_dropped": int(symbols_dropped),
+    }
 
 
 def resolve_execution_mode(fill_timing: str):
@@ -283,6 +362,7 @@ def ensure_backtest_spec(
     prices: pl.DataFrame,
     prediction_hash: str,
     initial_cash: float,
+    traded_universe: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Normalize ``strategy_spec`` to the canonical backtest spec form.
 
@@ -296,6 +376,17 @@ def ensure_backtest_spec(
     always populated in ``strategy.rebalance`` — taken from ``execution.*``
     when present, otherwise from ``case_config`` (which sources them from
     ``setup.yaml::backtest.rebalance.default``).
+
+    ``traded_universe`` is the same declaration ``build_backtest_spec`` takes, for the
+    same reason and with the same rule: build it with ``traded_universe_declaration``
+    when the price panel was deliberately reduced, and it lands in ``strategy.signal``,
+    which is hashed whole, so the reduction reaches ``backtest_hash`` instead of hashing
+    like the full run over the same predictions. It is
+    written only when a caller declares one, on both the carried-forward and the projected
+    path, so every existing call site produces byte-identical specs and no registered
+    backtest re-keys. A declaration handed here overwrites one inherited from the spec
+    being normalized, because the panel this run was given is the universe it trades;
+    ``apply_traded_universe`` then checks that claim against the panel in the runner.
     """
     if is_backtest_spec(strategy_spec):
         spec = deepcopy(strategy_spec)
@@ -311,6 +402,8 @@ def ensure_backtest_spec(
         rb = spec.setdefault("strategy", {}).setdefault("rebalance", {})
         rb.setdefault("min_weight_change", float(getattr(case_config, "min_weight_change", 0.005)))
         rb.setdefault("min_trade_value", float(getattr(case_config, "min_trade_value", 100.0)))
+        if traded_universe is not None:
+            spec["strategy"].setdefault("signal", {})["traded_universe"] = deepcopy(traded_universe)
         if "backtest_config" in spec:
             # Always overwrite metadata.prediction_hash with the caller's
             # argument — the spec may have been cloned from another run
@@ -366,6 +459,8 @@ def ensure_backtest_spec(
     }
     if case_study == "sp500_options":
         strategy["signal"].setdefault("schedule_contract", SP500_OPTIONS_SCHEDULE_CONTRACT)
+    if traded_universe is not None:
+        strategy["signal"]["traded_universe"] = deepcopy(traded_universe)
     if "allocation" in strategy_spec:
         strategy["allocation"] = deepcopy(strategy_spec["allocation"])
     if "risk" in strategy_spec:
@@ -442,6 +537,8 @@ def build_backtest_spec(
     min_weight_change: float | None = None,
     min_trade_value: float | None = None,
     label: str | None = None,
+    traded_universe: dict[str, Any] | None = None,
+    prediction_age: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     # A case study that declares per-label cadences must be told which label it is building for.
     # Defaulting to the case-study cadence here would put the spec on the wrong grid and register
@@ -454,18 +551,51 @@ def build_backtest_spec(
             "label=; "
             "pass the label this spec is being built for."
         )
+    # The same refusal for the step, and for a sharper reason: the step is emitted below only
+    # when a label resolves one, while `run_backtest` stamps the declared step onto whatever
+    # spec it is handed. So an unlabelled call here does not build a spec on the wrong grid -
+    # it builds a spec that hashes to an identity no run ever registers, and a caller that
+    # pre-hashes it to decide what to skip finds every registered row missing
+    # . Measured on us_firm_characteristics: 2,276 of 2,276
+    # registered baseline rows invisible to `11_backtest`'s own skip check.
+    if declares_rebalance_step(case_study) and not label:
+        raise ValueError(
+            f"{case_study} declares labels.rebalance_step, which is part of the backtest "
+            "identity, so build_backtest_spec needs a non-empty label=; pass the label this "
+            "spec is being built for. Without it the spec hashes to an identity no run "
+            "registers."
+        )
     resolved_signal = deepcopy(signal)
     if case_study == "sp500_options":
         resolved_signal.setdefault("schedule_contract", SP500_OPTIONS_SCHEDULE_CONTRACT)
+    # The universe a reduced run trades, from `traded_universe_declaration`. It sits in the
+    # signal block because that block is hashed whole, so the reduction reaches
+    # `backtest_hash` without a second place to keep in step with it. Emitted only when the
+    # caller declares one - the rule `cadence` and `step` already follow above - so a full
+    # run produces byte-identical specs to before this parameter existed and every
+    # registered backtest keeps the identity it was written under.
+    if traded_universe is not None:
+        resolved_signal["traded_universe"] = deepcopy(traded_universe)
+    # The prediction-age bound, from `prediction_age_declaration`, on the same terms and in
+    # the same block for the same reason: it changes what the run is computed from without
+    # touching `prediction_hash`, so without this a bounded run and an unbounded one over the
+    # same predictions hash alike and the second is served the first's result.
+    if prediction_age is not None:
+        resolved_signal["prediction_age"] = deepcopy(prediction_age)
 
     strategy_spec: dict[str, Any] = {
         "signal": resolved_signal,
         "execution": {
+            # `VECTORIZED_CASE_STUDIES` rather than a second copy of the same set. The
+            # membership was written out here as well, and the two are read by different
+            # things: this one decides the dispatch in `backtest_runner`, and the constant
+            # decides `IS_VECTORIZED` in four risk-management notebooks. Adding a case study
+            # to one and not the other gives a notebook the wrong branch with nothing raising.
             "mode": (
                 execution_mode
                 if execution_mode is not None
                 else "vectorized"
-                if case_study in {"us_firm_characteristics", "sp500_options"}
+                if case_study in VECTORIZED_CASE_STUDIES
                 else "engine"
             ),
             "engine_preset": "realistic",
@@ -474,7 +604,7 @@ def build_backtest_spec(
             # that declares nothing produces byte-identical specs to before this parameter existed.
             "cadence": case_config.cadence_for(label),
             # The step composes with the cadence to decide which slots are traded, so it
-            # belongs to the identity beside it (ml4t/agent-workspace#1005). Emitted only
+            # belongs to the identity beside it. Emitted only
             # when the case study declares one, so a case study that declares nothing
             # produces byte-identical specs to before this key existed - the same rule
             # `cadence_for` follows above.

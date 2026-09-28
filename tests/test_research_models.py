@@ -27,6 +27,7 @@ from case_studies.research import (
 from case_studies.research.results import ResultsCatalog
 from case_studies.utils import gbm as gbm_utils
 from case_studies.utils import linear, tabular_dl
+from case_studies.utils.folds import clear_memo, folds_built
 from case_studies.utils.latent_factors import adapter as latent_adapter
 from case_studies.utils.latent_factors import case_study as latent_case_study
 from case_studies.utils.latent_factors.cae import run_cae_fold
@@ -148,6 +149,111 @@ def _tabm_study(tmp_path, monkeypatch):
     monkeypatch.setattr(modeling, "load_modeling_dataset", load_dataset)
     monkeypatch.setattr(modeling, "load_configs", lambda *args, **kwargs: configs)
     return study, modeling_dataset, loads
+
+
+def _counted_loads(monkeypatch) -> list[tuple]:
+    """Record every `load_modeling_dataset` the linear resolver issues."""
+    loads: list[tuple] = []
+    original = linear.load_modeling_dataset
+
+    def counted(case_study, label, *args, **kwargs):
+        loads.append((case_study, label, kwargs.get("max_symbols", 0)))
+        return original(case_study, label, *args, **kwargs)
+
+    monkeypatch.setattr(linear, "load_modeling_dataset", counted)
+    return loads
+
+
+def test_resolving_a_configuration_grid_reads_the_panel_and_builds_the_folds_once(
+    tmp_path, monkeypatch
+) -> None:
+    """Resolving per configuration must not repeat the work that does not depend on one.
+
+    Loading the panel and preparing a fold depend on the data and the split, not on the
+    estimator, so a grid of configurations over one label needs one of each however many
+    configurations it holds. Counting requests would answer the wrong question - what is pinned
+    here is the work done, by dataset loads and by folds actually built, against a grid that
+    triples.
+
+    A caller that hands `run_models` pre-resolved requests takes the per-request branch rather
+    than the family batch runner, and this is what makes that a choice about when folds are
+    built rather than a multiplier on how often.
+    """
+    study = _linear_study(tmp_path, monkeypatch)
+    loads = _counted_loads(monkeypatch)
+
+    def resolve(config_names):
+        clear_memo()
+        linear.clear_input_memo()
+        loads.clear()
+        before = folds_built()
+        resolved = [
+            study.model(family="linear", label="fwd_ret_1d", config_name=name).resolve()
+            for name in config_names
+        ]
+        return resolved, len(loads), folds_built() - before
+
+    _, one_load, one_built = resolve(("ridge_a",))
+    resolved, three_loads, three_built = resolve(("ridge_a", "ridge_b", "ridge_c"))
+
+    assert one_load == three_loads == 1
+    # Two declared folds, built once for the grid rather than once per configuration.
+    assert one_built == three_built == 2
+
+    # Not merely the same values: the same arrays. Every configuration of one label sees one
+    # prepared fold set, so resolving up front does not hold a copy per configuration either.
+    first, second, third = (request._context.folds for request in resolved)
+    assert first[0] is second[0] is third[0]
+
+
+def test_resolving_and_planning_agree_on_every_training_identity(tmp_path, monkeypatch) -> None:
+    """The two paths through `run_models` must not produce different models.
+
+    `plan_models` computes identities from placeholder folds and the per-request path computes
+    them from prepared ones. When those were two implementations of fold preparation they
+    disagreed at 1e-11 in the standardised design matrix, which moved every data-derived alpha
+    and gave one declared configuration two training hashes depending on which path ran it.
+
+    Only a data-derived penalty can show that. A fixed `alpha` is resolved from the
+    configuration by `_fixed_effective_params` without reading a fold at all, so identities
+    over fixed penalties agree between the paths whatever the arrays hold.
+    """
+    study = _linear_study(tmp_path, monkeypatch)
+    names = ("ridge_f1", "ridge_f2", "ridge_f3")
+    # `alpha_frac` rather than a fixed `alpha`, and that is the whole point. A fixed penalty
+    # takes `_fixed_effective_params`, which resolves from the configuration alone and never
+    # reads a fold - so an identity comparison over fixed penalties cannot see the divergence
+    # this test is about. A fraction is resolved from the prepared design matrix, which is
+    # exactly where the two paths compute from different arrays.
+    monkeypatch.setattr(
+        linear,
+        "_load_preset",
+        lambda config_name: {
+            "config_name": config_name,
+            "family": "linear",
+            "library": "sklearn",
+            "model_class": "Ridge",
+            "params": {"alpha_frac": float(config_name[-1]) / 10.0},
+        },
+    )
+
+    def requests():
+        return [
+            study.model(family="linear", label="fwd_ret_1d", config_name=name) for name in names
+        ]
+
+    # The penalty has to actually be data-derived, or the comparison below is vacuous.
+    assert linear._fixed_effective_params(linear._load_preset(names[0]), {}, (0, 1)) is None, (
+        "a fixed penalty resolves without reading a fold and cannot show the divergence"
+    )
+
+    resolved = tuple(request.resolve() for request in requests())
+    plan = plan_models(study, requests=requests())
+
+    assert tuple(request.identity for request in resolved) == tuple(
+        member.training_hash for member in plan.members
+    )
+    assert len({request.identity for request in resolved}) == len(names)
 
 
 def test_tabm_public_batch_materializes_and_prepares_compatible_panel_once(
@@ -1441,7 +1547,13 @@ def test_linear_runner_replays_valid_models_after_registration_interrupt(
     assert recovered.predictions[0].complete
     assert recovered.predictions[0].coverage()["n_expected"] == 12
     assert attempted_predictions is not None
-    assert recovered.predictions[0].load().equals(attempted_predictions)
+    # The replay writes exactly what the interrupted attempt computed. Compared without the
+    # `label` column, which the publication path stamps onto every frame and the runner's own
+    # frame therefore does not carry (ml4t/agent-workspace#887); it is asserted separately
+    # rather than dropped from the comparison silently.
+    republished = recovered.predictions[0].load()
+    assert republished.get_column("label").unique().to_list() == ["fwd_ret_1d"]
+    assert republished.drop("label").equals(attempted_predictions)
     assert fitted_digests == {
         path.name: linear._sha256(path) for path in sorted(model_dir.glob("fold_*.joblib"))
     }
@@ -1795,6 +1907,118 @@ def test_gbm_batch_is_fold_major_and_matches_individual_execution(tmp_path, monk
     assert all(run.diagnostics["base_fold_preparations"] == 2 for run in batch.runs)
     assert all(run.diagnostics["disk_fold_cache"] is False for run in batch.runs)
     assert population.require_complete() == plan.expected_prediction_hashes
+
+
+def _frames_held_by(candidate: Any) -> list[pl.DataFrame]:
+    """Every prediction frame the candidate still references, directly or in one of its lists."""
+    held = []
+    for value in vars(candidate).values():
+        if isinstance(value, pl.DataFrame):
+            held.append(value)
+        elif isinstance(value, list):
+            held.extend(item for item in value if isinstance(item, pl.DataFrame))
+    return held
+
+
+def test_gbm_batch_releases_each_fold_shard_before_the_next_configuration(
+    tmp_path, monkeypatch
+) -> None:
+    """A fitted fold's predictions are on disk, so nothing holds them in memory.
+
+    Fold-major execution fits every configuration in a compatibility group against one prepared
+    fold, so a prediction frame retained by a candidate lives until that candidate finishes -
+    after the last fold, for every candidate at once. nasdaq's fifteen-configuration group over
+    two folds accumulated 52 GB of frames it had already written to parquet, and earlyoom killed
+    the notebook at a 62.4 GB peak. The shard is the durable copy; the frame is not kept.
+    """
+    monkeypatch.setenv("ML4T_FOLD_MEMO_BUDGET_BYTES", "1")
+    from case_studies.utils import folds as fold_utils
+
+    fold_utils.clear_memo()
+    study = _gbm_study(tmp_path / "batch", monkeypatch)
+    shard_frames: list[weakref.ReferenceType[pl.DataFrame]] = []
+    original_shard = gbm_utils._gbm_fold_prediction_shard
+    original_run_fold = gbm_utils._run_gbm_batch_fold
+
+    def observed_shard(entries, context):
+        frame = original_shard(entries, context)
+        shard_frames.append(weakref.ref(frame))
+        return frame
+
+    def observed_run_fold(candidate, fold):
+        gc.collect()
+        assert all(reference() is None for reference in shard_frames)
+        assert not _frames_held_by(candidate)
+        original_run_fold(candidate, fold)
+
+    monkeypatch.setattr(gbm_utils, "_gbm_fold_prediction_shard", observed_shard)
+    monkeypatch.setattr(gbm_utils, "_run_gbm_batch_fold", observed_run_fold)
+    requests = [
+        study.model(
+            family="gbm",
+            label="fwd_ret_1d",
+            config_name="leaves_7_mse",
+            overrides={"device": "cpu", "max_bin": 63, "learning_rate": learning_rate},
+        )
+        for learning_rate in (0.1, 0.2, 0.3)
+    ]
+
+    batch = run_models(study, requests=requests)
+    gc.collect()
+
+    assert len(shard_frames) == 6
+    assert all(reference() is None for reference in shard_frames)
+    assert all(run.diagnostics["compatibility_group_size"] == 3 for run in batch.runs)
+    for run in batch.runs:
+        shard_dir = run.training.root / "run_log" / "training" / run.training.hash
+        shards = sorted((shard_dir / "prediction_folds").glob("fold_*.parquet"))
+        assert [path.name for path in shards] == ["fold_0.parquet", "fold_1.parquet"]
+        assert all(prediction.load().height for prediction in run.predictions)
+
+
+def test_linear_batch_releases_each_fold_shard_before_the_next_configuration(
+    tmp_path, monkeypatch
+) -> None:
+    """The same contract in the linear runner, whose batch path has the same shape."""
+    study = _linear_study(tmp_path / "batch", monkeypatch)
+    shard_frames: list[weakref.ReferenceType[pl.DataFrame]] = []
+    original_frame = linear._prediction_frame
+    original_run_fold = linear._run_batch_candidate_fold
+
+    def observed_frame(fold, predictions, context):
+        frame = original_frame(fold, predictions, context)
+        shard_frames.append(weakref.ref(frame))
+        return frame
+
+    def observed_run_fold(candidate, fold):
+        gc.collect()
+        assert all(reference() is None for reference in shard_frames)
+        assert not _frames_held_by(candidate)
+        original_run_fold(candidate, fold)
+
+    monkeypatch.setattr(linear, "_prediction_frame", observed_frame)
+    monkeypatch.setattr(linear, "_run_batch_candidate_fold", observed_run_fold)
+    requests = [
+        study.model(
+            family="linear",
+            label="fwd_ret_1d",
+            config_name="ridge",
+            overrides={"alpha": alpha},
+        )
+        for alpha in (1.0, 2.0, 3.0)
+    ]
+
+    batch = run_models(study, requests=requests)
+    gc.collect()
+
+    assert len(shard_frames) == 6
+    assert all(reference() is None for reference in shard_frames)
+    assert all(run.diagnostics["compatibility_group_size"] == 3 for run in batch.runs)
+    for run in batch.runs:
+        shard_dir = run.training.root / "run_log" / "training" / run.training.hash
+        shards = sorted((shard_dir / "prediction_folds").glob("fold_*.parquet"))
+        assert [path.name for path in shards] == ["fold_0.parquet", "fold_1.parquet"]
+        assert run.predictions[0].load().height
 
 
 def test_gbm_batch_resolves_fold_dependent_huber_parameters(tmp_path, monkeypatch) -> None:
@@ -2937,3 +3161,85 @@ def test_peak_rss_is_read_in_the_unit_the_platform_reports(monkeypatch) -> None:
     on_macos = runtime.peak_rss_bytes()
 
     assert on_linux == on_macos * 1024
+
+
+def _trained_tabm_request(study, monkeypatch, calls: list[str]):
+    """Fit one tabm request and hand back the request plus its run."""
+
+    def counted_train(*, model, X_val, val_dates, state_callback=None, **kwargs):
+        calls.append(str(val_dates[0])[:10])
+        if state_callback is not None:
+            state_callback(1, model)
+        predictions = np.asarray(X_val[:, 0], dtype=np.float64)
+        return {1: 0.1}, {1: predictions}, {1: 0.01}
+
+    monkeypatch.setattr(tabular_dl, "_train_tabm_fold", counted_train)
+    request = study.model(
+        family="tabular_dl",
+        label="fwd_ret_1d",
+        config_name="tabm_s",
+        overrides={"device": "cpu", "num_threads": 1},
+    )
+    return request, request.run()
+
+
+def _cached_run_verdicts(monkeypatch) -> list[bool]:
+    """Record what `_cached_research_run` decides on each request it is asked about."""
+    verdicts: list[bool] = []
+    original = tabular_dl._cached_research_run
+
+    def spy(study, spec, context):
+        run = original(study, spec, context)
+        verdicts.append(run is not None)
+        return run
+
+    monkeypatch.setattr(tabular_dl, "_cached_research_run", spy)
+    return verdicts
+
+
+def test_a_cached_tabm_run_survives_the_loss_of_its_epoch_dump(tmp_path, monkeypatch) -> None:
+    """The reader bundles ship without all_predictions.parquet, so its absence must not refit.
+
+    Nothing reads that file: `_cached_research_run` uses only best_epoch_predictions.parquet
+    and result.json, and required the dump for its readability alone.
+    """
+    study, _, _ = _tabm_study(tmp_path, monkeypatch)
+    calls: list[str] = []
+    request, first = _trained_tabm_request(study, monkeypatch, calls)
+    fitted = list(calls)
+    assert fitted, "the first run must actually fit"
+
+    diagnostics = first.training.root / "run_log" / "training" / first.training.hash / "diagnostics"
+    dump = diagnostics / "all_predictions.parquet"
+    assert dump.is_file(), "the writer still produces the dump; only the bundle drops it"
+    dump.unlink()
+
+    verdicts = _cached_run_verdicts(monkeypatch)
+    reused = request.run()
+
+    assert verdicts == [True], "the run must be taken from cache, not re-executed"
+    assert calls == fitted, "a missing epoch dump must not trigger a refit"
+    assert reused.training.hash == first.training.hash
+    assert reused.predictions[0].hash == first.predictions[0].hash
+
+
+def test_a_cached_tabm_run_is_rejected_without_its_learning_curves(tmp_path, monkeypatch) -> None:
+    """The negative control: a file the reuse path reads is still required.
+
+    Without it the cache must be refused. Fold-level fitted state may still spare the
+    fit, which is why this asserts on the cache verdict and not on the training calls.
+    """
+    study, _, _ = _tabm_study(tmp_path, monkeypatch)
+    calls: list[str] = []
+    request, first = _trained_tabm_request(study, monkeypatch, calls)
+
+    diagnostics = first.training.root / "run_log" / "training" / first.training.hash / "diagnostics"
+    (diagnostics / "learning_curves.parquet").unlink()
+
+    verdicts = _cached_run_verdicts(monkeypatch)
+    request.run()
+
+    # The run re-executes and rewrites the diagnostics, so the post-execution
+    # verification asks again and gets a yes. The first verdict is the one under test.
+    assert verdicts[0] is False, "losing a file the reuse path reads must refuse the cache"
+    assert verdicts[1:] == [True], "the re-executed run must verify afterwards"

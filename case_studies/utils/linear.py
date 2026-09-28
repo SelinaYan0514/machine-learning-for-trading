@@ -3,14 +3,12 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import json
-import math
 import os
 import platform
-import subprocess
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -43,8 +41,10 @@ from case_studies.utils.folds import (
     prepare_standardized_folds,
 )
 from case_studies.utils.registry import prediction_hash_from_parts, training_hash_from_spec
+from case_studies.utils.registry.registration import _with_prediction_label
 from case_studies.utils.registry.specs import canonical_json
-from case_studies.utils.runtime import cpu_seconds, resource_measurement
+from case_studies.utils.registry.store import _timestamps_as_utc
+from case_studies.utils.runtime import cpu_seconds, resource_measurement, source_commit
 from utils.modeling import (
     load_modeling_dataset,
     resolve_linear_params,
@@ -69,8 +69,7 @@ _MODEL_CLASSES = {
     "ElasticNet": ElasticNet,
     "LogisticRegression": LogisticRegression,
 }
-_PREVIEW_FIELDS = {"folds", "max_symbols", "train_sample_frac"}
-
+from case_studies.utils.preview_fields import LINEAR_PREVIEW_FIELDS as _PREVIEW_FIELDS
 
 # Declared behaviour of this runner. Bump when a change here would change a fitted result: the
 # model classes it dispatches to, how a hyperparameter is derived, the fitting procedure, or what
@@ -113,7 +112,7 @@ class _BatchCandidate:
     training: TrainingResult | None = None
     ledger: ExecutionLedger | None = None
     attempt: ExecutionAttempt | None = None
-    frames: list[pl.DataFrame] = field(default_factory=list)
+    shards: list[Path] = field(default_factory=list)
     reused_folds: list[int] = field(default_factory=list)
     fitted_folds: list[int] = field(default_factory=list)
     fit_elapsed_s: float = 0.0
@@ -163,15 +162,7 @@ def _runtime_identity() -> dict[str, str]:
 
 
 def _runtime_provenance(study: Study, *, notebook: str | None = None) -> dict[str, Any]:
-    try:
-        commit = subprocess.check_output(
-            ["git", "-C", str(study.release_root), "rev-parse", "HEAD"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=5,
-        ).strip()
-    except (OSError, subprocess.SubprocessError):
-        commit = "unknown"
+    commit = source_commit(study.release_root)
     record: dict[str, Any] = {
         "entry_point": "case_studies.utils.linear",
         "packages": _runtime_identity(),
@@ -660,6 +651,7 @@ def _require_holdout_temporal_features(mds, split: dict[str, Any]) -> None:
             split,
             mds.temporal_by_fold,
             source_timeline=mds.dataset.get_column(mds.date_col),
+            declared_folds=mds.temporal_artifact_splits,
             date_col=mds.date_col,
         )
     except ValueError as exc:
@@ -826,6 +818,7 @@ def reconstruct_locked_request(
             split,
             mds.temporal_by_fold,
             source_timeline=mds.dataset.get_column(mds.date_col),
+            declared_folds=mds.temporal_artifact_splits,
             date_col=mds.date_col,
         )
     expected = _expected_keys_from_dataset(
@@ -1024,7 +1017,14 @@ def _fit_or_reuse_fold(
     training: TrainingResult,
     ledger: ExecutionLedger,
     fold: dict[str, Any],
-) -> tuple[pl.DataFrame, bool, float]:
+) -> tuple[Path, bool, float]:
+    """Fit one fold of one configuration, and return the shard it is persisted in.
+
+    Returning the path rather than the frame is what bounds a compatibility group. Fold-major
+    execution fits every configuration in the group against one prepared fold, so a returned
+    frame is retained until that configuration finishes - which is after the last fold, for
+    every configuration at once.
+    """
     fold_id = int(fold["fold"])
     params = spec["computation"]["model"]["effective_params_by_fold"][str(fold_id)]
     model_dir = training.root / "run_log" / "training" / training.hash / "models"
@@ -1041,7 +1041,7 @@ def _fit_or_reuse_fold(
         prediction_shard=shard,
         resolved_settings=params,
     ):
-        return pl.read_parquet(shard), True, 0.0
+        return shard, True, 0.0
     completed = ledger.fold_completion_exists(
         training_hash=training.hash,
         candidate_identity=training.hash,
@@ -1061,6 +1061,7 @@ def _fit_or_reuse_fold(
             )
             if not pl.read_parquet(shard).equals(recovered):
                 raise ValueError("prediction shard changed")
+            del recovered
             ledger.complete_fold(
                 training_hash=training.hash,
                 candidate_identity=training.hash,
@@ -1069,7 +1070,7 @@ def _fit_or_reuse_fold(
                 prediction_shard=shard,
                 resolved_settings=params,
             )
-            return recovered, True, 0.0
+            return shard, True, 0.0
         except Exception as exc:
             raise ValueError(
                 f"locked linear fold {fold_id} has conflicting uncommitted artifacts"
@@ -1123,7 +1124,7 @@ def _fit_or_reuse_fold(
     finally:
         artifact_temp.unlink(missing_ok=True)
         shard_temp.unlink(missing_ok=True)
-    return frame, False, time.perf_counter() - started
+    return shard, False, time.perf_counter() - started
 
 
 def _write_model_manifest(training: TrainingResult, *, immutable: bool = False) -> None:
@@ -1149,20 +1150,20 @@ def _fit_or_reuse_predictions(
     training: TrainingResult,
     ledger: ExecutionLedger,
 ) -> tuple[pl.DataFrame, list[int], list[int]]:
-    prediction_frames = []
+    shards = []
     reused_folds = []
     fitted_folds = []
     for fold in context.folds:
         fold_id = int(fold["fold"])
-        frame, reused, _ = _fit_or_reuse_fold(spec, context, training, ledger, fold)
-        prediction_frames.append(frame)
+        shard, reused, _ = _fit_or_reuse_fold(spec, context, training, ledger, fold)
+        shards.append(shard)
         if reused:
             reused_folds.append(fold_id)
         else:
             fitted_folds.append(fold_id)
 
     _write_model_manifest(training, immutable=context.immutable_recovery)
-    predictions = pl.concat(prediction_frames).sort("symbol", "timestamp", "fold")
+    predictions = pl.scan_parquet(shards).sort("symbol", "timestamp", "fold").collect()
     return predictions, reused_folds, fitted_folds
 
 
@@ -1239,6 +1240,23 @@ def _fail_batch_candidate(candidate: _BatchCandidate, error: Exception) -> None:
         candidate.attempt = None
 
 
+def _progress(message: str) -> None:
+    """One timestamped line per unit of work, flushed.
+
+    Deliberately not a tqdm bar. This runner's output is read two ways and neither favours
+    one: papermill captures it into a notebook cell, and `nb-run.sh` tees it to a log that
+    someone greps hours later to ask whether the run is moving. A bar rewrites one line with
+    carriage returns, which a log file records as an unreadable single line and a captured
+    cell renders as the final frame only - so at 07:30 it says exactly as little as no output
+    at all.
+
+    Discrete lines carry the thing a bar cannot: when each unit finished. That is what makes
+    "no new line for four hours" a legible statement, which is the question this exists to
+    answer.
+    """
+    print(f"[{datetime.now(UTC).strftime('%H:%M:%S')}] {message}", flush=True)
+
+
 def _run_batch_candidate_fold(candidate: _BatchCandidate, fold: dict[str, Any]) -> None:
     if candidate.result is not None or candidate.error is not None:
         return
@@ -1250,7 +1268,7 @@ def _run_batch_candidate_fold(candidate: _BatchCandidate, fold: dict[str, Any]) 
     if fold_id in candidate.reused_folds or fold_id in candidate.fitted_folds:
         return
     try:
-        frame, reused, elapsed = _fit_or_reuse_fold(
+        shard, reused, elapsed = _fit_or_reuse_fold(
             candidate.spec,
             candidate.context,
             candidate.training,
@@ -1260,8 +1278,13 @@ def _run_batch_candidate_fold(candidate: _BatchCandidate, fold: dict[str, Any]) 
     except Exception as exc:
         _fail_batch_candidate(candidate, exc)
         return
-    candidate.frames.append(frame)
+    candidate.shards.append(shard)
     candidate.fit_elapsed_s += elapsed
+    _progress(
+        f"  fold {fold_id} {'reused' if reused else 'fitted'} for "
+        f"{candidate.request.get('config_name', '?')} "
+        f"in {elapsed:6.1f}s (config total {candidate.fit_elapsed_s:7.1f}s)"
+    )
     (candidate.reused_folds if reused else candidate.fitted_folds).append(fold_id)
 
 
@@ -1284,7 +1307,7 @@ def _reuse_batch_candidate_fold(candidate: _BatchCandidate, fold_id: int) -> boo
         resolved_settings=params,
     ):
         return False
-    candidate.frames.append(pl.read_parquet(shard))
+    candidate.shards.append(shard)
     candidate.reused_folds.append(fold_id)
     return True
 
@@ -1297,13 +1320,15 @@ def _finish_batch_candidate(study: Study, candidate: _BatchCandidate) -> None:
     assert candidate.training is not None
     assert candidate.attempt is not None
     try:
-        if len(candidate.frames) != len(candidate.context.fold_ids):
+        if len(candidate.shards) != len(candidate.context.fold_ids):
             raise RuntimeError(
-                f"linear candidate produced {len(candidate.frames)} of "
+                f"linear candidate produced {len(candidate.shards)} of "
                 f"{len(candidate.context.fold_ids)} fold shards"
             )
         _write_model_manifest(candidate.training)
-        predictions = pl.concat(candidate.frames).sort("symbol", "timestamp", "fold")
+        predictions = (
+            pl.scan_parquet(candidate.shards).sort("symbol", "timestamp", "fold").collect()
+        )
         prediction = study.results.publish_predictions(
             candidate.training,
             checkpoint_kind="final",
@@ -1370,6 +1395,10 @@ def _run_batch_group(
         candidate.result is None and candidate.error is None for candidate in candidates
     )
     if first_pass_needed:
+        _progress(
+            f"linear group {compatibility_key[:12]}: {len(candidates)} configurations x "
+            f"{len(fold_ids)} folds, fold-major"
+        )
         for split in base["splits"]:
             fold_id = int(split["fold"])
             fixed_pending = [
@@ -1388,6 +1417,11 @@ def _run_batch_group(
                     _fail_batch_candidate(candidate, exc)
                 break
             preparation_elapsed_s += time.perf_counter() - started
+            _progress(
+                f"fold {fold_id} of {len(fold_ids)} prepared in "
+                f"{time.perf_counter() - started:.1f}s; {len(fixed_pending)} configurations "
+                f"to fit on it"
+            )
             for candidate in dependent:
                 if candidate.error is not None:
                     continue
@@ -1481,15 +1515,25 @@ def plan_model_requests(
 
     ordered: list[dict[str, Any] | None] = [None] * len(requests)
     planned_groups = []
-    input_cache: dict[tuple[str, str, int], tuple[Any, Any]] = {}
+    # One entry, not a growing dict. The cache is here so two compatibility groups over the same
+    # inputs read the panel once; keeping every group's panel instead is what made a multi-label
+    # plan carry one modeling dataset per label to the end of the run. Measured 2026-09-10 on
+    # nasdaq100_microstructure, one `load_modeling_dataset` per label with nothing released:
+    # 6.71, 12.65, 18.41, 22.53 GiB resident and a 35.79 GiB peak, before a single fit. Its
+    # 06_linear fits four labels in one call and died at 48.6 GB on the third of them.
+    cached_input_key: tuple[str, str, int] | None = None
+    cached_inputs: tuple[Any, Any] | None = None
     for key, indexed_requests in groups.items():
         input_key = _input_compatibility_key(indexed_requests[0][1])
+        if cached_input_key != input_key:
+            # Released before the next panel is read, so the two are never alive together.
+            cached_input_key, cached_inputs = None, None
         base = _load_batch_base(
             study,
             indexed_requests[0][1],
-            inputs=input_cache.get(input_key),
+            inputs=cached_inputs,
         )
-        input_cache.setdefault(input_key, (base["label_ref"], base["mds"]))
+        cached_input_key, cached_inputs = input_key, (base["label_ref"], base["mds"])
         fold_ids = tuple(int(split["fold"]) for split in base["splits"])
         candidates = []
         dependent = []
@@ -1545,6 +1589,16 @@ def plan_model_requests(
                 {candidate.index: candidate.effective_params for candidate in candidates},
             )
         )
+        # The payload outlives planning by the whole length of the run, and `mds` is by far the
+        # largest thing in `base`. `run_model_plan` reloads this group's panel when it reaches
+        # the group and drops it again afterwards, so one is alive at a time instead of one per
+        # group. Nothing else planning derived is rebuilt - the splits, the expected keys and
+        # the provenance in `base` are the planned ones - so no identity can move.
+        base["mds"] = None
+    cached_input_key, cached_inputs = None, None
+    # `_INPUT_MEMO` is left holding the last group's panel rather than cleared. It is a
+    # one-entry memo that clears itself on the next miss, so it costs one panel and not one per
+    # group, and it is what lets a single-group plan reach execution without a second read.
     if any(spec is None for spec in ordered):
         raise RuntimeError("linear batch planner did not resolve every request")
     return tuple(spec for spec in ordered if spec is not None), tuple(planned_groups)
@@ -1556,6 +1610,20 @@ def run_model_plan(study: Study, payload: tuple[Any, ...]) -> tuple[ModelRun, ..
     ]
     failures = []
     for key, indexed_requests, base, planned_effective in payload:
+        if base.get("mds") is None:
+            # Planning dropped it rather than carry every group's panel to the end of the run.
+            # One reload per group - a scan, ~18 s on the nasdaq100_microstructure minute panel -
+            # against 22.53 GiB held for the length of a four-label call.
+            request = indexed_requests[0][1]
+            tier = ExecutionTier(request["execution_tier"])
+            study.require_writable()
+            study.activate(tier)
+            _, base["mds"] = _load_inputs(
+                study,
+                request,
+                tier,
+                int(dict(request["preview_reductions"]).get("max_symbols", 0)),
+            )
         try:
             candidates = _run_batch_group(
                 study,
@@ -1568,6 +1636,10 @@ def run_model_plan(study: Study, payload: tuple[Any, ...]) -> tuple[ModelRun, ..
         except Exception as error:
             failures.append(error)
             continue
+        finally:
+            # Whatever the group did, its panel goes now: the next group loads its own.
+            base["mds"] = None
+            clear_input_memo()
         for candidate in candidates:
             if candidate.error is not None:
                 failures.append(candidate.error)
@@ -1589,15 +1661,21 @@ def run_model_requests(study: Study, requests: list[dict[str, Any]]) -> tuple[Mo
 
     ordered: list[ModelRun | None] = [None] * len(requests)
     failures: list[Exception] = []
-    input_cache: dict[tuple[str, str, int], tuple[Any, Any]] = {}
+    # One entry, not a growing dict - see `plan_model_requests`. A dict keyed by input holds
+    # every label's panel to the end of the call; measured at 22.53 GiB over four labels on
+    # nasdaq100_microstructure, before a single fit.
+    cached_input_key: tuple[str, str, int] | None = None
+    cached_inputs: tuple[Any, Any] | None = None
     for key, indexed_requests in groups.items():
         input_key = _input_compatibility_key(indexed_requests[0][1])
+        if cached_input_key != input_key:
+            cached_input_key, cached_inputs = None, None
         base = _load_batch_base(
             study,
             indexed_requests[0][1],
-            inputs=input_cache.get(input_key),
+            inputs=cached_inputs,
         )
-        input_cache.setdefault(input_key, (base["label_ref"], base["mds"]))
+        cached_input_key, cached_inputs = input_key, (base["label_ref"], base["mds"])
         candidates = _run_batch_group(
             study,
             indexed_requests,
@@ -1720,7 +1798,25 @@ def validate_locked_run(
         ):
             raise ValueError("locked linear completed-fold record does not validate")
         shards.append(pl.read_parquet(shard))
-    reconstructed = pl.concat(shards).sort("symbol", "timestamp", "fold")
+    # Publication stamps the label onto every prediction frame that arrives without one
+    # (`_with_prediction_label`, the single path all four families publish through), and the
+    # per-fold shards on disk are written before that. So the reconstruction has to be stamped
+    # the same way before the two frames can be compared. Without it this check compared a
+    # five-column frame against a six-column one and could never pass - unreachable until a
+    # linear configuration first carried a holdout, which is what fx_pairs did once its
+    # carrier selection was corrected. The stamp is added rather than the column dropped: the
+    # published label is part of what the reconstruction has to agree with.
+    # The shards are the frame as the fit wrote it; `published` came back through
+    # `PredictionResult.load`, which widens a `Date` decision-time column to
+    # `Datetime(us, 'UTC')` so the families join. `equals` compares dtypes, so the
+    # reconstruction is widened the same way or this check fails on the representation
+    # rather than on the values it exists to compare.
+    reconstructed = _timestamps_as_utc(
+        _with_prediction_label(
+            pl.concat(shards).sort("symbol", "timestamp", "fold"), str(spec["label"])
+        ),
+        widen_dates=True,
+    )
     if not reconstructed.equals(published):
         raise ValueError("locked linear fitted state does not reproduce published predictions")
     return hashlib.sha256(canonical_json(manifest_record).encode()).hexdigest()

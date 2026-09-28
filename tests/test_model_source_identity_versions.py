@@ -15,12 +15,24 @@ from case_studies.utils.latent_factors import adapter as latent_adapter
 from case_studies.utils.registry import training_hash_from_spec
 
 PINNED_SEQUENCE_RUNNER = 1
-PINNED_SEQUENCE_PREPARATION = 1
+# 2 since #767 (174154ad) corrected where the sequence path fills a missing feature. 3 since
+# #1090: sequence windows are laid out on the panel's expected periods instead of on a symbol's
+# own row order, an absent period keeps its cell and is described by two declared features, and
+# eligibility became two measured bounds where it had been an undeclared zero tolerance. Both the
+# contents of a window and the set of windows changed. The pin moves with the version
+# deliberately: it exists to make a bump a decision someone writes down, not to prevent one.
+PINNED_SEQUENCE_PREPARATION = 3
 PINNED_SEQUENCE_STATE = 1
 PINNED_TABM_RUNNER = 1
 PINNED_TABM_STATE = 1
 PINNED_LATENT_ADAPTER = 1
-PINNED_CAUSAL_RUNNER = 1
+# 1 -> 2 on 2026-09-10: the block-permutation refutation compares HAC t-statistics rather
+# than raw effects (ml4t/agent-workspace#1120). Permuting the treatment frees it from the
+# controls, so var(T_res) inflates and every placebo effect is shrunk toward zero by
+# arithmetic - the permutation distribution was narrower than the null it stood for, and
+# the bias ran one way, toward "Passes". refutation_p is a registered value, so the change
+# has to move the identity; causal rows have no migration path and refit.
+PINNED_CAUSAL_RUNNER = 2
 
 
 def _training_spec(source_identity: dict) -> dict:
@@ -51,9 +63,11 @@ def test_sequence_identity_is_declared_and_architecture_scoped() -> None:
         {"library": "darts", "params": {"architecture": "tsmixer"}}
     )
 
+    # Literals, not the pins above: the duplication is the guard. A bump has to be written
+    # down in both places, so it cannot ride along with an unrelated edit to one of them.
     assert nlinear == {
         "sequence_runner": 1,
-        "sequence_preparation": 1,
+        "sequence_preparation": 3,
         "sequence_state": 1,
         "backend": "pytorch/v1",
         "architecture": "nlinear/v1",
@@ -97,7 +111,7 @@ def test_latent_identity_is_declared_and_model_scoped(model: str) -> None:
 
 def test_causal_identity_is_declared() -> None:
     assert causal.CAUSAL_RUNNER_VERSION == PINNED_CAUSAL_RUNNER
-    assert causal._causal_source_identity() == {"causal_runner": 1}
+    assert causal._causal_source_identity() == {"causal_runner": 2}
 
 
 @pytest.mark.parametrize(

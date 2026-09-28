@@ -162,8 +162,18 @@ def extract_sentiment(p_yes: float) -> Sentiment:
     return Sentiment.STRONGLY_BEARISH
 
 
+INLINE_ENUMERATION = re.compile(r"\(\d+\)\s*")
+SENTENCE_END = re.compile(r"(?<![A-Z]\.)(?<=[.!?])\s+(?=[A-Z])")
+
+
 def extract_key_findings(rationale: str) -> list[str]:
-    """Extract bullet points and numbered items from rationale."""
+    """Extract the items a rationale enumerates, on their own lines or inline.
+
+    Line-leading bullets and numbers win where they exist. Otherwise the inline
+    ``(1) ... (2) ...`` form models routinely use inside a sentence is split on its
+    markers; at least two are required so a lone parenthesised digit in ordinary
+    prose is not read as a list.
+    """
     findings = []
     for line in rationale.split("\n"):
         line = line.strip()
@@ -171,7 +181,18 @@ def extract_key_findings(rationale: str) -> list[str]:
             findings.append(re.sub(r"^[-•*]\s+", "", line).strip())
         elif re.match(r"^\d+[.)]\s+", line):
             findings.append(re.sub(r"^\d+[.)]\s+", "", line).strip())
-    return findings[:10]
+    if findings:
+        return findings[:10]
+    items = [part.strip() for part in INLINE_ENUMERATION.split(rationale)[1:]]
+    if len(items) < 2:
+        return []
+    # The text after the last marker runs on into whatever the model wrote next, so the
+    # last item ends at its own sentence boundary rather than at the end of the rationale.
+    # The boundary has to survive an abbreviation: "U.S. inflation remains elevated" is one
+    # sentence, so a full stop only ends the item when the letter before it is not a capital
+    # and the next word begins with one.
+    items[-1] = SENTENCE_END.split(items[-1])[0]
+    return [item.rstrip(";.").strip() for item in items][:10]
 
 
 def extract_uncertainties(rationale: str) -> list[str]:
@@ -250,6 +271,7 @@ class ResearchAgent:
         p_yes = 0.5
         rationale = ""
         raw_action: dict = {}
+        forecast_produced = False
 
         for step in range(1, self.max_steps + 1):
             response, usage = self.llm.complete_with_usage(messages, json_mode=True)
@@ -284,6 +306,7 @@ class ResearchAgent:
                 p_yes = action["p_yes"]
                 rationale = action["rationale"]
                 raw_action = action
+                forecast_produced = True
                 traces.append(AgentTrace(step=step, action="forecast", llm_raw=response))
                 break
 
@@ -299,7 +322,9 @@ class ResearchAgent:
                     )
                 )
         else:
-            # Loop exhausted without a forecast: record forced default
+            # Loop exhausted without a forecast. p_yes keeps its initial value,
+            # which forecast_produced=False marks as a non-answer rather than a
+            # judgement, so aggregation can drop it.
             rationale = "Max steps reached without forecast"
             traces.append(AgentTrace(step=self.max_steps, action="forced_default"))
 
@@ -308,6 +333,7 @@ class ResearchAgent:
             p_yes=p_yes,
             rationale=rationale,
             traces=traces,
+            forecast_produced=forecast_produced,
             confidence=extract_confidence(raw_action),
             sentiment=extract_sentiment(p_yes),
             key_findings=extract_key_findings(rationale),

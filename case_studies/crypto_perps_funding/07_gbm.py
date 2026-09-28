@@ -76,7 +76,6 @@
 # %%
 """Fit the declared crypto perpetuals gradient boosting population on the walk-forward folds."""
 
-import numpy as np
 import plotly.graph_objects as go
 import polars as pl
 from plotly.subplots import make_subplots
@@ -104,7 +103,7 @@ POPULATION_NAME = ""
 # The generation of `crypto_perps_funding-gbm-validation-v1` the published one replaces.
 # `OfficialPopulation.create` hashes `supersedes` into the snapshot, so a run that passes None
 # computes a different hash from the row on record and is refused - which made this notebook
-# unrunnable against its own registry (ml4t/agent-workspace#879). The value was supplied at run
+# unrunnable against its own registry. The value was supplied at run
 # time on 2026-08-22 and never written down, so the committed source could not reproduce the
 # population it published. Checked against `official_populations`: `178c8b6cef03` is the current
 # generation and it supersedes `32770bf22544`. A re-run recomputes `178c8b6cef03`, matches, and

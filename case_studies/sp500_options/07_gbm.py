@@ -77,7 +77,6 @@
 # %%
 """Fit the declared short-straddle gradient boosting population on the walk-forward folds."""
 
-import numpy as np
 import plotly.graph_objects as go
 import polars as pl
 
@@ -100,7 +99,7 @@ WORKSPACE: str = ""
 PREVIEW_REDUCTIONS: dict = {}
 CONFIG_NAMES: list[str] = []
 POPULATION_NAME = ""
-SUPERSEDES_POPULATION: str = "65069e079063"
+SUPERSEDES_POPULATION: str = ""
 
 # %%
 study = open_study("sp500_options", execution_tier=EXECUTION_TIER, workspace=WORKSPACE or None)

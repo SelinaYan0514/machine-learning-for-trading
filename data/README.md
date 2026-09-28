@@ -130,7 +130,8 @@ uv run python data/futures/market/download.py
 
 The Chapter 3 MBO slice (NVDA, 10 trading days in November 2024) is best
 obtained as a one-off download from the Databento Download Center —
-total cost is under $10 and the files stay available for 30 days.
+total cost is under $10, covered by the $125 free credit Databento grants
+new accounts, and the files stay available for 30 days.
 
 See `data/equities/market/microstructure/MBO_DOWNLOAD.md` for step-by-step
 instructions. An API-based alternative (`mbo_download.py`) is available
@@ -175,13 +176,16 @@ conversions resume, so an interrupted run continues where it stopped: the option
 conversion at the last day it wrote, the NASDAQ-100 conversion at the last day it
 staged, part-way through a month.
 
-**Give the conversion at least 2 GB of memory.** The NASDAQ-100 archive peaks around
-1.3 GB, one day of bars while parsing and about two thirds of a month while a month is
-assembled. In Docker the limit that applies is Docker Desktop's own allocation
-(Settings -> Resources -> Memory), not the host's RAM, and it defaults low enough on
-some installs to stop the run. A conversion killed for memory prints nothing and exits
-137, because the kill leaves no traceback; if a run stops with no error, check the exit
-status before anything else.
+**Give the conversion at least 2 GB of memory, and the options archive 3 GB.** The
+NASDAQ-100 conversion peaked at 1.4 GB over all 24 months, measured inside a 2 GB container:
+a parsed day is ~50 MB, an assembly batch a few hundred, and the rest is the interpreter and
+its imports. The options archive adds ~0.9 GB before it parses anything, because reading days
+out of the zip has to hold the index of its 1,275,314 members; extracting the archive first
+avoids that as well as being faster. In
+Docker the limit that applies is Docker Desktop's own allocation (Settings -> Resources ->
+Memory), not the host's RAM, and it defaults low enough on some installs to stop the run.
+A conversion killed for memory prints nothing and exits 137, because the kill leaves no
+traceback; if a run stops with no error, check the exit status before anything else.
 
 The TAQ ticks are already parquet in the layout the loader scans, so unpacking
 them is the whole of the work. Name the members — Dropbox writes a stray root
@@ -269,6 +273,23 @@ When data is missing, loaders raise `DataNotFoundError` with download instructio
 
 ## API Keys
 
+None of these are needed to start. `cp .env.example .env` and the free datasets
+in the table above download as they are; come back here when a chapter asks for
+a source that needs one.
+
+### No sign-up at all
+
+| Provider | Variable          | What to put there            |
+| -------- | ----------------- | ---------------------------- |
+| SEC      | `EDGAR_IDENTITY`  | Your own name and email      |
+
+The SEC mandates a real `User-Agent` on every EDGAR request and blocks
+placeholder addresses, so this is not a key and there is nothing to register
+for - `EDGAR_IDENTITY=Jane Doe jane@example.org` in `.env` is the whole step.
+Ch04 NB02 and NB14, Ch22 NB01, and the `form4_download.py` and
+`filings_download.py` scripts refuse to run while it is empty. Every other
+SEC-derived dataset here is a committed snapshot and needs nothing.
+
 ### Free API Keys
 
 | Provider         | Variable         | Sign Up                                           |
@@ -285,10 +306,11 @@ When data is missing, loaders raise `DataNotFoundError` with download instructio
 
 ### Configuration
 
-Create `.env` in repository root:
+Fill in the lines you need in the `.env` you copied from `.env.example`:
 
 ```bash
-ML4T_DATA_PATH=/path/to/your/data
+# No sign-up - your own name and email
+EDGAR_IDENTITY=Jane Doe jane@example.org
 
 # Free API keys
 FRED_API_KEY=your-fred-key
@@ -298,6 +320,16 @@ OANDA_API_KEY=your-oanda-key
 # Paid
 DATABENTO_API_KEY=db-your-key
 ```
+
+Leave `ML4T_DATA_PATH` commented out unless you keep the datasets on a separate
+drive. The default is this repository's own `data/` folder and it is correct for
+every chapter.
+
+On the local `uv` path, `.env` reaches a notebook because importing `utils`
+loads it; a value you change there takes effect at the next kernel restart. On
+the Docker path Compose reads `.env` when it *creates* the container, so stop
+Jupyter Lab and run `docker compose up ml4t` again. `docker compose restart`
+does not pick up the new value.
 
 ---
 

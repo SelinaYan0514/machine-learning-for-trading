@@ -15,7 +15,7 @@
 
 # %% [markdown]
 # # ML-Based Exit Signals: Two-Model Architecture
-# **Docker image**: `ml4t-gpu`
+# **Docker image**: `ml4t`
 #
 # ## Purpose
 # Demonstrate a two-model exit architecture in which entry-model confidence becomes an
@@ -30,7 +30,8 @@
 # - Recognize when an architectural change does not pay off on AUC but still matters operationally.
 #
 # ## Book reference
-# §19.7 Adaptive Risk Controls, Figure 19.5 (signal-strength-conditioned barrier outcomes).
+# §19.7 Adaptive risk controls without leakage, Figure 19.5
+# (signal-strength-conditioned barrier outcomes).
 #
 # ## Prerequisites
 # Complete [`02_exit_strategies`](02_exit_strategies.ipynb) first for the rule-based exit
@@ -61,7 +62,7 @@ from utils.style import COLORS, show_plotly_with_alt, show_with_alt
 
 # %% tags=["parameters"]
 SEED = 42
-LGB_DEVICE = "cuda"
+LGB_DEVICE = "cpu"
 FORWARD_HOURS = 24
 N_OOF_FOLDS = 5
 N_IMPORTANCE_REPEATS = 5
@@ -75,7 +76,11 @@ ENTRY_CONFIDENCE_DROP = 0.30
 set_global_seeds(SEED)
 OUTPUT_DIR = get_output_dir(19, "ml_exit_signals")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-print(f"LightGBM device: {LGB_DEVICE} (GPU production path required)")
+print(
+    f"LightGBM device_type requested: {LGB_DEVICE}. A build without that tree learner raises "
+    "at fit(), and the booster is checked against this value below in case the parameter "
+    "never reached it."
+)
 
 # %% [markdown]
 # ## 1. Data Loading
@@ -287,7 +292,7 @@ label_summary
 
 # %%
 def make_classifier(seed: int) -> lgb.LGBMClassifier:
-    """Create the pinned CUDA LightGBM classifier used throughout the notebook."""
+    """Create the pinned LightGBM classifier used throughout the notebook."""
 
     return lgb.LGBMClassifier(
         n_estimators=100,
@@ -298,7 +303,7 @@ def make_classifier(seed: int) -> lgb.LGBMClassifier:
         subsample=0.8,
         subsample_freq=1,
         colsample_bytree=0.8,
-        max_bin=63,
+        max_bin=255,
         importance_type="gain",
         device_type=LGB_DEVICE,
         n_jobs=1,
@@ -452,8 +457,8 @@ if entry_model_device != LGB_DEVICE:
         f"LightGBM device mismatch: required {LGB_DEVICE}, observed {entry_model_device or 'unset'}"
     )
 print(
-    f"GPU completeness: LightGBM {lgb.__version__}; "
-    f"trained booster device_type={entry_model_device}; CPU helper threads=1"
+    f"Device check: LightGBM {lgb.__version__} trained the booster with "
+    f"device_type={entry_model_device}, the value that was requested; helper threads=1"
 )
 entry_proba_test = predict_positive_probability(entry_model, X_test)
 
@@ -593,6 +598,10 @@ exit_signal_confidence = entry_proba_test < entry_confidence_drop
 exit_signal_combined = exit_signal_model | exit_signal_confidence
 
 # %%
+# Bound once: both rates are read by name in the table, the reading under it, and the takeaways.
+confidence_fire_rate = exit_signal_confidence.mean()
+combined_fire_rate = exit_signal_combined.mean()
+
 signal_counts = pl.DataFrame(
     {
         "Rule": [
@@ -610,8 +619,8 @@ signal_counts = pl.DataFrame(
         "Share of bars": [
             f"{entry_signal.mean():.1%}",
             f"{exit_signal_model.mean():.1%}",
-            f"{exit_signal_confidence.mean():.1%}",
-            f"{exit_signal_combined.mean():.1%}",
+            f"{confidence_fire_rate:.1%}",
+            f"{combined_fire_rate:.1%}",
         ],
     }
 )
@@ -621,8 +630,8 @@ signal_counts
 display(
     Markdown(
         f"""**Interpretation**: The confidence-drop clause fires on
-{exit_signal_confidence.mean():.1%} of test bars and the combined rule fires on
-{exit_signal_combined.mean():.1%}. Because the rare-event entry model usually assigns low
+{confidence_fire_rate:.1%} of test bars and the combined rule fires on
+{combined_fire_rate:.1%}. Because the rare-event entry model usually assigns low
 probability, most bars sit below the confidence-drop level already, so that clause fires on nearly
 everything and the combined rule inherits its behaviour rather than the exit model's. The next
 section reads the holding periods and trade returns instead of assuming more exits are better."""
@@ -824,9 +833,9 @@ cost, and are not an estimate of what the strategy would earn."""
 # %% [markdown]
 # ## 10. Visualization
 #
-# The figures test whether the architecture's behavior is explainable. GPU LightGBM
-# is best-effort reproducible rather than bitwise deterministic, so importance is
-# summarized across seeded repeats with random row and feature subsampling.
+# The figures test whether the architecture's behavior is explainable. Gain importance
+# depends on the row and feature subsamples each fit happens to draw, so it is summarized
+# across seeded repeats rather than read off a single fit.
 
 
 # %%
@@ -837,7 +846,7 @@ def repeated_gain_importance(
     seed: int,
     repeats: int,
 ) -> pl.DataFrame:
-    """Estimate normalized gain importance dispersion across seeded GPU repeats."""
+    """Estimate normalized gain importance dispersion across seeded repeats."""
 
     records = []
     for repeat in range(repeats):
@@ -930,8 +939,8 @@ importance_xmax = 1.1 * max(
 )
 fig.update_layout(
     title=(
-        f"Entry confidence ranks #{entry_prediction_rank} in the enhanced exit model"
-        f"<br><sup>Mean normalized gain across {N_IMPORTANCE_REPEATS} seeded GPU repeats; "
+        "Feature importance in the entry and enhanced exit models"
+        f"<br><sup>Mean normalized gain across {N_IMPORTANCE_REPEATS} seeded repeats; "
         "error bars show ±1 SD</sup>"
     ),
     width=950,
@@ -942,13 +951,17 @@ fig.update_layout(
 fig.update_xaxes(title_text="Mean normalized gain importance (%)", range=[0, importance_xmax])
 show_plotly_with_alt(
     fig,
-    "Two histograms of predicted probability on a shared scale and bin width, entry above and exit below, each with its decision threshold marked. Nearly all the mass sits well below the threshold in both.",
+    "Two panels of horizontal bars on a shared importance scale, the entry model on the left "
+    "and the enhanced exit model on the right, each feature carrying an error bar for its "
+    "repeat-to-repeat spread and the bars ordered from most important down. Both panels fall "
+    "away steeply from their top feature. The stacked entry-prediction feature is highlighted "
+    "in the right-hand panel, in the middle of that ordering rather than at either end.",
 )
 
 # %% tags=["results"]
 display(
     Markdown(
-        f"""**Interpretation**: Across {N_IMPORTANCE_REPEATS} seeded GPU fits,
+        f"""**Interpretation**: Across {N_IMPORTANCE_REPEATS} seeded fits,
 `entry_prediction` ranks #{entry_prediction_rank} by mean normalized gain in the enhanced exit
 model. Gain importance is an impurity-based allocation measure, not a signed or causal effect; the
 error bars show its repeat-to-repeat dispersion."""
@@ -986,7 +999,7 @@ fig.add_trace(
 fig.add_vline(x=exit_threshold, line_dash="dash", line_color=COLORS["amber"], row=1, col=2)
 
 fig.update_layout(
-    title="The fixed rules select only the upper tail of each distribution",
+    title="Predicted probability by model, with each decision threshold",
     height=400,
     showlegend=False,
 )
@@ -994,7 +1007,11 @@ fig.update_xaxes(title_text="Predicted probability", range=[0, 1])
 fig.update_yaxes(title_text="Test bars (count)")
 show_plotly_with_alt(
     fig,
-    "Grouped bars comparing the exit rules on mean trade return and average holding period, showing that the rules differ far more in how long they hold than in what they earn.",
+    "Two histograms of predicted probability sharing a scale and bin width, the entry model on "
+    "the left and the exit model on the right, each with a dashed vertical line at its "
+    "decision threshold. The entry distribution is pressed hard against the low end and decays "
+    "away long before its threshold; the exit distribution is a broad hump centred close to "
+    "its own threshold, so the line cuts through the bulk of it rather than past the tail.",
 )
 
 # %% [markdown]
@@ -1090,9 +1107,11 @@ ax_pub.set_yticks(range(0, 101, 20))
 ax_pub.legend(loc="upper center", ncols=3, frameon=False)
 show_with_alt(
     fig_pub,
-    "Stacked bars of outcome share by signal quintile: adverse move, neutral, and strong upside. "
-    "The strong-upside share grows across the quintiles from near zero, while the adverse-move "
-    "share stays broadly flat.",
+    "Stacked bars of outcome share by signal quintile, each bar split into adverse move, neutral "
+    "and strong upside. The strong-upside band grows steadily across the quintiles from almost "
+    "nothing in the weakest. The adverse-move band does not follow it: it rises over the first "
+    "four quintiles and then falls back in the strongest, so the two bands are not simply "
+    "trading off against each other.",
 )
 
 # %% tags=["results"]
@@ -1124,17 +1143,18 @@ takeaways = pl.DataFrame(
             f"{exit_auc_basic:.3f}",
             f"{exit_auc_enhanced:.3f}",
             f"{(exit_auc_enhanced - exit_auc_basic):+.3f} ({improvement:+.2f}%)",
-            f"{exit_signal_confidence.mean():.1%} of bars",
+            f"{confidence_fire_rate:.1%} of bars",
         ],
     }
 )
 takeaways
 
 # %% tags=["results"]
+meta_train_rows = meta_train_mask.sum()
 display(
     Markdown(
         f"The purged out-of-fold pass supplies an entry probability for "
-        f"**{meta_train_mask.sum():,} training rows** without any of them coming from a model that "
+        f"**{meta_train_rows:,} training rows** without any of them coming from a model that "
         f"saw its own row. Basic and enhanced exit AUC are **{exit_auc_basic:.3f}** and "
         f"**{exit_auc_enhanced:.3f}**. On the test interval, **{best_mean_row['Strategy']}** has "
         f"the highest mean compounded trade return at **{best_mean_row['mean_return']:.2%}**, and "

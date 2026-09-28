@@ -75,6 +75,22 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 REPLACEMENTS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"/home/[^/]+/ml4t/third_edition/code/"), ""),
     (re.compile(r"/home/[^/]+/ml4t/code/"), ""),
+    # A worktree is a repo root too. `~/ml4t/public` is the main checkout and
+    # `~/ml4t/public-<lane>` a per-lane worktree, so both map to "" like the two
+    # repo roots above rather than falling through to the generic `~/ml4t/` rule,
+    # which strips the username and leaves the lane name - a directory that exists
+    # on one machine and belongs to a lane rather than to the book.
+    #
+    # The second spelling is not redundant. The generic rule below has been turning
+    # the first into the second since worktrees came in, so 410 committed notebooks
+    # already carry the `~/` form and nothing downstream can see it: `nbcheck`'s
+    # ABSOLUTE_PATH and this file's own CI guard both only match the `/home/` form.
+    # Without the second rule the sweep finds nothing to fix.
+    #
+    # `(?=/)` after the optional lane suffix is what keeps a hypothetical
+    # `~/ml4t/publications/` out; a bare `public[^/]*` would eat it.
+    (re.compile(r"/home/[^/]+/ml4t/public(?:-[A-Za-z0-9._-]+)?/"), ""),
+    (re.compile(r"~/ml4t/public(?:-[A-Za-z0-9._-]+)?/"), ""),
     # Docker container repo root: GPU notebooks (e.g. Ch12 02_gbm_comparison run
     # in the ml4t-gpu image) bake the container working dir /app into outputs.
     (re.compile(r"/app/"), ""),
@@ -155,6 +171,16 @@ def _iter_notebooks() -> list[Path]:
         if SKIP_PARTS & set(p.parts):
             continue
         if p.name.startswith("_executed_"):
+            continue
+        # `nb-run.sh` writes `.<stem>.build.<pid>.ipynb` and `.<stem>.papermill.<pid>.ipynb`
+        # beside the notebook it is running and deletes them on exit. They belong to that run,
+        # not to the working tree this script fixes, and a concurrent run in the same directory
+        # deletes one between this walk and the read below. On 2026-09-08 that raced four
+        # teaching notebooks at once: a healthy `12_kalshi_prediction_markets` run printed a
+        # `FileNotFoundError` naming `11_defi_tvl_evaluation`'s build file, the sweep died
+        # before sanitizing kalshi's own outputs, and the run still exited 0 with the notebook
+        # no longer matching its stamp.
+        if p.name.startswith("."):
             continue
         if p in ignored:
             continue
@@ -322,7 +348,15 @@ def main() -> int:
     dirty: list[tuple[Path, int]] = []
     blocked: list[tuple[Path, str]] = []
     for nb in targets:
-        raw = nb.read_text(encoding="utf-8")
+        try:
+            raw = nb.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            # Only reachable for a path that existed during the walk and is gone now, which
+            # means another process owns it. Skipping one such file is right; failing the whole
+            # sweep leaves every notebook after it in the sort order unsanitized.
+            if args.notebooks:
+                raise
+            continue
         new, n, skipped = sanitize_notebook(raw)
         blocked += [(nb.relative_to(REPO_ROOT), s) for s in skipped]
         if n:

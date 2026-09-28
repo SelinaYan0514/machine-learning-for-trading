@@ -43,12 +43,9 @@
 
 import sqlite3
 import time
-import warnings
 
 import matplotlib.pyplot as plt
 import polars as pl
-
-warnings.filterwarnings("ignore")
 
 from case_studies.research import (
     OfficialPopulation,
@@ -67,7 +64,10 @@ from case_studies.utils.backtest_loaders import (
     load_backtest_prices_for,
     warmup_periods_for,
 )
-from case_studies.utils.backtest_presets import build_backtest_spec
+from case_studies.utils.backtest_presets import (
+    build_backtest_spec,
+    traded_universe_declaration,
+)
 from case_studies.utils.backtest_runner import run_backtest
 from case_studies.utils.conformal import ensure_conformal_calibration_identity
 from case_studies.utils.notebook_contracts import prediction_members_in_force
@@ -81,16 +81,20 @@ from case_studies.utils.sweep_config import (
     get_checkpoints_per_config,
     get_top_k_values_for,
     get_top_n_predictions,
+    top_n_cap,
 )
 from utils.paths import get_case_study_dir
-from utils.style import COLORS, FIGSIZE, add_message_title
+from utils.style import COLORS, FIGSIZE, add_message_title, show_with_alt
 
 # %% tags=["parameters"]
 CASE_STUDY_ID = "sp500_equity_option_analytics"
+EXECUTION_TIER = "canonical"
+WORKSPACE: str = ""
 LABEL = ""
 MAX_SYMBOLS = 0
 SKIP_EXPENSIVE_ALLOC = False
 TOP_N_PREDICTIONS = None
+SUPERSEDES_ALLOCATION_POPULATIONS: dict[str, str] | None = None
 
 # %% [markdown]
 # ### What is asked for, and what it resolves to
@@ -100,6 +104,29 @@ TOP_N_PREDICTIONS = None
 # injected parameter wins; otherwise the case study's own declaration does.
 
 # %%
+# A run given a workspace reads and registers there rather than in the released case
+# directory, and `open_study` is what activates that root. Activation rewrites
+# `ML4T_OUTPUT_DIR` for the rest of the process, so it has to happen before the first
+# `get_case_study_dir` rather than beside the registry read further down: `CASE_DIR` has to
+# already answer for the workspace.
+#
+# `WORKSPACE` is read at both tiers. It used to be read on the preview branch only, so a
+# canonical run that passed one was answered with `Study.regenerate` and registered its
+# backtests in the published store while its caller read from the workspace it asked for -
+# no exception, no warning, and an exit status that said the run had refused (#1100). A
+# canonical run with a workspace is the same full-fidelity sweep writing to that root, which
+# is what a rehearsal against a private registry needs. A preview still requires one, because
+# a preview with no workspace has nowhere of its own to write.
+_workspace_study = None
+if EXECUTION_TIER == "preview" and not WORKSPACE:
+    raise ValueError("preview execution requires WORKSPACE")
+if WORKSPACE or EXECUTION_TIER == "preview":
+    _workspace_study = open_study(
+        CASE_STUDY_ID,
+        execution_tier=EXECUTION_TIER,
+        workspace=WORKSPACE or None,
+        entry_point="15_portfolio_management",
+    )
 CASE_DIR = get_case_study_dir(CASE_STUDY_ID)
 bt_config = get_backtest_config(CASE_STUDY_ID)
 TOP_N = (
@@ -107,6 +134,7 @@ TOP_N = (
     if TOP_N_PREDICTIONS is not None
     else get_top_n_predictions(CASE_STUDY_ID, "allocation")
 )
+TOP_N_CAP = top_n_cap(TOP_N)
 CHECKPOINTS_PER_CONFIG = get_checkpoints_per_config(CASE_STUDY_ID)
 ALLOCATION_LABEL = LABEL or bt_config.primary_label
 
@@ -117,13 +145,19 @@ print(
 
 # `Study.at` is the read-only form: one root, no activation. These notebooks only read the
 # populations - their backtests reach the registry by their own paths - and every other way in
-# ends in `activate()`, which rewrites `ML4T_OUTPUT_DIR` process-wide. `open_study` with the
-# canonical tier routes to `Study.regenerate`, which refuses unless `features`, `labels` and
-# `run_log` are symlinks: true in a maintainer worktree, false in every clean clone and CI run.
-# `CASE_DIR` is already the directory this notebook resolved, including under a preview, so
+# ends in `activate()`, which rewrites `ML4T_OUTPUT_DIR` process-wide. `open_study` at the
+# canonical tier with no workspace routes to `Study.regenerate`, which refuses unless
+# `features`, `labels` and `run_log` are symlinks: true in a maintainer worktree, false in
+# every clean clone and CI run. Given a workspace it routes to `Study.open` instead, which is
+# why the branch above opens one whenever `WORKSPACE` is set rather than only for a preview.
+# `CASE_DIR` is already the directory this notebook resolved, including under a workspace, so
 # asking it directly answers for the registry the rest of the notebook reads.
-_study = Study.at(CASE_DIR, case_study=CASE_STUDY_ID, entry_point="15_portfolio_management")
-_members, _population_notes = prediction_members_in_force(_study)
+_study = (
+    _workspace_study
+    if _workspace_study is not None
+    else Study.at(CASE_DIR, case_study=CASE_STUDY_ID, entry_point="15_portfolio_management")
+)
+_members, _population_notes = prediction_members_in_force(_study, CASE_DIR)
 for _note in _population_notes:
     print(_note)
 CURRENT_MEMBERS = _members
@@ -170,8 +204,16 @@ top_preds = resolve_best_predictions(
     prediction_hashes=CURRENT_MEMBERS,
     backtest_hashes=BASELINE_GRID,
 )
-if len(top_preds) != TOP_N:
-    raise RuntimeError(f"Expected {TOP_N} advancing configurations, found {len(top_preds)}")
+# The unit here is a configuration, not a row: `resolve_best_predictions` returns
+# `checkpoints_per_config` rows per advancing config, so `len(top_preds)` counts configurations
+# only while that is 1. A width of 0 asks for every configuration, as `top_n_predictions.signal`
+# does in this setup.yaml, and then there is no count to promise - only that something advanced.
+advancing_configs = top_preds.select("family", "config_name").n_unique()
+if TOP_N_CAP is None:
+    if not advancing_configs:
+        raise RuntimeError("No configuration advanced to the allocation stage")
+elif advancing_configs != TOP_N_CAP:
+    raise RuntimeError(f"Expected {TOP_N} advancing configurations, found {advancing_configs}")
 
 selected_hashes = top_preds["prediction_hash"].to_list()
 top_preds.select("source", "prediction_hash", "sharpe")
@@ -191,6 +233,32 @@ prices = load_backtest_prices_for(
 )
 n_assets = prices["symbol"].n_unique()
 print(f"Price support: {len(prices):,} rows across {n_assets} historical symbols")
+
+# `MAX_SYMBOLS` reduces the price panel, and until the run says so in its own specification
+# that reduction did not reach `backtest_hash`: a reduced run and the full run over the same
+# predictions hashed alike, so the second was served the first's result and the reduction
+# bought nothing (ml4t/agent-workspace#911). Declaring it here, before anything is hashed,
+# gives a reduced run an identity of its own; `run_backtest` checks the panel against the
+# declaration and narrows the predictions to it, so the sweep ranks the cross-section this
+# says it ranks and `n_assets` above describes that same set. A full run declares nothing and
+# is byte-identical to before.
+# A reduced run is a preview run. Refused on the canonical tier so a narrowed result can
+# never land in the registry the book's numbers come from, and so the two can never sit in
+# one registry to be ranked against each other: `resolve_best_predictions` takes MAX(sharpe)
+# over every backtest of a prediction, and a Sharpe earned over a handful of names would
+# advance a configuration ahead of one earned over the whole panel. `us_equities_panel` 16
+# through 19 already refuse the parameter this way, and `canonically_refused_parameters`
+# reads the refusal out of the source, so the canonical fixture path drops the name rather
+# than handing the notebook something its first cell raises on.
+if EXECUTION_TIER == "canonical" and MAX_SYMBOLS:
+    raise ValueError(
+        "MAX_SYMBOLS narrows the universe this run trades, which makes it a different "
+        "portfolio from the declared one and gives it its own backtest identity "
+        "(ml4t/agent-workspace#911). A canonical run trades the declared universe: set "
+        "MAX_SYMBOLS=0, or run under EXECUTION_TIER='preview' with a WORKSPACE."
+    )
+TRADED_UNIVERSE = traded_universe_declaration(prices) if MAX_SYMBOLS else None
+
 
 # %% [markdown]
 # ## 2. Sweep alternative allocators
@@ -227,6 +295,7 @@ for pred_row in top_preds.iter_rows(named=True):
                 CASE_STUDY_ID,
                 bt_config,
                 prices=prices,
+                traded_universe=TRADED_UNIVERSE,
                 prediction_hash=pred_row["prediction_hash"],
                 initial_cash=bt_config.initial_cash,
                 chapter="ch17",
@@ -300,36 +369,69 @@ ALLOCATION_POPULATION = sweep_plan_name(
 # change that name's membership without saying so, and the refusal it pre-empts is the one
 # thing that makes a changed grid visible. Add an entry when a run is actually refused, with
 # the hash the refusal prints.
-SUPERSEDES_ALLOCATION_POPULATIONS: dict[str, str] = {}
+_DECLARED_SUPERSEDES_ALLOCATION_POPULATIONS: dict[str, str] = {}
+
+# Resolved under a different name, per the convention stated at the parameters cell: an
+# injected parameter wins, otherwise the case study's own declaration does. Until 2026-09-18
+# the committed map above *was* the parameter name, and because it is assigned here rather
+# than in the parameters cell it overwrote whatever papermill injected, before the
+# `population_supersedes` call below ever read it. A run that declared the supersedes it was
+# asked for was refused as though it had declared nothing. The two sibling notebooks guarded by the same freeze already take this
+# as a parameter: cme_futures as SUPERSEDES_ALLOCATION_POPULATION, crypto_perps_funding as
+# SUPERSEDES_ALLOCATION.
+_supersedes_allocation_populations = (
+    _DECLARED_SUPERSEDES_ALLOCATION_POPULATIONS
+    if SUPERSEDES_ALLOCATION_POPULATIONS is None
+    else SUPERSEDES_ALLOCATION_POPULATIONS
+)
 
 _plan = None
 try:
-    _writable = open_study(CASE_STUDY_ID, entry_point="15_portfolio_management")
+    _writable = (
+        _workspace_study
+        if _workspace_study is not None
+        else open_study(CASE_STUDY_ID, entry_point="15_portfolio_management")
+    )
 except PermissionError as exc:
     print(f"Not recording the allocation plan here: {exc}")
 else:
-    if _writable.root != CASE_DIR:
+    # `storage_root` is the registry this run writes, which is not always `root`: a preview's
+    # `root` stays the case directory while its writes go to `<workspace>/.preview/<case>`. A
+    # canonical run, with or without a workspace, writes its own root. Either way the guard
+    # compares it against the directory the sweep above read, so a run that reads one registry
+    # and records its plan in another is refused rather than recorded.
+    if _writable.storage_root(EXECUTION_TIER) != CASE_DIR:
         raise RuntimeError(
-            f"15 ran its sweep against {CASE_DIR} but opened a study rooted at {_writable.root}. "
+            f"15 ran its sweep against {CASE_DIR} but opened a study writing to {_writable.storage_root(EXECUTION_TIER)}. "
             "Recording the plan there would describe a registry this run did not write."
         )
-    _plan = OfficialPopulation.create(
-        _writable,
-        name=ALLOCATION_POPULATION,
-        member_kind="backtest",
-        members=[row["backtest_hash"] for row in planned],
-        supersedes=population_supersedes(
+    if EXECUTION_TIER != "canonical":
+        # `OfficialPopulation.create` refuses a preview, and rightly: a published population is
+        # a durable claim about what this case study publishes, and a preview is discarded with
+        # its workspace. The sweep still executes and still registers. `_plan` stays None, which
+        # the attestation below already tests for - the same state a non-writable study leaves.
+        print(
+            f"{EXECUTION_TIER} tier: the sweep executes and registers, and publishes no "
+            f"official population under {ALLOCATION_POPULATION}."
+        )
+    else:
+        _plan = OfficialPopulation.create(
             _writable,
             name=ALLOCATION_POPULATION,
-            declared=SUPERSEDES_ALLOCATION_POPULATIONS.get(ALLOCATION_POPULATION),
-        ),
-    )
-    # Before any member executes; see `sweep_attestation_name`.
-    _attempt = open_sweep_attempt(_writable, _plan, UPSTREAM_PLANS)
-    print(
-        f"Allocation plan {ALLOCATION_POPULATION}: {_plan.hash}, {len(planned)} planned, "
-        f"attempt {_attempt}"
-    )
+            member_kind="backtest",
+            members=[row["backtest_hash"] for row in planned],
+            supersedes=population_supersedes(
+                _writable,
+                name=ALLOCATION_POPULATION,
+                declared=_supersedes_allocation_populations.get(ALLOCATION_POPULATION),
+            ),
+        )
+        # Before any member executes; see `sweep_attestation_name`.
+        _attempt = open_sweep_attempt(_writable, _plan, UPSTREAM_PLANS)
+        print(
+            f"Allocation plan {ALLOCATION_POPULATION}: {_plan.hash}, {len(planned)} planned, "
+            f"attempt {_attempt}"
+        )
 
 # %% [markdown]
 # A production run fails if any planned backtest fails. The notebook does not
@@ -428,7 +530,11 @@ add_message_title(
     "Mean and peak Sharpe for each declared allocator",
     "Bars: mean across primary-label combinations; points: strongest single one",
 )
-fig.show()
+show_with_alt(
+    fig,
+    "Horizontal bars of mean validation Sharpe for each allocator, ordered by that mean, with a "
+    "separate marker for the allocator's best single configuration.",
+)
 
 # %% [markdown]
 # ## 4. Inspect the leading allocation
@@ -511,7 +617,11 @@ add_message_title(
     "How each allocator's Sharpe moves as the basket widens",
     f"Dashed line: equal-weight baseline Sharpe {baseline_sharpe:.3f}",
 )
-fig.show()
+show_with_alt(
+    fig,
+    "One line per allocator of annualized validation Sharpe against the number of stocks selected "
+    "per rebalance, with a dashed horizontal line at the equal-weight baseline.",
+)
 
 # %% [markdown]
 # ## Key takeaways

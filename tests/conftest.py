@@ -9,13 +9,13 @@ Two modes of operation:
 import json
 import os
 import shutil
+import subprocess
 import sys
 import time
 from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
-import yaml
 
 from tests.preset_patches import _patch_presets_for_testing, _trim_label_configs
 
@@ -38,6 +38,30 @@ CASE_STUDY_IDS = [
 # Set by ``seeded_output_dir`` so the per-test restore below knows the value the
 # session deliberately installed, rather than reverting it.
 _SESSION_OUTPUT_DIR: str | None = None
+
+# The ``ML4T_OUTPUT_DIR`` this session started with, captured while this module is being
+# imported - which the rootdir conftest is, before any test module is collected and long
+# before any test body or fixture can write the variable.
+#
+# ``seeded_output_dir`` is session-scoped and used to read the *live* environment, so the
+# directory the whole session seeds and publishes was decided by whichever test happened to
+# trigger the fixture first. Every higher-scoped fixture for that test has already set up by
+# then, and ``restore_output_root`` cannot see any of them: it is function-scoped, so the
+# ``before`` it captures is taken after they ran and it faithfully restores their leak. A
+# module- or session-scoped fixture in any file that writes ``ML4T_OUTPUT_DIR`` therefore
+# handed the whole session its own ``tmp_path``, and every later consumer looked for artifacts
+# in a temp tree belonging to a finished test - "present on disk but reported missing", on a
+# test that passes when its file runs alone.
+#
+# The legitimate caller this still serves is CI, which exports ``ML4T_OUTPUT_DIR`` before
+# pytest starts (``.github/workflows/test.yml`` sets it at the workflow level). That value is
+# present at import and is what gets captured, so nothing about the CI path changes.
+_STARTING_OUTPUT_DIR: str | None = os.environ.get("ML4T_OUTPUT_DIR")
+
+
+def starting_output_dir() -> str | None:
+    """The ``ML4T_OUTPUT_DIR`` the session started with, or ``None`` where it started unset."""
+    return _STARTING_OUTPUT_DIR
 
 
 @pytest.fixture(autouse=True)
@@ -342,8 +366,13 @@ def seeded_output_dir(tmp_path_factory):
 
     With pytest-xdist, each worker gets its own subdirectory to avoid races
     on shutil.rmtree/copytree when multiple workers seed simultaneously.
+
+    The base comes from :data:`_STARTING_OUTPUT_DIR` rather than from the live environment.
+    This fixture is session-scoped and runs at whatever point the first test needing it runs,
+    so reading the environment here adopted whatever an earlier test or a higher-scoped
+    fixture had left in it - see the note beside that constant.
     """
-    base_dir = os.environ.get("ML4T_OUTPUT_DIR")
+    base_dir = _STARTING_OUTPUT_DIR
     if base_dir:
         # With xdist, append worker id to avoid races
         worker_id = os.environ.get("PYTEST_XDIST_WORKER", "")
@@ -639,6 +668,12 @@ def _restore_output_root():
     reads the committed ``case_studies/`` tree instead of the seeded output dir. This lives here
     rather than in each module because thirteen copies of it drifted apart once already.
     """
+    # `previous` is not None for the test that installs the session value. Session-scoped
+    # fixtures set up before function-scoped ones, so `seeded_output_dir` has already written
+    # the variable by the time this reads it, and the pop branch below is unreachable for that
+    # test. Measured 2026-09-15 with both module shadows removed and this file unchanged: the
+    # value survives its own first teardown and every teardown after it. A trace showing it
+    # popped was taken with a shadow still in the tree, and the pop was the shadow's.
     previous = os.environ.get("ML4T_OUTPUT_DIR")
     yield
     if previous is None:
@@ -667,3 +702,19 @@ def clean_env():
     yield os.environ
     os.environ.clear()
     os.environ.update(saved_env)
+
+
+@pytest.fixture
+def tmp_repo(tmp_path):
+    """Make a stand-in ``REPO_ROOT`` a real repository.
+
+    Stamping a notebook stores the blob it names - ``source_py_blob`` exists so that a later
+    command can fetch that blob and compare code cells, and a hash recorded without storing the
+    object names something that is not there. Storing it needs somewhere to store it, so a test
+    that stands ``REPO_ROOT`` on a directory has to stand it on a repository.
+
+    Opt in per module with ``pytestmark = pytest.mark.usefixtures("tmp_repo")`` rather than
+    autouse here, so the rest of the suite does not pay for a ``git init`` it never reads.
+    """
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True, capture_output=True)
+    return tmp_path

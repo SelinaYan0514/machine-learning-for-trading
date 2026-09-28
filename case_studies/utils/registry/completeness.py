@@ -51,11 +51,10 @@ silently reuse a partial state because the result would be misleading
 from __future__ import annotations
 
 import json
-import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
-from .specs import backtest_hash_from_parts, canonical_json, training_hash_from_spec
+from .specs import backtest_hash_from_parts, training_hash_from_spec
 from .store import (
     _backtest_dir,
     _case_dir,
@@ -66,7 +65,27 @@ from .store import (
 
 @dataclass(frozen=True)
 class PredictionCoverage:
-    """Exact expected-versus-actual prediction coverage evidence."""
+    """Exact expected-versus-actual prediction coverage evidence.
+
+    ``expected`` is the family's own target. ``_prepare_expected_keys`` builds it from the
+    fold inputs the adapter prepared, after the model's own eligibility filtering, so
+    ``complete`` here means "this run produced what it set out to produce". It does not and
+    cannot mean "this run covered the declared universe": the declared universe never enters
+    the comparison. A sequence model that narrows its own target scores ``complete`` here and
+    50.9% on :func:`notebook_contracts.measure_prediction_cross_sections`, from the same
+    predictions - measured on ``sp500_equity_option_analytics``, where all 140 members ruled
+    inadmissible carry a row here reading ``complete`` with ``n_missing = 0``.
+
+    ``status`` is stored, but a stored row can only ever read ``complete``: registration
+    raises on a partial evaluation and ``allow_partial`` defaults to False everywhere in
+    production, so the non-complete evaluations are refused before the row is written.
+    Readers should test the counts rather than the verdict, which is what
+    :func:`notebook_contracts.incompletely_registered_predictions` does - though on the
+    corpus as it stands that is a change of what is read and not of what can be seen. Every
+    count and digest here is computed against the same ``expected_keys``, so they agree with
+    ``status`` on all 6,480 rows today; they can disagree with it only on a row written by
+    something that stores a shortfall instead of refusing it.
+    """
 
     expected_key_digest: str
     actual_key_digest: str
@@ -104,6 +123,16 @@ class PredictionCoverage:
         }
 
 
+# The rendering `_canonical_key_column` implements, stamped onto every digest it produces.
+# `k1` is the rendering it implemented before it normalized temporal columns, under which a
+# `Date` rendered `2016-01-29` and a `Datetime("ms")` of the same instant rendered
+# `2016-01-29 00:00:00.000`, so the same key set digested two ways. Bump `KEY_DIGEST_RENDERING`
+# whenever `_canonical_key_column` changes what it emits, and keep the older rendering
+# reachable from `_canonical_key_column` so a digest that predates the stamp stays identifiable.
+KEY_DIGEST_RENDERING = "k2"
+LEGACY_KEY_DIGEST_RENDERING = "k1"
+
+
 def _prediction_key_columns(frame) -> tuple[str, ...]:
     columns = set(frame.columns)
     entities = [name for name in ("symbol", "product") if name in columns]
@@ -117,7 +146,12 @@ def _prediction_key_columns(frame) -> tuple[str, ...]:
     )
 
 
-def _canonical_key_frame(frame, key_columns: tuple[str, ...] | None = None):
+def _canonical_key_frame(
+    frame,
+    key_columns: tuple[str, ...] | None = None,
+    *,
+    rendering: str = KEY_DIGEST_RENDERING,
+):
     import polars as pl
 
     if not isinstance(frame, pl.DataFrame):
@@ -132,10 +166,12 @@ def _canonical_key_frame(frame, key_columns: tuple[str, ...] | None = None):
         raise ValueError(
             f"prediction coverage requires columns {sorted(required)}; missing {missing}"
         )
-    return frame.select(*(_canonical_key_column(frame, name) for name in key_columns))
+    return frame.select(
+        *(_canonical_key_column(frame, name, rendering=rendering) for name in key_columns)
+    )
 
 
-def _canonical_key_column(frame, name: str):
+def _canonical_key_column(frame, name: str, *, rendering: str = KEY_DIGEST_RENDERING):
     """One key column rendered so two frames from different paths can be joined on it.
 
     Casting a temporal column straight to String renders whatever dtype it happens to carry:
@@ -147,21 +183,103 @@ def _canonical_key_column(frame, name: str):
 
     Every temporal dtype is therefore normalized to microsecond UTC first, so the rendering
     is decided by this function rather than by which loader produced the frame.
+
+    *rendering* selects which version of that decision to apply. `k1` is what this function
+    did before it normalized, kept only so a stored digest that names no rendering can be
+    identified by recomputing it both ways rather than assumed to be one of them.
     """
     import polars as pl
 
     if name == "fold_id":
         return pl.col(name).cast(pl.Int64)
+    if rendering == LEGACY_KEY_DIGEST_RENDERING:
+        return pl.col(name).cast(pl.String)
     dtype = frame.schema[name]
     if dtype == pl.Date or isinstance(dtype, pl.Datetime):
         return pl.col(name).cast(pl.Datetime("us")).cast(pl.String).alias(name)
     return pl.col(name).cast(pl.String)
 
 
-def _key_digest(frame, key_columns: tuple[str, ...]) -> str:
+def key_digest_value(digest: str) -> str:
+    """*digest* without its rendering prefix: the part two digests are equal on."""
+    _, sep, value = str(digest).partition(":")
+    return value if sep else str(digest)
+
+
+def key_digest_rendering(digest: str, *, expected_keys=None) -> str | None:
+    """Which rendering produced *digest*, or ``None`` where that cannot be established.
+
+    A digest carrying no prefix was written before the prefix existed, and that is all it
+    says: measured across the fleet 2026-09-07, 4,303 of the 4,469 stored digests reproduce
+    under the current rendering and 166 - all `us_equities_panel`'s - under `k1`, and every
+    one of them is stored bare. Reading a bare digest as `k1` would therefore have declared
+    a rendering change on 4,303 rows where there was none, and refuse the next checkpoint
+    registered against any of them.
+
+    Pass *expected_keys* to settle it by measurement instead: the key frame is digested
+    under each known rendering and the one that reproduces *digest* is the one that produced
+    it. Where neither does, the frames hold different keys, which is a different question,
+    and this returns ``None`` rather than guessing.
+    """
+    prefix, sep, _ = str(digest).partition(":")
+    if sep:
+        return prefix
+    if expected_keys is None:
+        return None
+    for rendering in (KEY_DIGEST_RENDERING, LEGACY_KEY_DIGEST_RENDERING):
+        if key_digest_value(coverage_key_digest(expected_keys, rendering=rendering)) == str(digest):
+            return rendering
+    return None
+
+
+def coverage_key_digest(expected_keys, *, rendering: str = KEY_DIGEST_RENDERING) -> str:
+    """The coverage key digest *expected_keys* takes under *rendering*."""
+    frame = _canonical_key_frame(expected_keys, rendering=rendering)
+    return _key_digest(frame, tuple(frame.columns), rendering=rendering)
+
+
+def require_comparable_key_digests(digests, *, what: str, expected_keys=None) -> None:
+    """Refuse to treat digests from different renderings as comparable.
+
+    Two digests taken under different renderings are unequal whatever their key sets, and
+    nothing about the inequality says so - which is how a rendering change turns into a
+    silent mis-grouping rather than an error. A consumer that
+    groups predictions by their eligibility digest reports more distinct contracts than
+    exist and tells a reader that two checkpoints scored on identical rows are not
+    comparable.
+
+    Measured when #1065 was filed: grouping each registry by the stored digest against one
+    uniform rendering split one set in sp500_options, one in us_firm_characteristics and two
+    in cme_futures, and nothing raised - the guard at the consumer only rejects a group whose
+    members disagree on `n_expected`, `n_actual` or `n_folds`, and the split halves agree on
+    all three.
+
+    Only renderings that can be established are compared. A digest that names none and that
+    *expected_keys* cannot identify makes no claim, and refusing on it would refuse the
+    whole fleet as written today.
+    """
+    renderings = sorted(
+        {
+            rendering
+            for digest in digests
+            if digest
+            for rendering in (key_digest_rendering(str(digest), expected_keys=expected_keys),)
+            if rendering is not None
+        }
+    )
+    if len(renderings) > 1:
+        raise ValueError(
+            f"{what} spans coverage-key renderings {renderings}, so its digests cannot be "
+            "compared: two digests taken under different renderings are unequal whatever "
+            "their key sets. Re-register the rows written under the older rendering, or "
+            "compare within one rendering."
+        )
+
+
+def _key_digest(frame, key_columns: tuple[str, ...], rendering: str = KEY_DIGEST_RENDERING) -> str:
     from case_studies.utils.artifact_digest import value_digest
 
-    return value_digest(frame, key_columns)
+    return f"{rendering}:{value_digest(frame, key_columns)}"
 
 
 def evaluate_prediction_coverage(expected_keys, predictions) -> PredictionCoverage:
@@ -469,8 +587,19 @@ def backtest_run_status(
 
         has_metrics = False
         if require_metrics:
+            # A NULL sharpe means "no metric pass has run here" everywhere except one
+            # case: a path the engine stopped at ruin registers every ranking metric as
+            # NULL on purpose, so that nothing sorts a bankrupt account against a solvent
+            # one. Reading that as incomplete would re-run the
+            # backtest on every pass and never converge, so `ruin` is what separates
+            # them. `ruin` is absent from a registry written before that column existed,
+            # in which case a NULL sharpe still means unmeasured.
+            has_ruin = "ruin" in {
+                row[1] for row in db.execute("PRAGMA table_info(backtest_metrics)").fetchall()
+            }
+            measured = "sharpe IS NOT NULL OR ruin = 1.0" if has_ruin else "sharpe IS NOT NULL"
             m_row = db.execute(
-                "SELECT sharpe FROM backtest_metrics WHERE backtest_hash = ? AND sharpe IS NOT NULL",
+                f"SELECT sharpe FROM backtest_metrics WHERE backtest_hash = ? AND ({measured})",
                 (b_hash,),
             ).fetchone()
             has_metrics = m_row is not None

@@ -21,7 +21,6 @@ import json
 import os
 import platform
 import shutil
-import subprocess
 import time
 import uuid
 import warnings
@@ -59,30 +58,31 @@ from case_studies.research.cv import (
 from case_studies.research.identity import ResolvedSpec
 from case_studies.research.models import ModelRun
 from case_studies.research.recovery import ExecutionAttempt, ExecutionLedger
-from case_studies.research.results import PredictionResult, Result, TrainingResult
+from case_studies.research.results import TrainingResult
 from case_studies.utils.artifact_digest import value_digest
 from case_studies.utils.derived_params import quantize_derived
 from case_studies.utils.folds import (
     FOLD_PREPARATION_VERSION,
+    # Unreferenced here and load-bearing. `tests/test_fold_seed_coupling.py` asserts
+    # `gbm.fold_seed is fold_seed` for each of the six modules that seed a fold, so this
+    # import IS this module's declared address for the shared definition. gbm reaches the
+    # derivation through `_subsample_index` rather than calling it at a seeding line, so
+    # nothing in this file references the name and F401 reports it.
+    fold_seed,  # noqa: F401
     prepare_gbm_folds_from_mds,
     training_labels_for_split,
 )
-from case_studies.utils.registry import prediction_hash_from_parts, training_hash_from_spec
+from case_studies.utils.registry import training_hash_from_spec
 from case_studies.utils.registry.specs import canonical_json
-from case_studies.utils.runtime import cpu_seconds, resource_measurement
-from utils.modeling import RANDOM_SEED, seed_everything
+from case_studies.utils.runtime import cpu_seconds, resource_measurement, source_commit
+from utils.modeling import RANDOM_SEED
 
 if TYPE_CHECKING:
     from case_studies.research.workspace import Study
 
 
-_GBM_PREVIEW_FIELDS = {
-    "checkpoint_interval",
-    "folds",
-    "max_iterations",
-    "max_symbols",
-    "train_sample_frac",
-}
+from case_studies.utils.preview_fields import GBM_PREVIEW_FIELDS as _GBM_PREVIEW_FIELDS
+
 _GBM_REQUEST_FIELDS = {
     "checkpoint_interval",
     "device",
@@ -126,7 +126,7 @@ class _GBMBatchCandidate:
     training: TrainingResult | None = None
     ledger: ExecutionLedger | None = None
     attempt: ExecutionAttempt | None = None
-    frames: list[pl.DataFrame] = field(default_factory=list)
+    shards: list[Path] = field(default_factory=list)
     reused_folds: list[int] = field(default_factory=list)
     fitted_folds: list[int] = field(default_factory=list)
     fit_elapsed_s: float = 0.0
@@ -261,6 +261,13 @@ GBM_RUNNER_VERSION = 1
 # on the ordering of a feature and routes a missing value down its own branch, so both would only
 # fabricate observations. Bump when that casting changes.
 GBM_PREPROCESSING_ID = "lightgbm-native-float32/v1"
+
+# The object a registered GBM run fits, recorded as `computation.model.class` and declared by
+# every `config/lgb/*.yaml` preset so the configuration catalog a notebook prints names the same
+# thing the registry does. It is the native Booster, not the `LGBMRegressor` that `create_model`
+# builds for callers outside the registered path - a distinction the catalog's blank `model_class`
+# column used to hide from the reader.
+GBM_MODEL_CLASS = "lightgbm.Booster"
 
 
 def _best_gpu_device(library: str) -> str | None:
@@ -649,174 +656,6 @@ def _extract_feature_importance(
 # ---------------------------------------------------------------------------
 
 
-def prepare_gbm_folds(
-    dataset_pd,
-    splits: list[dict[str, Any]],
-    feature_names: list[str],
-    label_col: str,
-    date_col: str,
-    entity_col: str = "symbol",
-    task_type: str = "regression",
-    class_values: list | None = None,
-    temporal_by_fold=None,
-    temporal_keys: list[str] | None = None,
-    temporal_feature_names: list[str] | None = None,
-    train_sample_frac: float = 1.0,
-    eval_label_col: str | None = None,
-    seed: int = RANDOM_SEED,
-) -> list[dict[str, Any]]:
-    """Prepare CV fold data for GBM training.
-
-    Unlike linear folds, GBM folds:
-    - Use float32 (LightGBM native precision)
-    - No imputation or scaling (GBM handles NaN natively)
-    - Include remapped labels for classification (0-indexed for LightGBM)
-
-    Parameters
-    ----------
-    dataset_pd : pandas DataFrame
-        Full dataset.
-    splits : list[dict]
-        Walk-forward splits.
-    feature_names : list[str]
-        Feature column names.
-    label_col, date_col, entity_col : str
-        Column names.
-    task_type : str
-        "regression" or "classification".
-    class_values : list, optional
-        Sorted unique class values for classification.
-    temporal_by_fold : pd.DataFrame, optional
-        Per-fold temporal features with a 'fold' column.
-    temporal_keys : list[str], optional
-        Join keys for temporal features.
-    temporal_feature_names : list[str], optional
-        Temporal feature column names to replace per fold.
-    train_sample_frac : float, optional
-        Fraction of training rows to keep per fold (1.0 = keep all).
-        Walk-forward CV structure is preserved (date ranges unchanged);
-        only the within-fold row density is reduced. Validation set is
-        NEVER sampled — OOS IC is always computed on the full val slice.
-        Seed is tied to fold_id for reproducibility. Use < 1.0 for
-        memory/compute-constrained runs on large datasets (e.g.,
-        nasdaq100 minute bars). Default 1.0.
-    eval_label_col : str, optional
-        Continuous return used for classification IC. The discrete label
-        remains the fitting target and is retained as ``y_val``.
-    seed : int
-        Base seed for optional within-fold training subsampling.
-
-    Returns
-    -------
-    list[dict]
-        Each dict has: fold, X_train, y_train, y_train_lgb, X_val, y_val,
-        y_val_lgb, dates, entities, n_train, n_val.
-    """
-    from utils.modeling import replace_temporal_columns
-
-    dates_series = dataset_pd[date_col]
-    entity_series = dataset_pd.get(entity_col)
-    is_classification = task_type == "classification" and class_values
-    has_fold_temporal = temporal_by_fold is not None and temporal_keys and temporal_feature_names
-
-    folds = []
-    for split in splits:
-        fold_id = split["fold"]
-        train_mask = (dates_series >= split["train_start"]) & (dates_series <= split["train_end"])
-        val_start = split.get("val_start", split.get("test_start"))
-        val_end = split.get("val_end", split.get("test_end"))
-        val_mask = (dates_series >= val_start) & (dates_series <= val_end)
-
-        if has_fold_temporal:
-            assert temporal_by_fold is not None
-            assert temporal_keys is not None
-            assert temporal_feature_names is not None
-            train_rows = replace_temporal_columns(
-                dataset_pd,
-                train_mask,
-                temporal_by_fold,
-                temporal_keys,
-                temporal_feature_names,
-                fold_id,
-            )
-            val_rows = replace_temporal_columns(
-                dataset_pd,
-                val_mask,
-                temporal_by_fold,
-                temporal_keys,
-                temporal_feature_names,
-                fold_id,
-            )
-            X_train = train_rows[feature_names].values.astype(np.float32)
-            y_train = train_rows[label_col].values.astype(np.float32)
-            X_val = val_rows[feature_names].values.astype(np.float32)
-            y_val = val_rows[label_col].values.astype(np.float32)
-            y_eval = val_rows[eval_label_col].values.astype(np.float32) if eval_label_col else None
-            val_dates = val_rows[date_col].values
-            del train_rows, val_rows
-        else:
-            X_train = dataset_pd.loc[train_mask, feature_names].values.astype(np.float32)
-            y_train = dataset_pd.loc[train_mask, label_col].values.astype(np.float32)
-            X_val = dataset_pd.loc[val_mask, feature_names].values.astype(np.float32)
-            y_val = dataset_pd.loc[val_mask, label_col].values.astype(np.float32)
-            y_eval = (
-                dataset_pd.loc[val_mask, eval_label_col].values.astype(np.float32)
-                if eval_label_col
-                else None
-            )
-            val_dates = dataset_pd.loc[val_mask, date_col].values
-
-        # Drop NaN labels
-        tv = ~np.isnan(y_train)
-        vv = ~np.isnan(y_val)
-        X_train, y_train = X_train[tv], y_train[tv]
-        X_val, y_val = X_val[vv], y_val[vv]
-        if y_eval is not None:
-            y_eval = y_eval[vv]
-        val_dates = val_dates[vv]
-        val_entities = (
-            dataset_pd.loc[val_mask, entity_col].values[vv] if entity_series is not None else None
-        )
-
-        # Optional train subsample (never touch val — OOS IC uses full val slice).
-        # Seed is tied to fold_id for reproducibility.
-        if 0.0 < train_sample_frac < 1.0 and len(X_train) > 0:
-            n_keep = max(1, int(len(X_train) * train_sample_frac))
-            rng = np.random.default_rng(seed + fold_id)
-            keep_idx = rng.choice(len(X_train), size=n_keep, replace=False)
-            keep_idx.sort()  # preserve row order
-            X_train = X_train[keep_idx]
-            y_train = y_train[keep_idx]
-
-        # Classification: remap labels to 0-indexed for LightGBM
-        if is_classification:
-            assert class_values is not None
-            y_train_lgb, _ = _remap_labels_for_lgb(y_train.astype(int), class_values)
-            y_val_lgb, _ = _remap_labels_for_lgb(y_val.astype(int), class_values)
-        else:
-            y_train_lgb = y_train
-            y_val_lgb = y_val
-
-        folds.append(
-            {
-                "fold": split["fold"],
-                "X_train": X_train,
-                "y_train": y_train,
-                "y_train_lgb": y_train_lgb,
-                "X_val": X_val,
-                "y_val": y_val,
-                "y_val_lgb": y_val_lgb,
-                "y_eval": y_eval,
-                "dates": val_dates,
-                "entities": val_entities,
-                "n_train": len(X_train),
-                "n_val": len(X_val),
-            }
-        )
-
-    return folds
-
-
 def _checkpoint_metrics_from_predictions(
     predictions: list[dict[str, Any]],
     checkpoints: list[int] | tuple[int, ...],
@@ -1033,7 +872,7 @@ def train_gbm_config(
     config : dict
         Preset dict with config_name, params, max_iterations, checkpoint_interval.
     fold_data : list[dict]
-        From prepare_gbm_folds().
+        From prepare_gbm_folds_from_mds().
     feature_names : list[str]
         For feature importance extraction.
     device : str
@@ -1492,15 +1331,7 @@ def _gbm_runtime_identity() -> dict[str, str]:
 def _gbm_runtime_provenance(
     study: Study, device: str, *, notebook: str | None = None
 ) -> dict[str, Any]:
-    try:
-        commit = subprocess.check_output(
-            ["git", "-C", str(study.release_root), "rev-parse", "HEAD"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=5,
-        ).strip()
-    except (OSError, subprocess.SubprocessError):
-        commit = "unknown"
+    commit = source_commit(study.release_root)
     lock_path = study.release_root / "uv.lock"
     record: dict[str, Any] = {
         "device": device,
@@ -1702,7 +1533,7 @@ def _load_gbm_batch_base(
     study: Study,
     request: dict[str, Any],
     *,
-    inputs: tuple[Any, Any, Any] | None = None,
+    inputs: tuple[Any, Any] | None = None,
 ) -> dict[str, Any]:
     from utils.modeling import load_modeling_dataset
 
@@ -1720,9 +1551,8 @@ def _load_gbm_batch_base(
     if inputs is None:
         label_ref = study.labels.get(request["label"], execution_tier=tier)
         mds = load_modeling_dataset(study.case_study, label_ref.name, max_symbols=max_symbols)
-        dataset_pd = mds.dataset.to_pandas()
     else:
-        label_ref, mds, dataset_pd = inputs
+        label_ref, mds = inputs
     if mds.date_col != "timestamp" or not mds.entity_cols:
         raise ValueError("GBM runner requires timestamp and an entity key")
     entity_col = mds.entity_cols[0]
@@ -1743,7 +1573,6 @@ def _load_gbm_batch_base(
     return {
         "label_ref": label_ref,
         "mds": mds,
-        "dataset_pd": dataset_pd,
         "splits": splits,
         "cv_record": cv_record,
         "expected": _gbm_expected_keys_from_dataset(mds, splits),
@@ -1793,7 +1622,7 @@ def _build_gbm_resolved_request(
         },
         "cv": base["cv_record"],
         "model": {
-            "class": "lightgbm.Booster",
+            "class": GBM_MODEL_CLASS,
             "implementation": "lightgbm",
             "effective_params_by_fold": effective,
             "huber_alpha_scale": config.get("huber_alpha_scale"),
@@ -2154,26 +1983,12 @@ def reconstruct_locked_request(
             split,
             mds.temporal_by_fold,
             source_timeline=mds.dataset.get_column(mds.date_col),
+            declared_folds=mds.temporal_artifact_splits,
             date_col=mds.date_col,
         )
     expected = _gbm_expected_keys_from_dataset(mds, [split])
     validate_locked_expected_keys(spec, expected)
-    folds = prepare_gbm_folds(
-        mds.dataset.to_pandas(),
-        [split],
-        mds.feature_names,
-        mds.label_col,
-        mds.date_col,
-        entity_col,
-        task_type=mds.task_type,
-        class_values=mds.class_values,
-        temporal_by_fold=mds.temporal_by_fold,
-        temporal_keys=mds.temporal_keys,
-        temporal_feature_names=mds.temporal_feature_names,
-        train_sample_frac=1.0,
-        eval_label_col=mds.eval_label_col,
-        seed=RANDOM_SEED,
-    )
+    folds = prepare_gbm_folds_from_mds(mds, [split], train_sample_frac=1.0, seed=RANDOM_SEED)
     if len(folds) != 1 or not folds[0]["n_train"] or not folds[0]["n_val"]:
         raise ValueError("locked GBM holdout fold could not be prepared")
     if not isinstance(model, dict):
@@ -2496,7 +2311,16 @@ def _gbm_fold_prediction_shard(entries: list[dict[str, Any]], context: GBMContex
 def _fit_or_reuse_gbm_fold(
     candidate: _GBMBatchCandidate,
     fold: dict[str, Any],
-) -> tuple[pl.DataFrame, bool, float]:
+) -> tuple[Path, bool, float]:
+    """Fit one fold of one configuration, and return the shard it is persisted in.
+
+    Returning the path rather than the frame is what bounds the group. Fold-major execution
+    holds one prepared fold and fits every configuration in the compatibility group against it,
+    so a returned frame is retained until that configuration finishes - which is after the last
+    fold, for every configuration at once. A nasdaq fold shard is 1.75 GB in memory, and a
+    fifteen-configuration group over two folds accumulated 52 GB of frames that were already
+    on disk.
+    """
     assert candidate.spec is not None
     assert candidate.context is not None
     assert candidate.training is not None
@@ -2514,7 +2338,7 @@ def _fit_or_reuse_gbm_fold(
         prediction_shard=shard,
         resolved_settings=settings,
     ):
-        return pl.read_parquet(shard), True, 0.0
+        return shard, True, 0.0
 
     started = time.perf_counter()
     staging = training_dir / f".fold_{fold_id}.{uuid.uuid4().hex}.tmp"
@@ -2564,7 +2388,7 @@ def _fit_or_reuse_gbm_fold(
         )
     finally:
         shutil.rmtree(staging, ignore_errors=True)
-    return frame, False, time.perf_counter() - started
+    return shard, False, time.perf_counter() - started
 
 
 def _write_gbm_training_manifest(training: TrainingResult, fold_ids: tuple[int, ...]) -> None:
@@ -2585,33 +2409,32 @@ def _write_gbm_training_manifest(training: TrainingResult, fold_ids: tuple[int, 
         temporary.unlink(missing_ok=True)
 
 
-def _gbm_curves_from_shards(
+def _gbm_checkpoint_curve(
     config_name: str,
-    predictions: pl.DataFrame,
-    checkpoints: tuple[int, ...],
-) -> list[dict[str, Any]]:
-    target = "eval_actual" if "eval_actual" in predictions.columns else "actual"
-    curves = []
-    for checkpoint in checkpoints:
-        frame = predictions.filter(pl.col("checkpoint") == checkpoint)
-        metric = cross_sectional_ic(
-            frame,
-            frame,
-            pred_col="prediction",
-            ret_col=target,
-            date_col="timestamp",
-            entity_col="symbol",
-            min_obs=5,
-        )
-        curves.append(
-            {
-                "config": config_name,
-                "iteration": checkpoint,
-                "ic_mean": float(metric["ic_mean"]),
-                "ic_std": float(metric.get("ic_std", 0.0)),
-            }
-        )
-    return curves
+    checkpoint: int,
+    frame: pl.DataFrame,
+) -> dict[str, Any]:
+    """One learning-curve point, from that checkpoint's predictions alone.
+
+    Taking one checkpoint's frame rather than the whole prediction set is what lets the caller
+    publish and score a checkpoint, release it, and move to the next.
+    """
+    target = "eval_actual" if "eval_actual" in frame.columns else "actual"
+    metric = cross_sectional_ic(
+        frame,
+        frame,
+        pred_col="prediction",
+        ret_col=target,
+        date_col="timestamp",
+        entity_col="symbol",
+        min_obs=5,
+    )
+    return {
+        "config": config_name,
+        "iteration": checkpoint,
+        "ic_mean": float(metric["ic_mean"]),
+        "ic_std": float(metric.get("ic_std", 0.0)),
+    }
 
 
 def _write_gbm_runtime_fields(path: Path, **fields: float) -> None:
@@ -2693,7 +2516,7 @@ def _reuse_gbm_batch_fold(candidate: _GBMBatchCandidate, fold_id: int) -> bool:
         resolved_settings=_gbm_fold_settings(candidate, fold_id),
     ):
         return False
-    candidate.frames.append(pl.read_parquet(shard))
+    candidate.shards.append(shard)
     candidate.reused_folds.append(fold_id)
     return True
 
@@ -2705,11 +2528,11 @@ def _run_gbm_batch_fold(candidate: _GBMBatchCandidate, fold: dict[str, Any]) -> 
     if fold_id in candidate.reused_folds or fold_id in candidate.fitted_folds:
         return
     try:
-        frame, reused, elapsed = _fit_or_reuse_gbm_fold(candidate, fold)
+        shard, reused, elapsed = _fit_or_reuse_gbm_fold(candidate, fold)
     except Exception as exc:
         _fail_gbm_batch_candidate(candidate, exc)
         return
-    candidate.frames.append(frame)
+    candidate.shards.append(shard)
     candidate.fit_elapsed_s += elapsed
     (candidate.reused_folds if reused else candidate.fitted_folds).append(fold_id)
 
@@ -2747,19 +2570,28 @@ def _finish_gbm_batch_candidate(study: Study, candidate: _GBMBatchCandidate) -> 
     assert candidate.training is not None
     assert candidate.attempt is not None
     try:
-        if len(candidate.frames) != len(candidate.context.fold_ids):
+        if len(candidate.shards) != len(candidate.context.fold_ids):
             raise RuntimeError(
-                f"GBM candidate produced {len(candidate.frames)} of "
+                f"GBM candidate produced {len(candidate.shards)} of "
                 f"{len(candidate.context.fold_ids)} fold shards"
             )
         _write_gbm_training_manifest(candidate.training, candidate.context.fold_ids)
-        predictions = pl.concat(candidate.frames).sort("checkpoint", "symbol", "timestamp", "fold")
         prediction_results = []
+        curves = []
         checkpoints = tuple(
             int(item["value"]) for item in candidate.spec["computation"]["checkpoint_schedule"]
         )
+        # One checkpoint at a time, read back from the fold shards this configuration already
+        # persisted. Concatenating every fold and then filtering held the whole prediction set
+        # plus a copy of the slice; a nasdaq configuration is 3.5 GB whole and 0.35 GB a slice.
         for checkpoint in checkpoints:
-            frame = predictions.filter(pl.col("checkpoint") == checkpoint).drop("checkpoint")
+            frame = (
+                pl.scan_parquet(candidate.shards)
+                .filter(pl.col("checkpoint") == checkpoint)
+                .drop("checkpoint")
+                .sort("symbol", "timestamp", "fold")
+                .collect()
+            )
             prediction_results.append(
                 study.results.publish_predictions(
                     candidate.training,
@@ -2774,6 +2606,9 @@ def _finish_gbm_batch_candidate(study: Study, candidate: _GBMBatchCandidate) -> 
                     label=candidate.spec["label"],
                 )
             )
+            curves.append(_gbm_checkpoint_curve(candidate.spec["config_name"], checkpoint, frame))
+            del frame
+        gc.collect()
         curves_path = (
             candidate.training.root
             / "run_log"
@@ -2781,7 +2616,6 @@ def _finish_gbm_batch_candidate(study: Study, candidate: _GBMBatchCandidate) -> 
             / candidate.training.hash
             / "learning_curves.parquet"
         )
-        curves = _gbm_curves_from_shards(candidate.spec["config_name"], predictions, checkpoints)
         _write_learning_curves(curves_path, curves)
         diagnostics = {
             "cache_hit": False,
@@ -2923,18 +2757,24 @@ def plan_model_requests(
 
     ordered: list[dict[str, Any] | None] = [None] * len(requests)
     planned_groups = []
-    input_cache: dict[tuple[str, str, int], tuple[Any, Any, Any]] = {}
+    # One entry, not a growing dict. The cache is here so two compatibility groups over the same
+    # inputs read the panel once; keeping every group's panel instead is what made a multi-label
+    # plan carry one modeling dataset per label to the end of the run. Measured 2026-09-10 on
+    # nasdaq100_microstructure, one `load_modeling_dataset` per label with nothing released:
+    # 6.71, 12.65, 18.41, 22.53 GiB resident and a 35.79 GiB peak, before a single fit.
+    cached_input_key: tuple[str, str, int] | None = None
+    cached_inputs: tuple[Any, Any] | None = None
     for key, indexed_requests in groups.items():
         input_key = _gbm_input_compatibility_key(indexed_requests[0][1])
+        if cached_input_key != input_key:
+            # Released before the next panel is read, so the two are never alive together.
+            cached_input_key, cached_inputs = None, None
         base = _load_gbm_batch_base(
             study,
             indexed_requests[0][1],
-            inputs=input_cache.get(input_key),
+            inputs=cached_inputs,
         )
-        input_cache.setdefault(
-            input_key,
-            (base["label_ref"], base["mds"], base["dataset_pd"]),
-        )
+        cached_input_key, cached_inputs = input_key, (base["label_ref"], base["mds"])
         mds = base["mds"]
         placeholder_folds = tuple({"fold": int(split["fold"])} for split in base["splits"])
         planned_candidates = {}
@@ -2968,6 +2808,14 @@ def plan_model_requests(
             ordered[index] = spec
             planned_candidates[index] = (config, effective, device, max_bin, num_threads)
         planned_groups.append((key, indexed_requests, base, planned_candidates))
+        # The payload outlives planning by the whole length of the run, and `mds` is by far the
+        # largest thing in `base`. `run_model_plan` reloads this group's panel when it reaches
+        # the group and drops it again afterwards, so one is alive at a time instead of one per
+        # group. Nothing else planning derived is rebuilt - the splits, the expected keys and
+        # the provenance in `base` are the planned ones - so no identity can move.
+        mds = None
+        base["mds"] = None
+    cached_input_key, cached_inputs = None, None
     if any(spec is None for spec in ordered):
         raise RuntimeError("GBM batch planner did not resolve every request")
     return tuple(spec for spec in ordered if spec is not None), tuple(planned_groups)
@@ -2979,6 +2827,21 @@ def run_model_plan(study: Study, payload: tuple[Any, ...]) -> tuple[ModelRun, ..
     ]
     failures = []
     for key, indexed_requests, base, planned_candidates in payload:
+        if base.get("mds") is None:
+            # Planning dropped it rather than carry every group's panel to the end of the run.
+            # One reload per group - a scan - against one modeling dataset per label held for
+            # the length of a multi-label call.
+            from utils.modeling import load_modeling_dataset
+
+            request = indexed_requests[0][1]
+            tier = ExecutionTier(request["execution_tier"])
+            study.require_writable()
+            study.activate(tier)
+            base["mds"] = load_modeling_dataset(
+                study.case_study,
+                base["label_ref"].name,
+                max_symbols=int(dict(request["preview_reductions"]).get("max_symbols", 0)),
+            )
         try:
             candidates = _run_gbm_batch_group(
                 study,
@@ -2991,6 +2854,9 @@ def run_model_plan(study: Study, payload: tuple[Any, ...]) -> tuple[ModelRun, ..
         except Exception as error:
             failures.append(error)
             continue
+        finally:
+            # Whatever the group did, its panel goes now: the next group loads its own.
+            base["mds"] = None
         for candidate in candidates:
             if candidate.error is not None:
                 failures.append(candidate.error)
@@ -3012,18 +2878,21 @@ def run_model_requests(study: Study, requests: list[dict[str, Any]]) -> tuple[Mo
 
     ordered: list[ModelRun | None] = [None] * len(requests)
     failures = []
-    input_cache: dict[tuple[str, str, int], tuple[Any, Any, Any]] = {}
+    # One entry, not a growing dict - see `plan_model_requests`. A dict keyed by input holds
+    # every label's panel to the end of the call; measured at 22.53 GiB over four labels on
+    # nasdaq100_microstructure, before a single fit.
+    cached_input_key: tuple[str, str, int] | None = None
+    cached_inputs: tuple[Any, Any] | None = None
     for key, indexed_requests in groups.items():
         input_key = _gbm_input_compatibility_key(indexed_requests[0][1])
+        if cached_input_key != input_key:
+            cached_input_key, cached_inputs = None, None
         base = _load_gbm_batch_base(
             study,
             indexed_requests[0][1],
-            inputs=input_cache.get(input_key),
+            inputs=cached_inputs,
         )
-        input_cache.setdefault(
-            input_key,
-            (base["label_ref"], base["mds"], base["dataset_pd"]),
-        )
+        cached_input_key, cached_inputs = input_key, (base["label_ref"], base["mds"])
         candidates = _run_gbm_batch_group(
             study,
             indexed_requests,
@@ -3166,30 +3035,11 @@ def validate_locked_run(
         record["checkpoint_value"],
     ) != (context.prediction_split, "iteration", selected[0]):
         raise ValueError("locked GBM run published the wrong checkpoint")
-    published = prediction.load().sort("symbol", "timestamp", "fold")
+    prediction.load()
     model_dir = run.training.root / "run_log" / "training" / run.training.hash / "models"
     if not _valid_gbm_model_dir(model_dir, context):
         raise ValueError("locked GBM fitted-state manifest does not validate")
-    reconstructed = _gbm_prediction_frame(
-        _predict_from_gbm_models(model_dir, spec, context)["predictions"],
-        selected[0],
-        context,
-    )
-    key_columns = ["symbol", "timestamp", "fold"]
-    value_columns = ["prediction", "actual"]
-    if "eval_actual" in published.columns or "eval_actual" in reconstructed.columns:
-        if "eval_actual" not in published.columns or "eval_actual" not in reconstructed.columns:
-            raise ValueError("locked GBM fitted state changed the prediction schema")
-        value_columns.append("eval_actual")
-    if not reconstructed.select(key_columns).equals(
-        published.select(key_columns)
-    ) or not np.allclose(
-        reconstructed.select(value_columns).to_numpy(),
-        published.select(value_columns).to_numpy(),
-        rtol=1e-12,
-        atol=1e-12,
-        equal_nan=False,
-    ):
-        raise ValueError("locked GBM fitted state does not reproduce published predictions")
+    # See the same removal in deep_learning.validate_locked_run. Removed here too so the three
+    # families record their locked runs the same way: booster digests, not a re-scored panel.
     manifest = json.loads((model_dir / "manifest.json").read_text())
     return hashlib.sha256(canonical_json(manifest).encode()).hexdigest()

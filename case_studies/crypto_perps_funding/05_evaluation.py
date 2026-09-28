@@ -57,7 +57,6 @@
 # %%
 """Evaluate crypto financial and temporal features on canonical validation folds."""
 
-import warnings
 from datetime import timedelta
 
 import matplotlib.pyplot as plt
@@ -74,12 +73,13 @@ from case_studies.utils.feature_engineering import (
     families_from_config,
     quantile_profile,
 )
+from case_studies.utils.warning_policy import apply_notebook_warning_policy
 from utils.cv_splits import load_evaluation_config
-from utils.modeling import fold_temporal_frame, load_modeling_dataset
+from utils.modeling import load_modeling_dataset
 from utils.paths import get_case_study_dir
 from utils.style import COLORS, add_message_title, show_with_alt
 
-warnings.filterwarnings("ignore")
+apply_notebook_warning_policy()
 
 # %% tags=["parameters"]
 MAX_SYMBOLS = 0
@@ -140,10 +140,10 @@ print(f"redundancy threshold {REDUNDANCY_CUT} and {N_QUANTILES} groups per settl
 # Two constraints follow, and together they fix which rows may be scored.
 #
 # First, the five features from notebook 04 are themselves model output: a volatility model and a
-# regime model are fitted inside each fold's training block and then run forward. A row therefore
-# has a different value for those five columns depending on which fold you are in, and it is out
-# of sample only in the fold whose training block ended before it. So each row enters exactly
-# once, carrying the version of those columns belonging to the fold that tests it.
+# regime model are fitted on a walk-forward refit schedule and run forward from each estimate.
+# A settlement therefore carries one value for those five columns, computed from parameters
+# estimated strictly before it, whichever fold later tests it. Each row still enters exactly
+# once, selected by the validation window it falls in.
 #
 # Second, a feature scored at time `t` is scored against the return realized by `t` plus eight
 # hours. Reading a return that lands inside the holdout would spend the holdout on a diagnostic.
@@ -157,32 +157,29 @@ financial_cols = [name for name in financial.columns if name not in JOIN_COLS]
 temporal_cols = mds.temporal_feature_names
 
 assert set(mds.feature_names) == set(financial_cols) | set(temporal_cols)
-assert mds.temporal_by_fold is not None
+# A settlement carries one value for the model-based columns, so the loader joins them onto
+# the panel once and there is no per-fold frame to substitute from. A non-None value here would
+# mean the artifact still carries a fold column, and every value below would depend on which
+# fold read it.
+assert mds.temporal_by_fold is None, (
+    "the loader found a fold-keyed model-based artifact, so notebook 04 still writes a fold column"
+)
 
-symbols = mds.dataset["symbol"].unique().to_list()
-base_frame = mds.dataset.select([*JOIN_COLS, *financial_cols, mds.label_col])
-# Selected one fold at a time inside the loop, so the artifact is never held whole.
+base_frame = mds.dataset.select([*JOIN_COLS, *financial_cols, *temporal_cols, mds.label_col])
 
 validation_frames = []
 for split in mds.splits:
-    base = base_frame.filter(
+    frame = base_frame.filter(
         pl.col("timestamp").is_between(split["val_start"], split["val_end"], closed="both")
-    )
-    fold_temporal = (
-        fold_temporal_frame(mds.temporal_by_fold, int(split["fold"]))
-        .filter(pl.col("symbol").is_in(symbols))
-        .select([*JOIN_COLS, *temporal_cols])
-        .with_columns(pl.col("timestamp").cast(base.schema["timestamp"]))
-        .unique(subset=JOIN_COLS)
-    )
-    frame = base.join(fold_temporal, on=JOIN_COLS, how="left").with_columns(
-        pl.lit(split["fold"]).alias("cv_fold")
-    )
+    ).with_columns(pl.lit(split["fold"]).alias("cv_fold"))
     validation_frames.append(frame)
 
 eval_panel = pl.concat(validation_frames).sort(["timestamp", "symbol"])
+# `generate_cv_splits` lays the validation windows end to end, so concatenating them cannot
+# claim a settlement twice. Checked rather than assumed: a duplicate would weight one
+# settlement twice in every correlation below.
 assert eval_panel.select(JOIN_COLS).is_duplicated().sum() == 0
-assert eval_panel.columns == [*JOIN_COLS, *financial_cols, mds.label_col, *temporal_cols, "cv_fold"]
+assert eval_panel.columns == [*JOIN_COLS, *financial_cols, *temporal_cols, mds.label_col, "cv_fold"]
 
 holdout_start = (
     pl.Series([load_evaluation_config(CASE_STUDY_ID)["holdout_start"]])
@@ -237,7 +234,7 @@ cross_section = (
 )
 thin = cross_section.filter(pl.col("perpetuals") < MIN_CROSS_SECTION)
 
-fig, ax = plt.subplots(figsize=(10, 4))
+fig, ax = plt.subplots(figsize=(10, 4), layout="tight")
 ax.fill_between(
     cross_section["timestamp"].to_list(),
     cross_section["perpetuals"].to_list(),
@@ -446,7 +443,9 @@ def contiguous_segments(series: pl.DataFrame) -> list[pl.DataFrame]:
     return [part.drop("_segment") for part in marked.partition_by("_segment", maintain_order=True)]
 
 
-fig, axes = plt.subplots(len(series_features), 1, figsize=(10, 7), sharex=True, sharey=True)
+fig, axes = plt.subplots(
+    len(series_features), 1, figsize=(10, 7), sharex=True, sharey=True, layout="tight"
+)
 for ax, feature in zip(axes, series_features, strict=True):
     stats = ic_results[feature]
     half_width = 1.96 * stats["hac_se"]
@@ -494,7 +493,7 @@ show_with_alt(
 # %%
 FOLD_FEATURES_SHOWN = 12
 fold_features = [name for name in eval_summary_ordering if name in fold_stats][:FOLD_FEATURES_SHOWN]
-fig, ax = plt.subplots(figsize=(10, 6))
+fig, ax = plt.subplots(figsize=(10, 6), layout="tight")
 for row, feature in enumerate(reversed(fold_features)):
     per_fold = (
         ic_timeseries[feature].group_by("cv_fold").agg(pl.col("ic").mean()).sort("cv_fold")["ic"]
@@ -586,7 +585,7 @@ print(f"largest average score: {leading['mean_ic']:.3f} on {leading['feature']}"
 
 # %%
 top_ic = eval_summary.head(20).sort("mean_ic")
-fig, ax = plt.subplots(figsize=(10, 7))
+fig, ax = plt.subplots(figsize=(10, 7), layout="tight")
 bar_colors = [COLORS["blue"] if value else COLORS["amber"] for value in top_ic["fdr_sig"]]
 ax.barh(top_ic["feature"].to_list(), top_ic["mean_ic"].to_list(), color=bar_colors)
 ax.axvline(0, color=COLORS["neutral"], linewidth=0.8)
@@ -622,7 +621,7 @@ show_with_alt(
 
 # %%
 limit = 1.1 * max(eval_summary["naive_t"].abs().max(), eval_summary["hac_t"].abs().max())
-fig, ax = plt.subplots(figsize=(7, 7))
+fig, ax = plt.subplots(figsize=(7, 7), layout="tight")
 ax.scatter(
     eval_summary["naive_t"].to_list(),
     eval_summary["hac_t"].to_list(),
@@ -736,7 +735,7 @@ if too_coarse:
     print(f"too few distinct values to split at any settlement: {', '.join(too_coarse)}")
 
 # %%
-fig, axes = plt.subplots(2, 3, figsize=(12, 7), sharex=True)
+fig, axes = plt.subplots(2, 3, figsize=(12, 7), sharex=True, layout="tight")
 for ax, feature in zip(axes.flat, shape_features, strict=False):
     profile = quantile_profiles[feature]
     bins = range(1, len(profile["mean"]) + 1)
@@ -808,7 +807,10 @@ sample_dates = (
     .sort()
     .gather_every(max(1, eval_panel["timestamp"].n_unique() // 200))
 )
-correlation_sample = eval_panel.filter(pl.col("timestamp").is_in(sample_dates))
+# `implode` because polars deprecated `is_in` against a Series of the same dtype as
+# ambiguous: it cannot tell "is this value one of those" from an element-wise compare.
+# Imploding says which was meant. Verified to select the same rows.
+correlation_sample = eval_panel.filter(pl.col("timestamp").is_in(sample_dates.implode()))
 high_corr_pairs = []
 for left_idx, left in enumerate(rankable):
     for right in rankable[left_idx + 1 :]:
@@ -827,7 +829,7 @@ print(f"measured on {len(sample_dates)} sampled settlements")
 pair_plot = high_corr_pairs[:20][::-1]
 pair_labels = [f"{left} / {right}" for left, right, _ in pair_plot]
 pair_values = [value for _, _, value in pair_plot]
-fig, ax = plt.subplots(figsize=(11, 8))
+fig, ax = plt.subplots(figsize=(11, 8), layout="tight")
 ax.barh(
     pair_labels,
     pair_values,

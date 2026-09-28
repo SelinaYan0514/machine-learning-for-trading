@@ -24,7 +24,7 @@ This section gives readers the conceptual bridge from single trees to GBMs. It e
 
 - [`01_ensemble_foundations`](01_ensemble_foundations.ipynb) — Benchmarks RF vs XGBoost/LightGBM/CatBoost on the Chen-Pelger-Zhu academic firm characteristics panel; quantifies the GBM-over-bagging advantage and the small spread across boosting libraries. _Runtime: ~6 min._
 
-### 12.2 The Workhorse: Gradient Boosting Machines
+### 12.2 Gradient Boosting Machines
 
 This is the operational core of the chapter. It explains the shared boosting framework, why GBMs fit tabular financial data so well, and how XGBoost, LightGBM, and CatBoost differ in regularization, speed, categorical handling, GPU behavior, and deployment tradeoffs. It also moves beyond library comparison into decisions practitioners actually face: when ranking matters more than point forecasts, when monotonic constraints improve robustness, and why native feature importance is not enough.
 
@@ -54,7 +54,7 @@ This section positions explainability as part of the model workflow rather than 
 - [`10_shap_nlp_sentiment`](10_shap_nlp_sentiment.ipynb) — SHAP token-level attribution on FinBERT sentiment classification; GPU recommended for transformer inference.
 - [`11_conformal_gbm`](11_conformal_gbm.ipynb) — Conformal prediction intervals for GBM regression (split conformal, QR-conformal, CQR) with empirical coverage diagnostics.
 
-### 12.6 GBMs Across Nine Asset Classes
+### 12.6 Case Study Insights
 
 This section provides the empirical payoff for the chapter. Instead of treating GBMs as abstract best practice, it shows where they help across the book's case studies, where linear models still win, which losses and tree sizes tend to work, how horizon and label design can matter as much as model class, and why validation results remain fragile without holdout confirmation. It gives the chapter its most concrete message: nonlinear models often help, but the real edge often comes from matching model, label, horizon, and evaluation design.
 
@@ -67,23 +67,26 @@ This section provides the empirical payoff for the chapter. Instead of treating 
 uv run python 12_gradient_boosting/<notebook>.py
 
 # Test mode (reduced data via Papermill)
-uv run pytest tests/test_notebooks.py -v -k "12_gradient_boosting"
+uv run pytest tests/test_chapter_notebooks.py -v -k "12_gradient_boosting"
 ```
 
 ## References
 
-- **Tianqi Chen and Carlos Guestrin** (2016). [XGBoost: A Scalable Tree Boosting System](https://doi.org/10.1145/2939672.2939785). *Proceedings of the 22nd ACM SIGKDD International Conference on Knowledge Discovery and Data Mining - KDD '16*.
-- **Nick Erickson et al.** (2020). [AutoGluon-Tabular: Robust and Accurate AutoML for Structured Data](https://arxiv.org/abs/2003.06505).
-- **Nick Erickson et al.** (2025). [TabArena: A Living Benchmark for Tabular Prediction](https://arxiv.org/abs/2501.02474).
-- **Jerome H. Friedman** (2001). [Greedy Function Approximation: A Gradient Boosting Machine](https://doi.org/10.1214/aos/1013203451). *The Annals of Statistics*.
-- **Yury Gorishniy et al.** (2024). [TabR: Tabular Deep Learning Meets Nearest Neighbors](https://arxiv.org/abs/2307.14338).
-- **Yury Gorishniy et al.** (2025). [TabM: Advancing Tabular Deep Learning with Parameter-Efficient Ensembling](https://arxiv.org/abs/2410.24210).
-- **Léo Grinsztajn et al.** (2025). [Scaling TabPFN: Sketching and Feature Selection for Tabular Prior-Data Fitted Networks](https://arxiv.org/abs/2501.02945).
-- **Noah Hollmann et al.** (2025). [Accurate Predictions on Small Data with a Tabular Foundation Model](https://doi.org/10.1038/s41586-024-08328-6). *Nature*.
 - **David Holzmüller et al.** (2024). [Better by Default: Strong Pre-Tuned MLPs and Boosted Trees on Tabular Data](https://doi.org/10.48550/arXiv.2407.04491).
 - **Guolin Ke et al.** (2017). [LightGBM: A Highly Efficient Gradient Boosting Decision Tree](https://papers.nips.cc/paper_files/paper/2017/hash/6449f44a102fde848669bdd9eb6b76fa-Abstract.html). *Curran Associates, Inc.*.
+- **Ivan Rubachev et al.** (2024). [TabReD: Analyzing Pitfalls and Filling the Gaps in Tabular Deep Learning Benchmarks](https://arxiv.org/abs/2406.19380).
+- **James O'Donovan and Gloria Yang Yu** (2024). [A Transaction Cost Perspective on Option Anomalies](https://doi.org/10.2139/ssrn.4806038).
+- **Jerome H. Friedman** (2001). [Greedy Function Approximation: A Gradient Boosting Machine](https://doi.org/10.1214/aos/1013203451). *The Annals of Statistics*.
+- **Leo Breiman** (2001). Statistical Modeling: The Two Cultures.
+- **Leo Breiman** (2001). [Random Forests](https://doi.org/http://dx.doi.org.prx.library.gatech.edu/10.1023/A:1010933404324). *Machine Learning; Dordrecht*.
+- **Liudmila Prokhorenkova et al.** (2019). [CatBoost: unbiased boosting with categorical features](http://arxiv.org/abs/1706.09516). *arXiv:1706.09516 [cs]*.
+- **Léo Grinsztajn et al.** (2025). [Scaling TabPFN: Sketching and Feature Selection for Tabular Prior-Data Fitted Networks](https://arxiv.org/abs/2501.02945).
+- **Nick Erickson et al.** (2020). [AutoGluon-Tabular: Robust and Accurate AutoML for Structured Data](https://arxiv.org/abs/2003.06505).
+- **Nick Erickson et al.** (2025). [TabArena: A Living Benchmark for Tabular Prediction](https://arxiv.org/abs/2501.02474).
+- **Noah Hollmann et al.** (2025). [Accurate Predictions on Small Data with a Tabular Foundation Model](https://doi.org/10.1038/s41586-024-08328-6). *Nature*.
 - **Scott M Lundberg et al.** (2017). [A Unified Approach to Interpreting Model Predictions](http://papers.nips.cc/paper/7062-a-unified-approach-to-interpreting-model-predictions.pdf). *Curran Associates, Inc.*.
 - **Scott M. Lundberg et al.** (2020). [From Local Explanations to Global Understanding with Explainable AI for Trees](https://doi.org/10.1038/s42256-019-0138-9). *Nature Machine Intelligence*.
-- **Liudmila Prokhorenkova et al.** (2019). [CatBoost: unbiased boosting with categorical features](http://arxiv.org/abs/1706.09516). *arXiv:1706.09516 [cs]*.
-- **Ivan Rubachev et al.** (2024). [TabReD: Analyzing Pitfalls and Filling the Gaps in Tabular Deep Learning Benchmarks](https://arxiv.org/abs/2406.19380).
+- **Tianqi Chen and Carlos Guestrin** (2016). [XGBoost: A Scalable Tree Boosting System](https://doi.org/10.1145/2939672.2939785). *Proceedings of the 22nd ACM SIGKDD International Conference on Knowledge Discovery and Data Mining - KDD '16*.
+- **Yury Gorishniy et al.** (2024). [TabR: Tabular Deep Learning Meets Nearest Neighbors](https://arxiv.org/abs/2307.14338).
+- **Yury Gorishniy et al.** (2025). [TabM: Advancing Tabular Deep Learning with Parameter-Efficient Ensembling](https://arxiv.org/abs/2410.24210).
 - **Ziyu Ye et al.** (2024). [TALENT: A Tabular Analytics and Learning Toolkit](https://openreview.net/forum?id=VhiUcSmK4a).

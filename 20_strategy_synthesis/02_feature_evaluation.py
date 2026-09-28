@@ -19,7 +19,8 @@
 # **Docker image**: `ml4t`
 #
 # Each case study runs an FDR-controlled triage pass on its candidate
-# feature menu (Ch8 §8.5), classifying every feature as PROCEED, REVISE,
+# feature menu (Ch7 §7.3 sets the triage gates, §7.4 the FDR control),
+# classifying every feature as PROCEED, REVISE,
 # or STOP. This notebook reads those nine ledgers side by side and asks
 # whether feature-level survival predicts strategy-level survival once
 # the rest of the pipeline runs.
@@ -36,18 +37,15 @@
 # %%
 """Ch20 Feature Evaluation — cross-case-study triage ledger comparison."""
 
-import warnings
-
 import matplotlib.pyplot as plt
 import numpy as np
 import polars as pl
 from IPython.display import Markdown, display
 
-warnings.filterwarnings("ignore")
-
 from case_studies.utils.analytics import CASE_STUDY_IDS, SHORT_NAMES, load_triage_ledger
+from case_studies.utils.strategy_analysis import rank_one
 from utils.paths import REPO_ROOT, get_chapter_dir
-from utils.style import show_with_alt
+from utils.style import COLORS, show_with_alt
 
 # %% tags=["parameters"]
 MAX_CASE_STUDIES = 0  # 0 = all available
@@ -109,15 +107,18 @@ panel = pl.concat(
 #
 # A feature earns PROCEED by either of two independent routes, recorded in the
 # ledger's `note`: it clears Benjamini-Hochberg at the level above
-# (`fdr_significant`), or its IC is large enough and holds its sign across
-# enough folds (`stable_and_above_threshold`) without clearing BH. The second
+# (`fdr_significant`), or its IC clears that case study's own effect-size floor
+# and holds its sign across enough folds (`stable_and_above_threshold`) without
+# clearing BH. The floor is set per case study, from 0.003 to 0.01 in absolute
+# mean IC, so the second route is calibrated to each market rather than shared
+# across them. The second
 # route exists because BH over a menu of dozens of correlated features is a
 # blunt instrument at these sample sizes, and a feature can be worth carrying
 # forward on effect size and stability alone.
 #
 # PROCEED is therefore a union of the two routes, not a narrowing of the first.
-# A case study can and does show more PROCEED features than FDR-significant
-# ones, so the three counts below are drawn side by side rather than stacked -
+# A case study can show more PROCEED features than FDR-significant ones, so the
+# three counts below are drawn side by side rather than stacked -
 # stacking them would assert a nesting that does not hold.
 
 # %%
@@ -153,9 +154,9 @@ fig, ax = plt.subplots(figsize=(9, 5))
 y = np.arange(funnel.height)
 height = 0.26
 series = [
-    ("n_candidate", "candidates", "lightgrey"),
-    ("n_fdr_sig", f"clears BH-FDR at {FDR_ALPHA:.2f}", "#9ecae1"),
-    ("n_proceed", "PROCEED", "#3182bd"),
+    ("n_candidate", "candidates", COLORS["silver_muted"]),
+    ("n_fdr_sig", f"clears BH-FDR at {FDR_ALPHA:.2f}", COLORS["blue_light"]),
+    ("n_proceed", "PROCEED", COLORS["blue"]),
 ]
 for offset, (col, label, color) in zip((-height, 0.0, height), series):
     ax.barh(
@@ -164,7 +165,7 @@ for offset, (col, label, color) in zip((-height, 0.0, height), series):
         height=height,
         color=color,
         label=label,
-        edgecolor="black",
+        edgecolor=COLORS["neutral"],
         linewidth=0.4,
     )
 ax.set_yticks(y)
@@ -173,7 +174,6 @@ ax.invert_yaxis()
 ax.set_xlabel("Number of features")
 ax.set_title("Candidate features, FDR-significant, and PROCEED, by case study")
 ax.legend(loc="lower right", frameon=False)
-fig.tight_layout()
 show_with_alt(
     fig,
     "Grouped horizontal bars per case study giving the candidate feature count, "
@@ -183,9 +183,13 @@ show_with_alt(
 )
 
 # %% [markdown]
-# The same triage protocol, applied to nine different markets, produces very
-# different survival rates. The summary below is computed from the table above
-# rather than typed, so it cannot drift from the ledgers as they are regenerated.
+# The nine case studies share the triage structure, and the two columns are
+# comparable to different degrees. The BH-FDR share is recomputed here from each
+# ledger's stored p-values at one `FDR_ALPHA`, so it is on a common scale. The
+# PROCEED share is read from each ledger's own decision, taken at that case
+# study's own effect-size floor and sign-consistency minimum, so it is not. The
+# summary below is computed from the table above rather than typed, so it cannot
+# drift from the ledgers as they are regenerated.
 
 # %% tags=["results"]
 _f = funnel.sort("pct_fdr_sig", descending=True)
@@ -194,6 +198,7 @@ _top = _f.row(0, named=True)
 _pr = funnel.sort("pct_proceed", descending=True)
 _hi, _lo = _pr.row(0, named=True), _pr.row(-1, named=True)
 _stab = funnel["n_proceed_by_stability"].sum()
+_total_proceed = funnel["n_proceed"].sum()
 display(
     Markdown(
         f"Across {funnel.height} case studies, the share of candidate features "
@@ -209,7 +214,7 @@ display(
         f"({_lo['cs_short']}, {_lo['n_proceed']} of {_lo['n_candidate']}) to "
         f"{_hi['pct_proceed']:.1f} percent ({_hi['cs_short']}, "
         f"{_hi['n_proceed']} of {_hi['n_candidate']}). "
-        f"Of {funnel['n_proceed'].sum()} PROCEED decisions in total, {_stab} "
+        f"Of {_total_proceed} PROCEED decisions in total, {_stab} "
         "were reached on effect size and fold stability without clearing BH, "
         "which is why the PROCEED bars are not contained inside the FDR bars."
     )
@@ -263,7 +268,12 @@ for ax, ycol, ylabel in zip(
 ):
     pts = forward.filter(pl.col(ycol).is_not_null()).to_pandas()
     ax.scatter(
-        pts["pct_proceed"], pts[ycol], color="#3182bd", s=40, edgecolor="black", linewidth=0.5
+        pts["pct_proceed"],
+        pts[ycol],
+        color=COLORS["blue"],
+        s=40,
+        edgecolor=COLORS["neutral"],
+        linewidth=0.5,
     )
     for _, row in pts.iterrows():
         ax.annotate(
@@ -273,11 +283,10 @@ for ax, ycol, ylabel in zip(
             xytext=(4, 3),
             textcoords="offset points",
         )
-    ax.axhline(0, color="grey", linestyle="--", linewidth=0.7)
+    ax.axhline(0, color=COLORS["neutral"], linestyle="--", linewidth=0.7)
     ax.set_xlabel("% candidate features in PROCEED")
     ax.set_ylabel(ylabel)
 fig.suptitle("Feature survival against strategy Sharpe, by case study")
-fig.tight_layout()
 show_with_alt(
     fig,
     "Two scatter panels plotting each case study's percentage of PROCEED "
@@ -289,8 +298,12 @@ show_with_alt(
 # %% tags=["results"]
 _paired = forward.filter(pl.col("holdout_sharpe").is_not_null())
 _absent = forward.filter(pl.col("holdout_sharpe").is_null())["cs_short"].to_list()
+# rank_one, not a one-key sort: the case study this picks is named in the sentence below,
+# so a tie on holdout Sharpe would publish whichever row the join happened to emit first.
 _best = (
-    _paired.sort("holdout_sharpe", descending=True).row(0, named=True) if _paired.height else None
+    rank_one(_paired, by="holdout_sharpe", name="cs_short").row(0, named=True)
+    if _paired.height
+    else None
 )
 display(
     Markdown(
@@ -320,10 +333,12 @@ display(
 # %% [markdown]
 # ## Takeaways
 #
-# - The same triage protocol yields very different survival rates across the
-#   nine markets. The numbers are in the computed summary above; what they show
-#   is that the protocol does not transfer a fixed pass rate from one asset class
-#   to the next, so a rate is only interpretable next to the market it came from.
+# - The nine case studies share the triage structure but not all of its
+#   parameters. The BH-FDR column is re-thresholded here at one alpha and can be
+#   compared across markets; the PROCEED column carries each case study's own
+#   effect-size floor, which spans a factor of three, so a difference in PROCEED
+#   rate is a difference in market and in floor together and cannot be assigned
+#   to either alone.
 # - PROCEED is a union of two routes, BH significance and effect-size-plus-fold-
 #   stability. Reading it as a stricter version of BH significance inverts the
 #   relationship and inflates how selective the screen appears.

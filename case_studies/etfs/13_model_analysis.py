@@ -58,11 +58,7 @@
 # %%
 """Compare every registered ETF model family on one panel, without selecting among them."""
 
-import warnings
-from pathlib import Path
-
 import numpy as np
-import pandas as pd
 import plotly.graph_objects as go
 import polars as pl
 import yaml
@@ -86,7 +82,6 @@ from case_studies.utils.model_viz import (
     plot_cv_timeline,
     plot_feature_importance_heatmap,
     plot_fold_boxplot,
-    plot_fold_heatmap,
     plot_label_horizon_forest,
     plot_learning_curves,
     plot_regime_bars,
@@ -99,10 +94,11 @@ from case_studies.utils.notebook_render import (
     selection_adjusted_leader_table,
 )
 from case_studies.utils.registry import load_prediction_index
+from case_studies.utils.warning_policy import apply_notebook_warning_policy
 from utils.paths import get_case_study_dir
 from utils.style import COLORS, show_plotly_with_alt, show_with_alt
 
-warnings.filterwarnings("ignore")
+apply_notebook_warning_policy()
 
 # %% tags=["parameters"]
 CASE_STUDY = "etfs"
@@ -113,7 +109,8 @@ N_BUCKETS = 10
 TOP_N_FEATURES = 15
 REGIME_WINDOW = 63
 # Both names stay bound here although nothing below reads them: that is what makes the harness
-# force preview and supply a workspace (`tests/pm_helpers.py:954`). Without them the canonical
+# force preview and supply a workspace - `_declares_tier_and_workspace` in `tests/pm_helpers.py`
+# looks for exactly this pair. Without them the canonical
 # branch regenerates in place, which needs symlinks a CI checkout does not have.
 EXECUTION_TIER = "canonical"
 WORKSPACE: str = ""
@@ -336,10 +333,10 @@ if best_preds.height > 0 and fold_ranges.height > 0:
 
 # %% [markdown]
 # Each fold trains on a fixed 10-year rolling window and validates on the
-# year that follows it. The folds are numbered in reverse-chronological
-# order: fold 0 validates the most recent pre-holdout year (2023) and
-# fold 7 the earliest (2016), with the 10-year training window sliding
-# back accordingly. The holdout period (2024 onwards) is never used for
+# year that follows it. The folds are numbered chronologically: fold 0
+# validates the earliest year (2016) and fold 7 the most recent
+# pre-holdout year (2023), with the 10-year training window sliding
+# forward accordingly. The holdout period (2024 onwards) is never used for
 # model selection.
 #
 # Because the window is a fixed 10 years rather than expanding, every fold
@@ -1247,20 +1244,34 @@ if causal is not None:
 # ### Calibration: Are Prediction Intervals Honest?
 #
 # Point IC tells us whether the ranking is correct on average; it says
-# nothing about whether the model's *uncertainty* is well calibrated.
-# Inductive split-conformal prediction (Vovk et al., 2005; Lei et al.,
-# 2018) gives a distribution-free check: using fold-0 absolute residuals
-# as a calibration set, the symmetric quantile $\hat{q}_{1-\alpha}$
-# defines an interval $[\hat{y} - \hat{q}, \hat{y} + \hat{q}]$ that
-# should cover the true label at rate $1-\alpha$ on the remaining folds.
-# Empirical coverage materially below the nominal level signals
-# overconfident residual scaling: the model is more wrong, more often,
-# than its training-time spread suggests. Width is reported as a
-# fraction of the actuals' standard deviation so families with different
-# return scales are comparable; smaller width at matched coverage means
-# tighter, more useful intervals. See Ch12 §12.6 / `11_conformal_gbm`
-# for the full conformal toolkit (CQR, ACI). What we report here is the
-# minimal residual-calibration diagnostic.
+# nothing about whether the model's *uncertainty* is well calibrated. The
+# width measured here is the one the `conformal_weighted` allocator sizes
+# positions with: calibrated per symbol on every absolute residual known at
+# `t - h`, where `h` is this label's horizon in data steps, falling back to a
+# quantile pooled over every symbol where one has too few residuals of its
+# own. A decision is covered when its absolute residual falls inside that
+# half-width, and `n_uncalibrated` counts the decisions that cleared no
+# warm-up and that no coverage figure describes.
+#
+# Empirical coverage materially below the nominal level signals overconfident
+# residual scaling - the model is more wrong, more often, than its
+# training-time spread suggests. Width is reported as a fraction of the
+# standard deviation of the outcomes it was measured against, so families with
+# different return scales are comparable; smaller width at matched coverage
+# means tighter, more useful intervals.
+#
+# Read it as a diagnostic of residual dispersion rather than a guarantee.
+# Split conformal's finite-sample coverage (Vovk et al., 2005; Lei et al.,
+# 2018) requires the calibration and evaluation scores to be exchangeable and
+# return residuals are not, and nothing in the allocation path reads an
+# interval or a coverage level - the width stands in for a volatility
+# estimate. See Ch12 §12.6 / `11_conformal_gbm` for the full conformal toolkit
+# (CQR, ACI).
+#
+# Each row is the family's highest-IC configuration for the primary label.
+# That is a model-level ranking and not the funnel's - every selection stage
+# ranks on validation backtest Sharpe - and it is used here because this
+# diagnostic runs before any backtest exists to rank.
 
 # %%
 conformal_etfs = conformal_coverage_diagnostic(

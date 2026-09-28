@@ -13,7 +13,7 @@ The chapter explains why market data cannot be treated as a neutral price series
 
 ## Sections
 
-### 3.1 Microstructure: The DNA of Price Formation
+### 3.1 How Microstructure Impacts Price Formation
 
 This section explains why market data cannot be treated as a neutral price series. It shows how spreads, depth, resiliency, order types, and intraday trading regimes shape both execution quality and the meaning of observed trades and quotes. For readers building trading systems, this is the section that turns "price data" into an economic object with frictions, incentives, and timing effects.
 
@@ -54,7 +54,7 @@ This section separates the continuous and jump components of intraday returns us
 
 - [`18_algoseek_jump_detection`](18_algoseek_jump_detection.ipynb) — Decomposes daily realized variance into continuous (bipower) and jump components on AlgoSeek minute bars; applies the Lee–Mykland nonparametric test to time individual jumps with a multiple-testing-correct critical value; compares with a naive |z|>4 rule that misses most jumps because a single daily volatility ignores time-of-day shape; emits a per-symbol-day jump-feature panel.
 
-### 3.6 Data Quality and Sessionization
+### 3.6 Microstructure Data Quality and Sessionization
 
 This section focuses on intraday failure modes that quietly corrupt research: sequencing errors, timestamp confusion, stale quotes, invalid book transitions, bad qualifiers, and session-boundary mistakes. It is especially useful because it frames data quality as invariants and auditability rather than generic cleaning, giving readers a practical QA mindset for microstructure work.
 
@@ -65,7 +65,7 @@ This section focuses on intraday failure modes that quietly corrupt research: se
 uv run python 03_market_microstructure/<notebook>.py
 
 # Test mode (reduced data via Papermill)
-uv run pytest tests/test_notebooks.py -v -k "03_market_microstructure"
+uv run pytest tests/test_chapter_notebooks.py -v -k "03_market_microstructure"
 ```
 
 ### Memory requirements
@@ -88,25 +88,28 @@ Most notebooks complete in under a minute. The only long-running notebook is the
 
 ## References
 
-- **Matteo Aquilina et al.** (2021). [Quantifying the High-Frequency Trading “Arms Race”](https://doi.org/10.3386/w29011).
-- **Rama Cont et al.** (2014). [The Price Impact of Order Book Events](https://doi.org/10.1093/jjfinec/nbt003). *Journal of Financial Econometrics*.
-- **David Easley et al.** (2012). [The Volume Clock: Insights into the High Frequency Paradigm](https://doi.org/10.2139/ssrn.2034858).
-- **David Easley et al.** (2021). [Microstructure in the Machine Age](https://doi.org/10.1093/rfs/hhaa078). *The Review of Financial Studies*.
-- **Lawrence R. Glosten and Paul R. Milgrom** (1985). [Bid, ask and transaction prices in a specialist market with heterogeneously informed traders](https://doi.org/10.1016/0304-405X(85)90044-3). *Journal of Financial Economics*.
-- **Martin D. Gould et al.** (2013). [Limit Order Books](http://arxiv.org/abs/1012.0349). *arXiv:1012.0349 [physics, q-fin]*.
-- **Nikolaus Hautsch and Ruihong Huang** (2012). [The market impact of a limit order](https://doi.org/10.1016/j.jedc.2011.09.012). *Journal of Economic Dynamics and Control*.
+- **Albert S. Kyle** (1985). [Continuous Auctions and Insider Trading](https://doi.org/10.2307/1913210). *Econometrica*.
+- **Ananth Madhavan** (2002). [Market Microstructure: A Practitioner's Guide](https://www.jstor.org/stable/4480415). *Financial Analysts Journal*.
+- **Ananth Madhavan et al.** (1997). [Why Do Security Prices Change? A Transaction-Level Analysis of NYSE Stocks](https://www.jstor.org/stable/2962338). *The Review of Financial Studies*.
+- **Andy Novocin and Bruce Weber** (2022). [Emerging Technologies and the Transformation of Exchange Trading Platforms](https://doi.org/10.3905/jpm.2022.1.390). *The Journal of Portfolio Management*.
+- **Charles M. C. Lee and Mark J. Ready** (1991). [Inferring Trade Direction from Intraday Data](https://doi.org/10.1111/j.1540-6261.1991.tb02683.x). *The Journal of Finance*.
 - **Craig W. Holden et al.** (2014). [The Empirical Analysis of Liquidity](https://doi.org/10.1561/0500000044). *Foundations and Trends® in Finance*.
 - **Craig W. Holden et al.** (2023). [In the Blink of an Eye: Exchange-to-SIP Latency and Trade Classification Accuracy](https://doi.org/10.2139/ssrn.4441422).
-- **Albert S. Kyle** (1985). [Continuous Auctions and Insider Trading](https://doi.org/10.2307/1913210). *Econometrica*.
-- **Charles M. C. Lee and Mark J. Ready** (1991). [Inferring Trade Direction from Intraday Data](https://doi.org/10.1111/j.1540-6261.1991.tb02683.x). *The Journal of Finance*.
-- **Ananth Madhavan et al.** (1997). [Why Do Security Prices Change? A Transaction-Level Analysis of NYSE Stocks](https://www.jstor.org/stable/2962338). *The Review of Financial Studies*.
-- **Ananth Madhavan** (2002). [Market Microstructure: A Practitioner's Guide](https://www.jstor.org/stable/4480415). *Financial Analysts Journal*.
-- **Andy Novocin and Bruce Weber** (2022). [Emerging Technologies and the Transformation of Exchange Trading Platforms](https://doi.org/10.3905/jpm.2022.1.390). *The Journal of Portfolio Management*.
+- **David Easley et al.** (2012). [The Volume Clock: Insights into the High Frequency Paradigm](https://doi.org/10.2139/ssrn.2034858).
+- **David Easley et al.** (2021). [Microstructure in the Machine Age](https://doi.org/10.1093/rfs/hhaa078). *The Review of Financial Studies*.
+- **Joel Hasbrouck and Gideon Saar** (2013). [Low-Latency Trading](https://doi.org/10.2139/ssrn.1695460).
+- **Lawrence R. Glosten and Paul R. Milgrom** (1985). [Bid, ask and transaction prices in a specialist market with heterogeneously informed traders](https://doi.org/10.1016/0304-405X(85)90044-3). *Journal of Financial Economics*.
+- **Marcos Lopez de Prado** (2018). Advances in Financial Machine Learning. *John Wiley & Sons*.
+- **Martin D. Gould et al.** (2013). [Limit Order Books](http://arxiv.org/abs/1012.0349). *arXiv:1012.0349 [physics, q-fin]*.
+- **Martin Reck** (2022). [Market Design—A Practitioner’s Perspective](https://doi.org/10.3905/jpm.2022.1.383). *The Journal of Portfolio Management*.
+- **Matteo Aquilina et al.** (2021). [Quantifying the High-Frequency Trading “Arms Race”](https://doi.org/10.3386/w29011).
 - **Maureen O'Hara** (2011). Market Microstructure Theory. *Wiley*.
 - **Maureen O’Hara** (2015). [High frequency market microstructure](https://doi.org/10.1016/j.jfineco.2015.01.003). *Journal of Financial Economics*.
-- **Marcos Lopez de Prado** (2018). Advances in Financial Machine Learning. *John Wiley & Sons*.
-- **Martin Reck** (2022). [Market Design—A Practitioner’s Perspective](https://doi.org/10.3905/jpm.2022.1.383). *The Journal of Portfolio Management*.
-- **SEC** (2020). [Staff Report on Algorithmic Trading in U.S. Capital Markets](https://www.sec.gov/file/staff-report-algorithmic-trading-us-capital-markets).
+- **Nikolaus Hautsch and Ruihong Huang** (2012). [The market impact of a limit order](https://doi.org/10.1016/j.jedc.2011.09.012). *Journal of Economic Dynamics and Control*.
+- **Ole E. Barndorff-Nielsen and Neil Shephard** (2004). [Econometric Analysis of Realized Covariation: High Frequency Based Covariance, Regression, and Correlation in Financial Economics](https://doi.org/10.1111/j.1468-0262.2004.00515.x). *Econometrica*.
+- **Rama Cont et al.** (2014). [The Price Impact of Order Book Events](https://doi.org/10.1093/jjfinec/nbt003). *Journal of Financial Econometrics*.
 - **Robert A. Schwartz et al.** (2022). [Equity Market Structure and the Persistence of Unsolved Problems: A Microstructure Perspective](https://doi.org/10.3905/jpm.2022.1.384). *The Journal of Portfolio Management*.
-- **Zihao Zhang et al.** (2019). [DeepLOB: Deep Convolutional Neural Networks for Limit Order Books](https://doi.org/10.1109/TSP.2019.2907260). *IEEE Transactions on Signal Processing*.
+- **SEC** (2020). [Staff Report on Algorithmic Trading in U.S. Capital Markets](https://www.sec.gov/file/staff-report-algorithmic-trading-us-capital-markets).
+- **Suzanne S. Lee and Per A. Mykland** (2008). [Jumps in Financial Markets: A New Nonparametric Test and Jump Dynamics](https://doi.org/10.1093/rfs/hhm056). *The Review of Financial Studies*.
 - **Yichi Zhang et al.** (2025). [ClusterLOB: Enhancing Trading Strategies by Clustering Orders in Limit Order Books](https://doi.org/10.48550/arXiv.2504.20349).
+- **Zihao Zhang et al.** (2019). [DeepLOB: Deep Convolutional Neural Networks for Limit Order Books](https://doi.org/10.1109/TSP.2019.2907260). *IEEE Transactions on Signal Processing*.

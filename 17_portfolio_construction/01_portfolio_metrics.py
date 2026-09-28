@@ -18,8 +18,9 @@
 #
 # **Docker image**: `ml4t`
 #
-# This notebook demonstrates comprehensive portfolio performance analysis using
-# `ml4t-diagnostic` as a modern Plotly-based replacement for pyfolio. The strategy
+# `ml4t-diagnostic` computes the risk-return metrics, drawdown episodes and
+# benchmark-relative statistics a portfolio report is built from, and replaces the
+# unmaintained pyfolio. The strategy
 # under analysis is the highest-validation-Sharpe ETF allocation backtest as recorded in
 # `case_studies/etfs/run_log/registry.db` - resolved at runtime via
 # `resolve_best_backtest_runs(...)` so the metrics always reflect the current
@@ -36,7 +37,7 @@
 # - Compare strategy performance against benchmarks (alpha, beta, IR)
 # - Perform event analysis during market stress periods
 #
-# **Book Reference**: Chapter 17, Section 17.3 (Portfolio Evaluation Metrics)
+# **Book Reference**: Chapter 17, Section 17.3 (Portfolio evaluation metrics)
 #
 # **Prerequisites**: The ETF case study (`case_studies/etfs/`) must have been run
 # to produce `run_log/backtest/<hash>/daily_returns.parquet`.
@@ -46,9 +47,6 @@
 
 import hashlib
 import json
-import warnings
-
-warnings.filterwarnings("ignore")
 
 import numpy as np
 import pandas as pd
@@ -80,13 +78,22 @@ from case_studies.utils.registry.queries import resolve_best_backtest_runs
 from data import load_etfs
 from utils.paths import get_case_study_dir, get_output_dir
 from utils.reproducibility import set_global_seeds
-from utils.style import COLORS
+from utils.style import COLORS, show_plotly_with_alt
+
+# %% [markdown]
+# Five settings decide what is analysed. `BACKTEST_HASH` left unset means the notebook picks the
+# strategy from the case study's registry rather than naming one: it takes the allocation-stage
+# backtest with the highest validation Sharpe on the 21-session forward-return target, so the
+# analysis follows whatever that case study currently produces instead of a hash that goes stale
+# the next time it is rebuilt. Setting it to a twelve-character hash pins one instead.
+#
+# `BENCHMARK_SYMBOL` is what alpha, beta and the capture ratios are measured against, and it has
+# to be something the strategy could plausibly have been held instead of - SPY, a broad US equity
+# fund, for a strategy allocating across US-listed ETFs. `ETF_LABEL` names the target the
+# case study's models predicted, which is what makes the registry lookup unambiguous when a case
+# study fits more than one.
 
 # %% tags=["parameters"]
-# Production defaults - Papermill overrides for CI testing.
-# BACKTEST_HASH = None lets the notebook resolve the highest-validation-Sharpe allocation backtest
-# from registry.db at runtime; pass a specific 12-char hash via Papermill to pin
-# the strategy under analysis (useful for deterministic CI testing).
 BACKTEST_HASH = None
 BENCHMARK_SYMBOL = "SPY"
 ETF_CASE_STUDY = "etfs"
@@ -107,7 +114,7 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 # `prediction_hash` or `backtest_hash`, the notebook queries
 # `registry.db` via `resolve_best_backtest_runs()` and selects the allocation-stage
 # run with the highest validation Sharpe. The strategy is therefore whatever
-# the current case-study pipeline considers the best ETF allocator on real OOS
+# the current case-study pipeline ranks first among ETF allocators on real OOS
 # data; see `case_studies/etfs/run_log/backtest/<hash>/spec.json` for its full
 # specification. The backtest artifact already includes its registered commission,
 # slippage, and next-bar execution assumptions; this notebook does not subtract costs again.
@@ -204,29 +211,64 @@ print(
 print(f"Benchmark: {BENCHMARK_SYMBOL}, {len(spy_returns):,} days")
 
 # %% [markdown]
-# ## 2. PortfolioAnalysis Overview
+# ## 2. Setting up the analysis
 #
-# The `PortfolioAnalysis` class provides a unified interface for portfolio analysis.
+# Every metric below is computed from the same three inputs - the strategy's daily returns, the
+# benchmark's, and the dates they fall on - so they are bound once here rather than passed
+# separately to each function. Two of the arguments are choices rather than data.
+#
+# The **risk-free rate** is what gets subtracted before a ratio is taken. It is set to zero here,
+# which makes every Sharpe and Sortino below an excess-return-over-cash figure only to the extent
+# that cash paid nothing; over a window covering 2022-23 it did not, so these ratios are
+# marginally flattering. Applying the same rate to the benchmark does **not** leave the comparison
+# unchanged. Sharpe is $(\mu - r_f)/\sigma$, so raising the rate by $\Delta$ costs each series
+# $\Delta/\sigma$ - and that is *larger* for the series with the smaller volatility. The steadier
+# of the two loses more of its ratio, which is what can reorder them: a low-volatility series
+# ranked first at $r_f = 0$ can fall behind a more volatile one once a realistic cash rate is
+# subtracted from both. Sortino is not invariant either, and it is not a plain division:
+# `periodic_sortino_ratio` measures downside deviation on returns *after* subtracting the rate, so
+# raising the rate shrinks the numerator and grows the denominator at the same time. It still only
+# ever moves the ratio down - that holds for a strategy earning less than cash too, where the
+# numerator is negative and both effects might have been expected to fight - but by an amount that
+# is not $\Delta$ over anything, so read the two ratios' sensitivities as different in kind rather
+# than assuming Sharpe's arithmetic carries over. What a common rate does leave alone is the
+# information ratio, which is computed on
+# active returns - the difference between the two series, from which any rate applied to both
+# cancels before the ratio is taken.
+#
+# **Periods per year** is what an annualization multiplies by. Daily equity returns are quoted
+# against 252 trading sessions. Switching to 365 does not move every annualized number by the same
+# amount, because two different scalings are at work: volatility and the ratios built on it scale
+# with the square root of the count, so they rise by the square root of the ratio of the two
+# counts, roughly a fifth, while a compounded
+# annual return raises one plus the periodic return to the count itself and therefore moves with
+# the underlying growth rate rather than by a fixed factor.
 
 # %%
 # Create analysis object
+RISK_FREE_RATE = 0.0  # annual; set it to a cash rate to measure excess return over cash
+PERIODS_PER_YEAR = 252  # trading sessions in a year, the grid these returns are quoted on
+
 analysis = PortfolioAnalysis(
     returns=strategy_returns.values,
     benchmark=spy_returns.values,
     dates=strategy_returns.index,
-    risk_free=0.0,  # Can specify annual risk-free rate
-    periods_per_year=252,
+    risk_free=RISK_FREE_RATE,
+    periods_per_year=PERIODS_PER_YEAR,
 )
 
-print(f"  Returns: {len(strategy_returns)} observations")
-print("  Benchmark: SPY")
-print("  Risk-free rate: 0%")
+print(f"Daily returns analysed: {len(strategy_returns):,} sessions")
+print(f"Measured against: {BENCHMARK_SYMBOL}")
+print(f"Annual risk-free rate subtracted before every ratio: {RISK_FREE_RATE:.2%}")
+print(f"Periods a year used to annualize: {PERIODS_PER_YEAR}")
 
 # %% [markdown]
 # ## 3. Summary Statistics
 #
-# The `compute_summary_stats()` method returns a `PortfolioMetrics` dataclass
-# with 22 performance metrics.
+# The headline table is the smallest set that does not mislead: a return, the volatility it was
+# earned at, two ratios of one against the other, the worst loss along the way, and three
+# benchmark-relative figures. Reporting the return alone says nothing about what was risked to
+# get it; reporting the Sharpe ratio alone hides how far the path fell before recovering.
 
 # %%
 # Compute all metrics.
@@ -251,43 +293,63 @@ headline_metrics = pd.DataFrame(
 headline_metrics
 
 # %% [markdown]
-# ### 3.1 Metrics Explained
+# ### What each metric is sensitive to
 #
-# | Metric | Description | Good Range |
-# |--------|-------------|------------|
-# | **Sharpe Ratio** | Risk-adjusted return (excess return / volatility) | > 1.0 |
-# | **Sortino Ratio** | Return per unit downside risk | > 1.5 |
-# | **Calmar Ratio** | Annual return / max drawdown | > 0.5 |
-# | **Omega Ratio** | Probability-weighted gains vs losses | > 1.5 |
-# | **Tail Ratio** | Right tail (95%) / left tail (5%) | > 1.0 |
-# | **Alpha** | Excess return vs benchmark | > 0 |
-# | **Information Ratio** | Active return / tracking error | > 0.5 |
-# | **Up Capture** | Performance in up markets | > 100% |
-# | **Down Capture** | Performance in down markets | < 100% |
+# The nine above answer different questions, and each is blind to something the next one sees.
+# What separates them is the denominator: what each one divides return by decides which kind of
+# bad outcome it can register at all.
+#
+# | Metric | What it divides return by | What it cannot see |
+# |--------|---------------------------|--------------------|
+# | **Sharpe ratio** | total volatility | which side the volatility came from - an upside surprise penalises it as much as a loss |
+# | **Sortino ratio** | volatility of losses only | how long a loss lasted, or how deep the path went |
+# | **Calmar ratio** | the largest peak-to-trough loss | everything except that one episode |
+# | **Omega ratio** | the probability-weighted mass of losses | nothing about ordering: the same returns shuffled give the same number |
+# | **Tail ratio** | the size of the worst losses against the largest gains | the middle of the distribution, which is most of it |
+# | **Alpha** | nothing - it is a return, net of what the benchmark's moves explain | whether the deviations that produced it were large or small |
+# | **Information ratio** | the volatility of the deviations from the benchmark | the direction of the market the deviations were taken in |
+# | **Up capture** | the benchmark's return in its rising periods | anything about falling ones |
+# | **Down capture** | the benchmark's return in its falling periods | anything about rising ones |
+#
+# There is no threshold that makes one of these good. A Sharpe of 1 is unremarkable for a
+# strategy trading at daily frequency and hard to reach for one holding positions for a quarter,
+# and the same number computed over three years and over thirty means different things because
+# the estimate's own standard error shrinks with the square root of the sample. What the table is
+# for is reading them together: a strategy that scores well on all of them is doing something
+# different from one that scores well on Sharpe alone.
 
 # %% [markdown]
 # ## 4. Rolling Metrics
 #
-# Time-varying metrics reveal how strategy performance evolves.
+# A single Sharpe ratio over the whole backtest is an average over every market the strategy
+# traded through. Recomputing it inside a moving window shows whether that average describes a
+# steady process or two different regimes with a crossover in the middle - which is the question
+# an investor with a finite horizon is actually asking.
+#
+# Three windows are used, and the choice is a trade-off between resolution and noise. Twenty-one
+# sessions is about a calendar month: it responds within weeks and its Sharpe estimate swings
+# wildly, because a ratio estimated from twenty-one observations has a standard error close to
+# the ratio itself. Sixty-three sessions is a quarter. Two hundred and fifty-two is a year, which
+# smooths through most single episodes and therefore reacts to a regime change several months
+# after it happens. Reading the three together is what separates a change in the strategy from a
+# short run of luck.
 
 # %%
 # Compute rolling metrics
+ROLLING_WINDOWS = [21, 63, 252]  # about a month, a quarter and a year of sessions
+
 rolling = analysis.compute_rolling_metrics(
-    windows=[21, 63, 252],  # 1-month, 3-month, 1-year
+    windows=ROLLING_WINDOWS,
     metrics=["sharpe", "volatility", "returns"],
 )
 
-print("Rolling metrics computed:")
-print(f"  windows: {rolling.windows}")
-print(f"  sharpe: {list(rolling.sharpe.keys())}")
-print(f"  volatility: {list(rolling.volatility.keys())}")
-print(f"  returns: {list(rolling.returns.keys())}")
+print(f"Sharpe, volatility and return recomputed over windows of {rolling.windows} sessions.")
 
 # %%
 # Plot rolling Sharpe ratio
 fig = go.Figure()
 
-for window in [21, 63, 252]:
+for window in ROLLING_WINDOWS:
     if window in rolling.sharpe:
         sharpe_series = rolling.sharpe[window]
         fig.add_trace(
@@ -308,19 +370,22 @@ fig.add_hline(
 )
 
 fig.update_layout(
-    title="Long-horizon Sharpe is steadier than short-window estimates",
+    title="Rolling Sharpe ratio over 21-, 63- and 252-session windows",
     xaxis_title="Date",
     yaxis_title="Sharpe Ratio",
     height=450,
     legend=dict(yanchor="top", y=0.99, xanchor="right", x=0.99),
 )
-fig.show()
+show_plotly_with_alt(
+    fig,
+    "Three lines of rolling Sharpe ratio against date, over 21, 63 and 252 sessions. The 21-session line swings across the whole vertical range while the 252-session line stays within a narrow band.",
+)
 
 # %%
 # Plot rolling volatility (annualized)
 fig = go.Figure()
 
-for window in [21, 63, 252]:
+for window in ROLLING_WINDOWS:
     if window in rolling.volatility:
         vol_series = rolling.volatility[window]
         fig.add_trace(
@@ -333,39 +398,67 @@ for window in [21, 63, 252]:
         )
 
 fig.update_layout(
-    title="Volatility spikes reveal when aggregate risk estimates break down",
+    title="Annualized rolling volatility over 21-, 63- and 252-session windows",
     xaxis_title="Date",
     yaxis_title="Volatility (%)",
     height=400,
 )
-fig.show()
+show_plotly_with_alt(
+    fig,
+    "Three lines of annualized rolling volatility against date, over 21, 63 and 252 sessions, with the shortest window spiking far above the other two during market stress.",
+)
 
 # %% [markdown]
 # ## 5. Drawdown Analysis
 #
-# Understanding drawdowns is critical for risk management.
+# A **drawdown** is the loss from a peak in cumulative value to the lowest point before that peak
+# is regained, measured as a fraction of the peak. It is the loss an investor who bought at the
+# worst moment actually lived through, which is why it drives the decision to abandon a strategy
+# in a way that volatility does not: volatility is symmetric and a drawdown is not.
+#
+# Three numbers describe one: how deep it went, how long it took to reach the bottom, and how
+# long it took to climb back to the old peak. The last of the three is the one usually left out,
+# and it is the one that decides whether a strategy is holdable - the same loss recovered in two
+# months and recovered in four years is the same number and not the same experience. Both
+# durations below are counted in trading sessions, not calendar days, because that is the grid
+# the return series is quoted on.
 
 # %%
 # Compute drawdown analysis
 drawdown = analysis.compute_drawdown_analysis(top_n=5)
 
-print("\nTop 5 Drawdowns:")
-if drawdown.top_drawdowns:
-    for i, dd in enumerate(drawdown.top_drawdowns, 1):
-        print(f"\n  #{i}: {dd.depth * 100:.2f}%")
-        print(f"      Peak:     {dd.peak_date}")
-        print(f"      Valley:   {dd.valley_date}")
-        print(f"      Recovery: {dd.recovery_date or 'Not recovered'}")
-        print(f"      Duration: {dd.duration_days or 'N/A'} days")
+deepest = pd.DataFrame(
+    [
+        {
+            "Depth": f"{dd.depth * 100:.2f}%",
+            "Peak": dd.peak_date.date(),
+            "Valley": dd.valley_date.date(),
+            "Recovered": dd.recovery_date.date() if dd.recovery_date else "not yet",
+            "Peak to valley (sessions)": dd.duration_days,
+            "Valley to peak (sessions)": dd.recovery_days
+            if dd.recovery_days is not None
+            else "still under",
+        }
+        for dd in drawdown.top_drawdowns
+    ],
+    index=pd.RangeIndex(1, len(drawdown.top_drawdowns) + 1, name="Rank"),
+)
+deepest
 
 
 # %% [markdown]
-# Build a drawdown series when you want to combine underwater curves with custom
-# annotations or downstream report generation.
+# `compute_drawdown_analysis` above returns the episodes; the chart below needs the value on every
+# date, which is the same quantity evaluated continuously. `DrawdownResult` already carries it as
+# `underwater_curve`, and it is written out here as well because it is three lines - compound the
+# returns, carry the running maximum, take the shortfall from it - and seeing the definition once
+# is what makes every drawdown figure in this chapter readable. The benchmark needs the same
+# curve, and no analysis object was built for it, so the function earns its place twice over.
+#
+# Computing it both ways is also the cheapest check available that the definition above is the
+# one the library uses, so the two are asserted equal rather than assumed to agree.
 
 
 # %%
-# Compute drawdown series
 def compute_drawdown_series(returns: pd.Series) -> pd.Series:
     """Compute drawdown time series."""
     cumulative = (1 + returns).cumprod()
@@ -376,6 +469,11 @@ def compute_drawdown_series(returns: pd.Series) -> pd.Series:
 
 dd_series = compute_drawdown_series(strategy_returns)
 dd_benchmark = compute_drawdown_series(spy_returns)
+
+np.testing.assert_allclose(
+    dd_series.to_numpy(), drawdown.underwater_curve.to_numpy(), rtol=0, atol=1e-12
+)
+print("Hand-derived underwater curve matches DrawdownResult.underwater_curve.")
 
 # %%
 # Plot underwater curve
@@ -401,19 +499,22 @@ fig.add_trace(
 )
 
 fig.update_layout(
-    title="Strategy and SPY follow distinct drawdown and recovery paths",
+    title="Underwater curves for the strategy and the SPY benchmark",
     xaxis_title="Date",
     yaxis_title="Drawdown (%)",
     height=400,
 )
-fig.show()
+show_plotly_with_alt(
+    fig,
+    "Two underwater curves against date, the strategy filled to zero and the benchmark dashed, each showing the percentage below its own running peak.",
+)
 
 # %%
 # Drawdown distribution
 fig = px.histogram(
     dd_series * 100,
     nbins=50,
-    title="Most observations stay near prior peaks despite episodic losses",
+    title="Distribution of the strategy's daily drawdown",
     labels={"value": "Drawdown (%)", "count": "Frequency"},
 )
 fig.add_vline(
@@ -423,10 +524,18 @@ fig.add_vline(
     annotation_text=f"Max DD: {metrics.max_drawdown * 100:.1f}%",
 )
 fig.update_layout(height=350, showlegend=False)
-fig.show()
+show_plotly_with_alt(
+    fig,
+    "Histogram of the strategy's daily drawdown, concentrated near zero with a thin tail reaching the maximum drawdown marked by a vertical line.",
+)
 
 # %% [markdown]
 # ## 6. Monthly and Annual Returns
+#
+# Daily returns compounded to month and year ends answer a question the aggregate figures do
+# not: how much of the total came from how few periods. A strategy whose annual return is
+# carried by two months is a different proposition from one earning the same amount steadily,
+# and the two are indistinguishable in a Sharpe ratio computed over the whole sample.
 
 # %%
 # Compute monthly returns
@@ -439,9 +548,12 @@ print(f"  Std:    {monthly_df['monthly_return'].std() * 100:.2f}%")
 print(f"  Best:   {monthly_df['monthly_return'].max() * 100:.2f}%")
 print(f"  Worst:  {monthly_df['monthly_return'].min() * 100:.2f}%")
 
+# %% [markdown]
+# The heatmap below is the same monthly series as a year-by-month grid. Read down a column to see
+# whether a calendar month is systematically good or bad, and across a row to see how much of a
+# year's return came from how few of its months.
+
 # %%
-# Create monthly returns heatmap
-# Reshape to year x month
 monthly_df["year"] = monthly_df["year"].astype(int)
 monthly_df["month"] = monthly_df["month"].astype(int)
 
@@ -471,12 +583,15 @@ fig = go.Figure(
 )
 
 fig.update_layout(
-    title="Monthly returns expose an uneven path hidden by annual averages",
+    title="Monthly return by year and calendar month",
     xaxis_title="Month",
     yaxis_title="Year",
     height=400,
 )
-fig.show()
+show_plotly_with_alt(
+    fig,
+    "Heatmap of monthly returns, years down the vertical axis and calendar months across, red for losses and green for gains, with each cell labelled.",
+)
 
 # %%
 # Annual returns comparison
@@ -508,20 +623,35 @@ fig.add_trace(
 )
 
 fig.update_layout(
-    title="Strategy and SPY leadership varies from year to year",
+    title="Annual return, strategy against the SPY benchmark",
     xaxis_title="Year",
     yaxis_title="Return (%)",
     barmode="group",
     height=400,
 )
-fig.show()
+show_plotly_with_alt(
+    fig,
+    "Grouped bars of annual return for the strategy and for SPY, one pair per calendar year.",
+)
 
 # %% [markdown]
 # ## 7. Benchmark-Relative Analysis
+#
+# Regressing the strategy's daily returns on the benchmark's splits them in two. **Beta** is the
+# slope: how much the strategy moved, on average, for each unit the market moved. **Alpha** is
+# the intercept, annualized: the part of the return the market's moves do not explain.
+#
+# Beta is what decides whether alpha is interesting. A strategy with a beta of one and no alpha
+# has reproduced the index; one with a beta of one half and no alpha has reproduced half of it
+# and kept half the capital idle. The two cutoffs below - a fifth below one and a fifth above -
+# are conventional labels for "materially less exposed than the market" and "materially more",
+# and there is nothing special about them beyond marking a fifth of the market's own movement
+# in each direction.
 
 # %%
-# Compute alpha and beta
-alpha, beta = alpha_beta(strategy_returns.values, spy_returns.values, periods_per_year=252)
+alpha, beta = alpha_beta(
+    strategy_returns.values, spy_returns.values, periods_per_year=PERIODS_PER_YEAR
+)
 
 print(f"Alpha: {alpha * 100:.2f}% (annualized)")
 print(f"Beta:  {beta:.3f}")
@@ -535,56 +665,71 @@ else:
     beta_interp = "Neutral (market-like exposure)"
 print(f"       {beta_interp}")
 
+# %% [markdown]
+# **Tracking error** is the volatility of the difference between the two return series, and the
+# **information ratio** divides the average of that difference by it. Together they ask whether
+# the deviations from the benchmark were worth taking: a strategy can exceed its benchmark by a
+# wide margin through deviations so volatile that the excess is indistinguishable from luck.
+#
+# Read the information ratio the way a t-statistic is read, because over $T$ years that is what
+# it is: multiplied by $\sqrt{T}$ it gives roughly the t-statistic of the average active return.
+# An information ratio of one half sustained over four years is therefore about one standard
+# error from zero, which is why the number needs a horizon attached before it means anything.
+
 # %%
-# Tracking error and information ratio
 active_returns = strategy_returns.values - spy_returns.values
-tracking_error = active_returns.std(ddof=1) * np.sqrt(252)
-ir = information_ratio(strategy_returns.values, spy_returns.values, periods_per_year=252)
+tracking_error = active_returns.std(ddof=1) * np.sqrt(PERIODS_PER_YEAR)
+ir = information_ratio(
+    strategy_returns.values, spy_returns.values, periods_per_year=PERIODS_PER_YEAR
+)
 
-print(f"\nTracking Error:   {tracking_error * 100:.2f}% (annualized)")
-print(f"Information Ratio: {ir:.3f}")
-if ir > 0.5:
-    print("  Strong active return")
-elif ir > 0.25:
-    print("  Positive but modest active return")
-elif ir > 0:
-    print("  Economically negligible active return after tracking error")
-else:
-    print("  Underperforming the benchmark")
+years = len(strategy_returns) / PERIODS_PER_YEAR
+print(f"Tracking Error:    {tracking_error * 100:.2f}% (annualized)")
+print(f"Information Ratio: {ir:.3f}  over {years:.1f} years")
+print(f"Implied t-statistic on the average active return: {ir * np.sqrt(years):.2f}")
+
+# %% [markdown]
+# **Capture ratios** split the comparison by the direction the benchmark moved. Up capture is
+# what the strategy returned across the periods the benchmark rose, as a fraction of what the
+# benchmark returned over those same periods; down capture is the same across the periods it
+# fell. A strategy capturing four fifths of the upside and half the downside is doing something
+# a single alpha number cannot express.
+#
+# They are conventionally quoted on monthly periods rather than daily ones, so both series are
+# compounded to month ends before the ratio is taken. The frequency is part of the definition:
+# the same strategy scores differently at daily and monthly frequency, because a month in which
+# the benchmark ends up while falling for three weeks counts as an up period at one and as a mix
+# at the other.
+#
+# The ratio is taken between the two *average* returns over those periods. `ml4t.diagnostic`
+# exposes an `up_down_capture` that instead divides the two compounded wealth factors, and for
+# down periods that inverts the reading: a strategy losing half as much as the benchmark in every
+# month the benchmark falls has captured half the downside, and the compounded form reports more
+# than the whole of it, because both products are below one and the larger numerator makes the
+# ratio exceed one. A down capture above one is supposed to mean the strategy fell harder than
+# the market. Take the ratio of the means.
 
 # %%
-# Up/Down Capture Ratios
-# Standard approach: mean monthly returns in up/down benchmark months
 strat_monthly = strategy_returns.resample("ME").apply(lambda x: (1 + x).prod() - 1)
 bench_monthly = spy_returns.resample("ME").apply(lambda x: (1 + x).prod() - 1)
-
-up_months = bench_monthly > 0
-down_months = bench_monthly < 0
-
+up_months, down_months = bench_monthly > 0, bench_monthly < 0
 up_capture = strat_monthly[up_months].mean() / bench_monthly[up_months].mean()
 down_capture = strat_monthly[down_months].mean() / bench_monthly[down_months].mean()
 
-print("\nCapture Ratios (monthly):")
+print("Capture ratios, on monthly periods:")
 print(f"  Up Capture:   {up_capture * 100:.1f}%")
 print(f"  Down Capture: {down_capture * 100:.1f}%")
 
-# Ideal: High up capture, low down capture
+# The gap between the two is the asymmetry: positive means the strategy kept more of the
+# benchmark's up months than of its down months.
 capture_spread = up_capture - down_capture
-print(f"\n  Capture Spread: {capture_spread * 100:.1f}pp")
-if capture_spread > 0.2:
-    print("  Capture profile: asymmetric - captures >20pp more upside than downside")
-elif capture_spread > 0:
-    print("  Capture profile: asymmetric - captures more upside than downside")
-elif capture_spread < 0:
-    print("  Capture profile: asymmetric - captures more downside than upside")
-else:
-    print("  Capture profile: symmetric (up capture == down capture)")
+print(f"  Spread (up - down): {capture_spread * 100:.1f}pp")
 
 # %%
 # Rolling Beta
 rolling_beta = pd.Series(index=strategy_returns.index, dtype=float)
 
-window = 252
+window = PERIODS_PER_YEAR  # one year of sessions
 for i in range(window, len(strategy_returns)):
     strat_window = strategy_returns.iloc[i - window : i].values
     bench_window = spy_returns.iloc[i - window : i].values
@@ -608,35 +753,53 @@ fig.add_hline(
 fig.add_hline(y=0, line_dash="dot", line_color=COLORS["neutral"], opacity=0.3)
 
 fig.update_layout(
-    title="Market exposure changes materially through the backtest",
+    title="Rolling one-year beta against the SPY benchmark",
     xaxis_title="Date",
     yaxis_title="Beta",
     height=400,
 )
-fig.show()
+show_plotly_with_alt(
+    fig,
+    "Rolling one-year beta against SPY plotted against date, with reference lines at one and zero.",
+)
 
 # %% [markdown]
 # ## 8. Risk Metrics (VaR, CVaR)
+#
+# **Value at Risk** at a confidence level is the loss that a stated fraction of periods exceeded.
+# Read at one day in twenty, it is the daily loss that one trading day in twenty was worse than;
+# read at one day in a hundred, it is the loss the worst day in a hundred exceeded. Both levels
+# below are empirical quantiles of the return series itself: the returns are sorted and the
+# quantile is taken, with no distribution assumed.
 
 # %%
 # Value at Risk
 var_95 = value_at_risk(strategy_returns.values, confidence=0.95)
 var_99 = value_at_risk(strategy_returns.values, confidence=0.99)
 
-print("Value at Risk (VaR):")
+print("Value at Risk, from the sample's own return distribution:")
 print(f"  95% VaR: {var_95 * 100:.2f}% (daily)")
 print(f"  99% VaR: {var_99 * 100:.2f}% (daily)")
-print(f"\n  Interpretation: On 95% of days, losses won't exceed {abs(var_95) * 100:.2f}%")
+breaches = int((strategy_returns.values < var_95).sum())
+print(f"  Days worse than the VaR: {breaches:,} of {len(strategy_returns):,}")
+
+# %% [markdown]
+# VaR says where the tail begins and nothing about what is inside it: a strategy whose worst day
+# loses a few percent and one whose worst day loses ten times that can share the same VaR.
+# **Conditional VaR**, also called expected shortfall, is the average of the losses that did
+# exceed the threshold, so it is the number that separates them. It is the reason a risk report
+# quotes both.
+#
+# Both are read off this sample's own history. Neither is a forecast, and the one-day-in-a-hundred
+# quantile of a few thousand observations rests on a few dozen of them.
 
 # %%
-# Conditional VaR (Expected Shortfall)
 cvar_95 = conditional_var(strategy_returns.values, confidence=0.95)
 cvar_99 = conditional_var(strategy_returns.values, confidence=0.99)
 
-print("Conditional VaR (Expected Shortfall):")
+print("Conditional VaR, the average loss on the days that breached VaR:")
 print(f"  95% CVaR: {cvar_95 * 100:.2f}% (daily)")
 print(f"  99% CVaR: {cvar_99 * 100:.2f}% (daily)")
-print(f"\n  Interpretation: When losses exceed VaR, average loss is {abs(cvar_95) * 100:.2f}%")
 
 # %%
 # Visualize return distribution with VaR
@@ -669,18 +832,29 @@ fig.add_vline(
 )
 
 fig.update_layout(
-    title="Tail losses extend beyond the 95% VaR threshold",
+    title="Daily return distribution with value at risk and conditional VaR",
     xaxis_title="Daily Return (%)",
     yaxis_title="Frequency",
     height=400,
     showlegend=False,
 )
-fig.show()
+show_plotly_with_alt(
+    fig,
+    "Histogram of daily strategy returns with vertical lines marking the value at risk at two "
+    "confidence levels and the conditional value at risk further into the left tail.",
+)
 
 # %% [markdown]
 # ## 9. Event Analysis
 #
-# Analyze performance during specific market events or stress periods.
+# Aggregate statistics average over every market the strategy traded through, so they say
+# nothing about the episodes an investor remembers. Cumulating the strategy and the benchmark
+# over five named windows - two crashes, two recoveries and one credit event - shows whether the
+# defensive profile the beta and capture ratios suggest actually held when it was tested.
+#
+# The five windows are chosen after the fact, which is what makes this a description rather than
+# a test. Each is bounded by the dates the episode is conventionally dated to; the strategy's
+# behaviour outside them is what every other section measures.
 
 # %%
 # Define market stress periods
@@ -714,11 +888,6 @@ def analyze_period(returns: pd.Series, benchmark: pd.Series, start: str, end: st
 
 
 # %%
-# Analyze each period
-print("\n" + "=" * 70)
-print("STRESS PERIOD ANALYSIS")
-print("=" * 70)
-
 period_results = []
 for name, (start, end) in STRESS_PERIODS.items():
     result = analyze_period(strategy_returns, spy_returns, start, end)
@@ -756,27 +925,33 @@ if period_results:
     )
 
     fig.update_layout(
-        title="Relative performance changes across stress and recovery windows",
+        title="Cumulative return over five stress and recovery windows",
         yaxis_title="Return (%)",
         barmode="group",
         height=450,
     )
-    fig.show()
+    show_plotly_with_alt(
+        fig,
+        "Grouped bars of cumulative return for the strategy and the benchmark over five named stress and recovery windows.",
+    )
 
 # %% [markdown]
 # ## 10. Stability Analysis
+#
+# **Stability** here is the R-squared of a straight line fitted to the cumulative value curve
+# against time. A value near one means the curve looks like a line, which is what a strategy
+# compounding at a steady rate produces; a lower value means the same total return arrived in
+# bursts. It is a description of the path, not of the return: a strategy that doubles in one
+# month and flatlines for four years scores badly and still doubled.
+#
+# A high R-squared does not mean the path was comfortable. A straight line fitted to eight years
+# of compounding absorbs a drawdown lasting several months without much loss of fit, so read
+# this number against the drawdown table in section 5 rather than instead of it.
 
 # %%
 # Stability of returns (R² of cumulative returns vs time)
 stability = stability_of_timeseries(strategy_returns.values)
 print(f"Stability (R²): {stability:.3f}")
-
-if stability > 0.9:
-    print("  Highly stable returns (consistent performance)")
-elif stability > 0.7:
-    print("  Moderately stable returns")
-else:
-    print("  Unstable returns (high variance in performance)")
 
 # %%
 # Cumulative returns with trend line
@@ -808,18 +983,26 @@ fig.add_trace(
 )
 
 fig.update_layout(
-    title="A stable trend can coexist with meaningful path risk",
+    title="Cumulative return with a fitted linear trend",
     xaxis_title="Date",
     yaxis_title="Cumulative Return",
     height=400,
 )
-fig.show()
+show_plotly_with_alt(
+    fig,
+    "Cumulative return against date with a fitted straight trend line overlaid, the two diverging where the path deviates from steady compounding.",
+)
 
 # %% [markdown]
 # ## 11. Full Performance Report
+#
+# The sections above computed each family of statistics next to the reasoning that motivates it.
+# Collecting them into one table grouped by what they measure - return, risk, the ratio of one
+# to the other, and the comparison against the benchmark - is the form a report takes when it
+# goes to someone who did not follow the derivation.
 
 # %%
-# Create comprehensive summary table
+# Build the summary table
 summary_data = {"Category": [], "Metric": [], "Value": []}
 
 
@@ -855,8 +1038,8 @@ if metrics.alpha is not None:
         ("Beta", f"{metrics.beta:.3f}"),
         ("Tracking Error", f"{tracking_error * 100:.2f}%"),
         ("Information Ratio", f"{metrics.information_ratio:.3f}"),
-        ("Up Capture", f"{up_capture * 100:.1f}%"),
-        ("Down Capture", f"{down_capture * 100:.1f}%"),
+        ("Up Capture (monthly)", f"{up_capture * 100:.1f}%"),
+        ("Down Capture (monthly)", f"{down_capture * 100:.1f}%"),
     ]
 other_metrics = [
     ("Stability (R²)", f"{stability:.3f}"),
@@ -881,16 +1064,19 @@ summary_df = pd.DataFrame(summary_data)
 summary_df
 
 # %% [markdown]
-# **Interpretation**: The comprehensive report separates absolute return, total risk,
-# risk-adjusted performance, and benchmark-relative attribution. Read alpha together with beta,
-# tracking error, and the information ratio: positive alpha alone does not establish that active
-# deviations earned their keep. Up/down capture then shows whether the residual profile comes
-# from upside participation or downside avoidance.
+# The four groups answer four questions and none of them answers another's. Read alpha together
+# with beta, tracking error and the information ratio: a positive alpha earned through deviations
+# whose own volatility swamps it has not established that the active positions were worth taking.
+# The two capture ratios then say where the residual profile came from - holding on in rising
+# markets, or losing less in falling ones.
 
 # %% [markdown]
-# ## 12. Standalone Metric Functions
+# ## 12. The same metrics, one at a time
 #
-# Individual metric functions are useful for quick checks in other notebooks.
+# The class above computes everything from one binding. Each metric is also available as a plain
+# function over an array of returns, which is what to reach for when checking a single number
+# somewhere else without setting up an analysis object. The values below are the same ones the
+# table carries, computed the other way.
 
 # %%
 # Example: Computing metrics without PortfolioAnalysis class
@@ -914,8 +1100,6 @@ print(f"  annual_volatility():  {annual_volatility(returns_arr) * 100:.2f}%")
 # `create_full_tear_sheet()`.
 
 # %%
-# Create comprehensive tear sheet
-# This generates all standard portfolio visualizations automatically
 tear_sheet = create_portfolio_dashboard(
     analysis,
     theme="default",
@@ -923,16 +1107,17 @@ tear_sheet = create_portfolio_dashboard(
     height_per_row=350,
 )
 
-print("PortfolioTearSheet generated!")
+print("Tear sheet generated.")
 print(f"  Figures included: {list(tear_sheet.figures.keys())}")
 
 # %% [markdown]
-# ### 13.1 Viewing the Tear Sheet
+# ### Reading what the dashboard computed
 #
-# The `show()` method displays metrics and all figures in sequence.
+# The dashboard carries its own metrics object. The figures below come from it, so printing its
+# numbers first is what says the two are describing the same series - they are the values already
+# computed in section 3, reached by a different route.
 
 # %%
-# Display key metrics from the tear sheet (same as computed above)
 ts = tear_sheet.metrics
 print(
     f"Sharpe: {ts.sharpe_ratio:.3f}  |  Sortino: {ts.sortino_ratio:.3f}  |  Calmar: {ts.calmar_ratio:.3f}"
@@ -940,28 +1125,47 @@ print(
 print(f"Annual Return: {ts.annual_return * 100:.2f}%  |  Max DD: {ts.max_drawdown * 100:.2f}%")
 print(f"Alpha: {ts.alpha * 100:.2f}%  |  Beta: {ts.beta:.3f}  |  IR: {ts.information_ratio:.3f}")
 
+# %% [markdown]
+# `tear_sheet.show()` renders every figure in sequence. Pulling three out by name instead is what
+# to do when a report needs a selection, and it is also where each figure's title and its alt
+# text for a screen reader are set, neither of which the dashboard can know from the returns
+# alone.
+
 # %%
-# Access individual figures from the tear sheet
-# (For more control than show(), display specific figures)
-for name in ["Cumulative Returns", "Drawdown", "Monthly Returns Heatmap"]:
-    if name in tear_sheet.figures:
-        fig = tear_sheet.figures[name]
-        dashboard_titles = {
-            "Cumulative Returns": "Compounding paths separate strategy from benchmark",
-            "Drawdown": "Drawdowns reveal the cost of the strategy's return path",
-            "Monthly Returns Heatmap": "Monthly returns reveal the consistency of compounding",
-        }
-        fig.update_layout(
-            title=dashboard_titles[name],
-            paper_bgcolor=COLORS["bg_light"],
-            plot_bgcolor=COLORS["bg_light"],
-        )
-        fig.show()
+dashboard_titles = {
+    "Cumulative Returns": "Cumulative return, strategy against the SPY benchmark",
+    "Drawdown": "Strategy underwater curve",
+    "Monthly Returns Heatmap": "Monthly return by year and calendar month",
+}
+dashboard_alt = {
+    "Cumulative Returns": (
+        "Two cumulative return paths against date, the strategy and the SPY benchmark, "
+        "both compounding upward and separating over the sample."
+    ),
+    "Drawdown": (
+        "The strategy's underwater curve against date, plotted as the percentage below the "
+        "running peak, with its deepest fall during the 2020 crash."
+    ),
+    "Monthly Returns Heatmap": (
+        "Heatmap of monthly return, years down the vertical axis and calendar months "
+        "across, coloured red for losses and green for gains."
+    ),
+}
+for name, title in dashboard_titles.items():
+    fig = tear_sheet.figures[name]
+    fig.update_layout(
+        title=title,
+        paper_bgcolor=COLORS["bg_light"],
+        plot_bgcolor=COLORS["bg_light"],
+    )
+    show_plotly_with_alt(fig, dashboard_alt[name])
 
 # %% [markdown]
-# ### 13.2 Exporting to HTML
+# ### Saving the dashboard as a file
 #
-# The tear sheet can be saved as a self-contained HTML file for sharing.
+# `save_html` writes every figure and its metrics into one file that opens in a browser with no
+# Python installed. `include_plotlyjs="cdn"` keeps the file small by loading the plotting library
+# from the network when it opens, which is the right trade unless the file has to work offline.
 
 # %%
 # Export to HTML (self-contained, shareable file)
@@ -970,11 +1174,12 @@ tear_sheet.save_html(html_path, include_plotlyjs="cdn")
 print(f"Dashboard saved to: {html_path.name}")
 
 # %% [markdown]
-# ## 14. Report Generation
+# ## 14. Assembling a custom report
 #
-# For combining multiple figures with narrative text, use `combine_figures_to_html()`.
-# This is useful when you want to create a custom report with specific figures and
-# explanatory sections.
+# The dashboard above is fixed: it decides which figures appear and in what order. A report going
+# to someone who is not reading the notebook usually needs a different selection and a sentence
+# beside each figure saying what to look at. `combine_figures_to_html` takes the figures already
+# built here plus that narrative and writes one self-contained file.
 
 # %%
 # Collect figures we created earlier for a custom report
@@ -1004,7 +1209,7 @@ fig_cum.add_trace(
     )
 )
 fig_cum.update_layout(
-    title="Compounding paths separate strategy from benchmark",
+    title="Cumulative return, strategy against the SPY benchmark",
     xaxis_title="Date",
     yaxis_title="Cumulative Return",
     height=400,
@@ -1036,7 +1241,7 @@ fig_dd.add_trace(
     )
 )
 fig_dd.update_layout(
-    title="Drawdowns reveal the cost of the strategy's return path",
+    title="Strategy underwater curve",
     xaxis_title="Date",
     yaxis_title="Drawdown (%)",
     height=350,
@@ -1067,12 +1272,28 @@ combine_figures_to_html(
 )
 print(f"Custom report saved to: {report_path.name}")
 
+# %% [markdown] tags=["results"]
+# ### What this run produced
+#
+# The strategy analysed is whichever allocation backtest the ETF case study currently ranks first
+# on validation Sharpe; its hash, allocator, cost model and execution convention are printed in
+# section 1, and every number in this notebook is computed from that one artifact. The summary table in
+# section 11 is the full set. Three things in it are worth reading together rather than
+# separately: the annualized return against the annual volatility it was earned at, the maximum
+# drawdown against the Calmar ratio that divides the return by it, and the alpha against the beta
+# and tracking error that say how much market exposure and how much active deviation produced it.
+#
+# The rolling panels in section 4 are what the aggregate figures hide. Where the 252-session
+# Sharpe and the 21-session Sharpe disagree for an extended stretch, the aggregate is an average
+# over two different regimes rather than a description of one process.
+
 # %% [markdown]
 # ## Key Takeaways
 #
-# 1. **Multi-dimensional evaluation is non-negotiable.** Sharpe ratio alone misses
-#    drawdown profiles, tail risk (VaR/CVaR), and benchmark-relative attribution.
-#    Always report at least Sharpe, max drawdown, and Sortino together.
+# 1. **One ratio cannot describe a return path.** Sharpe divides return by total volatility,
+#    so it registers neither how far the path fell nor how long it stayed down, and it treats
+#    an upside surprise as a cost. Report it alongside the maximum drawdown and the Sortino
+#    ratio, which are blind to different things.
 # 2. **Rolling metrics expose regime dependence.** Aggregate Sharpe can be positive
 #    while rolling windows show extended negative periods - a critical warning for
 #    investors with finite horizons.
@@ -1082,6 +1303,25 @@ print(f"Custom report saved to: {report_path.name}")
 # 4. **Stress-period analysis tests robustness.** The maximum drawdown and event panels
 #    turn an aggregate performance score into the timing and recovery questions that
 #    matter to investors.
+#
+# ### Known limitations
+#
+# - **One strategy, one benchmark, one sample.** Every number here describes a single backtest
+#   over a single history. None of them carries a confidence interval, and the Sharpe ratio in
+#   particular is estimated with a standard error close to 1/sqrt(years) - so two strategies
+#   differing by a few tenths over a few years have not been separated by this evidence.
+# - **The strategy was chosen by validation Sharpe.** Ranking a set of candidates and then
+#   reporting the statistics of the one that ranked first overstates them, because the ranking itself used the same
+#   kind of noise the statistic measures. This notebook is a diagnostic of a chosen artifact, not
+#   an unbiased estimate of what that artifact would earn next.
+# - **Stress periods are named by hand.** The five windows in section 9 were chosen because they
+#   are known episodes, which means the selection is retrospective. They show how the strategy
+#   behaved in them; they do not establish how it behaves in stress generally.
+# - **VaR and CVaR are empirical quantiles.** Both are read off the sample's own distribution, so
+#   the one-day-in-a-hundred figures rest on a few dozen observations and neither extrapolates
+#   past the worst day in the history.
+# - **The risk-free rate is zero.** Ratios that subtract it are therefore excess-over-nothing
+#   rather than excess-over-cash, which flatters them over any period when cash paid a return.
 #
 # **Next**: These metrics are used throughout Ch17-19 to evaluate allocation methods,
 # transaction cost impact, and risk controls.

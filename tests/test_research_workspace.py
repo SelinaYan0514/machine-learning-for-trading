@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 
 import polars as pl
@@ -792,6 +793,144 @@ def test_preview_records_the_entry_point_when_generated_dirs_are_not_symlinks(
     assert recorded == ("06_linear",)
 
 
+def _register_one(study, **kwargs):
+    """One preview training registration, so the tests below differ only in what they declare."""
+    return study.results.register_training(
+        {
+            "identity_version": 2,
+            "execution_tier": "preview",
+            "family": "linear",
+            "label": "fwd_ret_21d",
+            "config_name": "ridge",
+            "seed": 42,
+            "preview_reductions": {"folds": [0]},
+        },
+        execution_tier="preview",
+        **kwargs,
+    )
+
+
+def _recorded_entry_point(training) -> str | None:
+    with sqlite3.connect(training.root / "run_log" / "registry.db") as db:
+        row = db.execute(
+            "SELECT entry_point FROM training_runs WHERE training_hash = ?", (training.hash,)
+        ).fetchone()
+    assert row is not None, "the run registered no training row"
+    return row[0]
+
+
+def test_provenance_fills_the_entry_point_column_when_the_study_was_not_told(
+    tmp_path: Path,
+) -> None:
+    """A notebook that declares only `notebook=` still gets its stem into the column.
+
+    `open_study(entry_point=...)` and `build_requests(notebook=...)` are the same fact declared
+    in two places, and declaring one and not the other is the common state: measured 2026-09-12
+    over the 53 notebooks calling `run_model_population`, 13 declare only the provenance half.
+    Those registered a NULL column while carrying the answer in the row they were writing, and a
+    NULL is what ml4t/agent-workspace#901 reports as the column having no meaning at all.
+    """
+    release = _seed_release(tmp_path)
+    study = open_study(
+        "etfs",
+        execution_tier=ExecutionTier.PREVIEW,
+        workspace=tmp_path / "ws",
+        release_root=release,
+    )
+    assert study.entry_point is None, "fixture must exercise the undeclared branch"
+
+    training = _register_one(study, runtime_provenance={"notebook_path": "06_linear"})
+    assert _recorded_entry_point(training) == "06_linear"
+
+
+def test_an_explicit_entry_point_wins_over_the_provenance_field(tmp_path: Path) -> None:
+    """The fallback must not overwrite a Study that was told which notebook it serves.
+
+    The negative half of the test above: without it, a fallback that took the provenance field
+    unconditionally would pass that test just as well while silently renaming every row a
+    declaring notebook writes.
+    """
+    release = _seed_release(tmp_path)
+    study = open_study(
+        "etfs",
+        execution_tier=ExecutionTier.PREVIEW,
+        workspace=tmp_path / "ws",
+        release_root=release,
+        entry_point="06_linear",
+    )
+
+    training = _register_one(study, runtime_provenance={"notebook_path": "07_gbm"})
+    assert _recorded_entry_point(training) == "06_linear"
+
+
+def test_neither_half_declared_still_registers_a_row(tmp_path: Path) -> None:
+    """A holdout reconstruction is not a notebook run, and must not acquire a wrong name.
+
+    `_runtime_provenance` omits `notebook_path` entirely when its caller names no notebook, for
+    the stated reason that a wrong notebook name is worse than an absent one. The fallback has to
+    preserve that rather than reaching for some other string.
+    """
+    release = _seed_release(tmp_path)
+    study = open_study(
+        "etfs",
+        execution_tier=ExecutionTier.PREVIEW,
+        workspace=tmp_path / "ws",
+        release_root=release,
+    )
+
+    training = _register_one(study, runtime_provenance={"entry_point": "case_studies.utils.linear"})
+    assert _recorded_entry_point(training) is None
+
+
+def test_open_study_says_it_read_inputs_in_place(tmp_path: Path, capsys) -> None:
+    """`open_study` takes one of two branches and used to say nothing about which.
+
+    A maintainer worktree symlinks its generated directories to shared artifacts, so it reads
+    inputs in place; a CI checkout has real directories and adopts the workspace. Which branch
+    ran is decided by the checkout, not by the caller, so the same notebook reports different
+    inputs on the two with nothing in the log telling them apart (ml4t/agent-workspace#974).
+    """
+    release, _ = _seed_regeneration_release(tmp_path)
+    generated = release / "case_studies" / "etfs"
+    assert all((generated / name).is_symlink() for name in ("features", "labels", "run_log")), (
+        "fixture must exercise the symlink branch"
+    )
+    capsys.readouterr()
+
+    open_study(
+        "etfs",
+        execution_tier=ExecutionTier.PREVIEW,
+        workspace=tmp_path / "ws",
+        release_root=release,
+    )
+
+    reported = capsys.readouterr().out
+    assert "open_study(etfs)" in reported
+    assert "symlinks - reading inputs in place" in reported
+    assert str(generated) in reported
+
+
+def test_open_study_says_the_workspace_is_the_root(tmp_path: Path, capsys) -> None:
+    """The other branch, which is the one CI takes and the one no worktree here exercises."""
+    release = _seed_release(tmp_path)
+    generated = release / "case_studies" / "etfs"
+    assert not any((generated / name).is_symlink() for name in ("features", "labels", "run_log")), (
+        "fixture must exercise the regular-directory branch"
+    )
+    capsys.readouterr()
+
+    open_study(
+        "etfs",
+        execution_tier=ExecutionTier.PREVIEW,
+        workspace=tmp_path / "ws",
+        release_root=release,
+    )
+
+    reported = capsys.readouterr().out
+    assert "open_study(etfs)" in reported
+    assert "real directories - the workspace is the study root" in reported
+
+
 def test_a_second_study_previewing_into_one_workspace_repoints_the_input_links(
     tmp_path: Path,
 ) -> None:
@@ -1017,3 +1156,121 @@ def test_a_checkout_shaped_release_root_carries_no_run_log(tmp_path: Path) -> No
             "harness reads the machine's published state again"
         )
     assert (release / "case_studies" / "config").is_dir()
+
+
+def test_a_bare_label_read_keeps_the_tier_the_study_was_opened_at(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """`labels.get(name)` must not re-activate the study at canonical.
+
+    `LabelCatalog.get` used to default `execution_tier` to CANONICAL and pass it straight to
+    `Study.activate`, so a caller who did not name a tier silently undid the preview activation
+    the notebook performed when it called `open_study`. A canonical activation skips the
+    `.preview` path segment and skips linking `labels/` and `features/` into the preview case
+    directory, so the label resolved to `<workspace>/<case_study>/labels/<name>.parquet` -
+    a path nothing writes - and the run died claiming the artifact was missing.
+
+    Asserted through the resolved path rather than through the returned ref, because the ref is
+    identical either way and the path is the thing that was wrong.
+    """
+    release = _seed_release(tmp_path)
+    case_dir = release / "case_studies" / "etfs"
+    artifacts = tmp_path / "artifacts" / "labels"
+    artifacts.mkdir(parents=True)
+    pl.DataFrame(
+        {
+            "symbol": ["SPY", "SPY"],
+            "timestamp": [datetime(2024, 1, 2), datetime(2024, 1, 3)],
+            "fwd_ret_21d": [0.01, -0.02],
+        }
+    ).write_parquet(artifacts / "fwd_ret_21d.parquet")
+    # A maintainer worktree, which is the shape open_study reads inputs in place for.
+    (case_dir / "labels").symlink_to(artifacts, target_is_directory=True)
+
+    workspace = tmp_path / "workspace"
+    study = open_study("etfs", execution_tier="preview", workspace=workspace, release_root=release)
+
+    resolved = study.labels.get("fwd_ret_21d").path
+
+    assert resolved.is_file(), f"a bare read resolved to a path nothing writes: {resolved}"
+    assert ".preview" in resolved.parts, f"a bare read left the preview tier: {resolved}"
+    # And naming the tier explicitly reaches the same artifact, so the default is a default
+    # rather than a second behaviour.
+    assert study.labels.get("fwd_ret_21d", execution_tier="preview").path == resolved
+
+
+def test_relative_preview_workspace_lands_outside_the_repository(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A bare workspace name used to resolve against the caller's cwd, which is the repo root.
+
+    Notebooks run from the repo root, so `WORKSPACE=smoke-1045` put a `config` symlink, a
+    `.preview/` tree and a 268K registry there, and `git status` offered all of it
+    (ml4t/agent-workspace#1053). A relative name now resolves against a declared preview root
+    instead, so nothing in `.gitignore` is load-bearing for it.
+    """
+    from utils.paths import REPO_ROOT as repo_root
+
+    release = _seed_release(tmp_path)
+    preview_root = tmp_path / "preview-root"
+    monkeypatch.setenv("ML4T_PREVIEW_ROOT", str(preview_root))
+    monkeypatch.chdir(repo_root)
+
+    study = open_study(
+        "etfs",
+        execution_tier=ExecutionTier.PREVIEW,
+        workspace="smoke-1045",
+        release_root=release,
+    )
+
+    assert study.output_root == (preview_root / "smoke-1045").resolve()
+    assert not (repo_root / "smoke-1045").exists(), (
+        "a relative workspace must not create anything in the checkout"
+    )
+
+
+def test_absolute_preview_workspace_is_taken_as_given(tmp_path: Path, monkeypatch) -> None:
+    """The drivers pass absolute paths (`smoke-chain.sh` defaults to the artifact store).
+
+    Redirecting those under the preview root would move every existing smoke workspace, so an
+    absolute path stays exactly where the caller put it.
+    """
+    release = _seed_release(tmp_path)
+    monkeypatch.setenv("ML4T_PREVIEW_ROOT", str(tmp_path / "unused-root"))
+    declared = tmp_path / "explicit" / "ws"
+
+    study = open_study(
+        "etfs",
+        execution_tier=ExecutionTier.PREVIEW,
+        workspace=declared,
+        release_root=release,
+    )
+
+    assert study.output_root == declared.resolve()
+
+
+def test_regeneration_refuses_the_default_release_root_under_a_test_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A test must not reach the published registry through the in-place path.
+
+    `Study.regenerate` writes through the generated-artifact symlinks, so in a maintainer
+    worktree it writes `~/ml4t/artifacts/case_studies/<cs>/run_log/registry.db`. A test run of
+    `fx_pairs` 13-16 did exactly that on 2026-08-16: 269 `backtest_runs`, 13
+    `official_populations` and a candidate set into the published registry, one of them frozen
+    incomplete under an immutable name.
+
+    The discriminator is the default `release_root`, not pytest alone - the three tests above
+    seed their own release tree and pass it, and they must keep working, which is what the
+    second half of this asserts.
+    """
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "test_regeneration_refuses::call")
+    with pytest.raises(PermissionError, match="canonical in-place regeneration is refused"):
+        Study.regenerate("etfs")
+
+    # Through the entry point a notebook actually uses. `open_study` resolves the default
+    # release root before calling `Study.regenerate`, so a guard that asks whether the caller
+    # passed one is dead here while looking correct at the other call site. That is what the
+    # first version of this guard did, and only this assertion catches it.
+    with pytest.raises(PermissionError, match="canonical in-place regeneration is refused"):
+        open_study("etfs")

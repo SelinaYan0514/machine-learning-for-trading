@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Any
 
 import polars as pl
 
-from .comparison import CandidateSet
+from .comparison import CandidateSet, binding_table
 from .configs import sweep_labels
 from .population import OfficialPopulation
 
@@ -77,9 +77,15 @@ def _recorded_set_count(registry: Any, name: str) -> int:
     """
     try:
         with sqlite3.connect(f"file:{registry}?mode=ro", uri=True) as db:
+            # A generation is a name binding, not an identity row: one set carries several
+            # names where a union equals one of its inputs, so counting `candidate_sets` rows
+            # by name answers 0 for a name that is bound and resolves. `binding_table` names
+            # the table this registry keeps its bindings in; only `name` is read from it, so
+            # this still answers for a registry that predates the rest of the columns.
             return int(
                 db.execute(
-                    "SELECT COUNT(*) FROM candidate_sets WHERE name = ?", (name,)
+                    f"SELECT COUNT(*) FROM {binding_table(db)} WHERE name = ?",  # noqa: S608
+                    (name,),
                 ).fetchone()[0]
             )
     except sqlite3.OperationalError as error:
@@ -119,12 +125,18 @@ PLAN_STAGE_KEYS: Mapping[str, str] = {
 def predictions_identity(prediction_hashes: Collection[str] | None) -> str:
     """A short, stable name for the set of prediction sets in force.
 
-    The plan names below carry it, which is what makes "has this sweep run against the
-    predictions in force" an equality rather than an inference. Every inference that was tried
-    instead answered one direction and missed the other: comparing a plan's members against the
-    current predictions catches a prediction the refit removed, and cannot see one it added,
-    because the backtests that would ride the new prediction do not exist until the sweep runs.
-    A digest of the whole set moves on either.
+    The plan names below carry it as a record of which generation of the pool a sweep planned
+    for. It was the lookup key too, on the reading that an equality is stronger than an
+    inference: comparing a plan's members against the current predictions catches a prediction
+    a refit removed and cannot see one it added, because the backtests that would ride a new
+    prediction do not exist until the sweep runs. That is true of that direction. The other
+    direction - which predictions in force have no planned backtest - is readable straight off
+    the same two sets, and it is the one that answers the question. So the equality is gone
+    from the lookup and :func:`_plan_in_force` asks the covering question instead.
+
+    A digest of the whole set moves on either, and on neither: it is computed from the output
+    of ``prediction_members_in_force``, whose screen is repo code, so correcting that code
+    moves the digest with no prediction, backtest or grid having changed at all.
 
     ``None`` means the case study declares no prediction populations, so there is no generation
     for a plan to be behind, and every plan under that name is asked completeness only.
@@ -147,12 +159,132 @@ def sweep_plan_name(case_study: str, label: str, stage: str, predictions: str) -
     five places is a convention that can differ in one of them.
 
     ``predictions`` is :func:`predictions_identity` of the populations the sweep planned
-    against, so the name identifies one (label, stage, predictions) triple. A plan that is
-    absent under the current name is a sweep that has not run against the current predictions -
-    whether they were added to, removed from, or replaced wholesale - and the freeze declines
-    for the same reason it declines a sweep that never ran at all.
+    against, so the name records which generation of the prediction pool this plan was built
+    for. It is a record and **not a lookup key**: :func:`_plan_in_force` finds a stage's plan
+    by ``(case_study, stage, label)`` and then asks whether it covers the predictions in force.
+
+    It used to be the lookup key, and that is what made a plan expire on a change that moved
+    no data. The in-force set is computed by repo code - ``prediction_members_in_force``, whose
+    cross-sectional screen reads the artifacts and the feature panels - so a correction to that
+    code re-keys every plan in every case study at once. ``dd44ff59`` on 2026-09-14 narrowed
+    the denominator for persistent-panel models and admitted the three
+    ``latent_factors/pca`` members ``sp500_equity_option_analytics`` had been dropping. Those
+    three prediction sets were registered 2026-09-06 and never changed; nothing about the
+    sweep, its rows or its grid moved. All fifteen of that case study's plans went unfindable
+    the same day, and ``15_portfolio_management`` refused before any fit for the second time in
+    six days, three days after re-running the sweep had "fixed" it.
     """
     return f"{case_study}-{PLAN_STAGE_KEYS[stage]}-{label}-{predictions}"
+
+
+def _is_plan_name(name: str, prefix: str) -> bool:
+    """Whether ``name`` is a plan published under ``prefix``, rather than one of its records.
+
+    A plan is ``{prefix}{predictions}`` and carries no further ``-``; the attempts and
+    attestations that reference it extend it with ``-g<generation>-attempt-N`` and
+    ``-g<generation>-swept-N``. Case-study ids and labels use underscores, so the separator is
+    unambiguous.
+    """
+    return name.startswith(prefix) and "-" not in name[len(prefix) :]
+
+
+def _plan_names_in_force(study: Study, case_study: str, label: str, stage: str) -> list[str]:
+    """Every plan recorded for this stage of this label, most recently published first.
+
+    The predictions component of the name is not matched on. Which generation of the
+    prediction pool a plan was built for is a question about that plan's contents, answered by
+    :func:`_plan_in_force` against the pool in force now; matching it into the lookup instead
+    is what made a plan unfindable the moment the pool moved for any reason at all.
+
+    **All of them are returned, not the most recent.** Recency looks like the right tiebreak
+    and is not, because ``create`` is idempotent on membership: a pool that moves from A to B
+    and back to A is answered with A's *existing* population, which keeps its original
+    ``created_at``. The most recent name is then B's, whose grid does not price the pool, and
+    the sweep that actually covers the pool in force is rejected as missing predictions - by a
+    re-run that cannot help, because running it again reuses A's snapshot and its timestamp
+    again. So the caller asks each in turn and takes the first that answers, and recency
+    decides only which failure is reported when none does.
+    """
+    db_path = study.root / "run_log" / "registry.db"
+    prefix = f"{case_study}-{PLAN_STAGE_KEYS[stage]}-{label}-"
+    try:
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=120.0) as db:
+            db.execute("PRAGMA busy_timeout = 60000")
+            rows = db.execute(
+                "SELECT name, MAX(created_at) FROM official_populations "
+                "WHERE name LIKE ? ESCAPE '\\' GROUP BY name ORDER BY 2 DESC",
+                (prefix.replace("_", r"\_").replace("%", r"\%") + "%",),
+            ).fetchall()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc):
+            return []
+        raise
+    return [name for name, _created_at in rows if _is_plan_name(name, prefix)]
+
+
+def _in_force_for_label(study: Study, in_force: Collection[str], label: str) -> set[str]:
+    """The prediction sets in force that a plan for ``label`` could have priced.
+
+    The pool a notebook hands down spans every declared label - ``prediction_members_in_force``
+    asks the registry what is published and screens it, and neither step knows which label the
+    sweep about to run is for. A plan is per (stage, label), so charging it against the whole
+    pool charges it for four labels it was never asked to sweep: on
+    ``sp500_equity_option_analytics`` the ``fwd_ret_5d`` baseline plan prices 684 backtests over
+    228 of the 807 members in force, and the other 579 belong to the other four labels.
+
+    A member the registry cannot place under any label stays in, rather than being narrowed
+    away. It has no ``prediction_sets`` row, so nothing has swept it and nothing can, and
+    dropping it here would turn the one state that most needs reporting into silence - the same
+    rule ``coverage.py`` states about itself: what cannot be evaluated is short, not passed.
+    """
+    wanted = sorted(set(in_force))
+    if not wanted:
+        return set()
+    db_path = study.root / "run_log" / "registry.db"
+    placed: set[str] = set()
+    matching: set[str] = set()
+    try:
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=120.0) as db:
+            db.execute("PRAGMA busy_timeout = 60000")
+            placeholders = ",".join("?" * len(wanted))
+            for member, member_label in db.execute(
+                f"SELECT p.prediction_hash, t.label FROM prediction_sets p "  # noqa: S608
+                f"JOIN training_runs t ON t.training_hash = p.training_hash "
+                f"WHERE p.prediction_hash IN ({placeholders})",
+                wanted,
+            ):
+                placed.add(member)
+                if member_label == label:
+                    matching.add(member)
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc):
+            raise
+    return matching | (set(wanted) - placed)
+
+
+def _plan_predictions(study: Study, members: Collection[str]) -> set[str]:
+    """The prediction sets a plan's backtests ride, read from the registry.
+
+    Not stored on the plan, because it cannot then disagree with the members: a plan is
+    required complete before this is asked, so every member has a ``backtest_runs`` row and
+    the join is total. A second recorded list would be a second declaration of one fact, which
+    is how the rung pin and the label restriction drifted apart one dimension at a time.
+    """
+    if not members:
+        return set()
+    db_path = study.root / "run_log" / "registry.db"
+    wanted = sorted(set(members))
+    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=120.0) as db:
+        db.execute("PRAGMA busy_timeout = 60000")
+        placeholders = ",".join("?" * len(wanted))
+        return {
+            row[0]
+            for row in db.execute(
+                f"SELECT DISTINCT prediction_hash FROM backtest_runs "  # noqa: S608
+                f"WHERE backtest_hash IN ({placeholders})",
+                wanted,
+            )
+        }
 
 
 #: Which stages a stage's grid is derived from, upstream first.
@@ -339,7 +471,7 @@ def publishes_sweep_plans(study: Study, case_study: str) -> bool:
 
 
 def _upstream_hashes(
-    study: Study, case_study: str, label: str, stage: str, predictions: str
+    study: Study, case_study: str, label: str, stage: str, in_force: frozenset[str] | None
 ) -> tuple[str, ...]:
     """The identities of the plans this stage's grid was derived from, upstream first.
 
@@ -348,7 +480,7 @@ def _upstream_hashes(
     once published while its baseline sweep was still running, and three of the ten
     configurations they advanced were not the ten the finished baseline gives.
 
-    Reads through :func:`_current_plan`, so each upstream plan is required complete and
+    Reads through :func:`_plan_in_force`, so each upstream plan is required complete and
     attested against its own upstream in turn, and the recursion ends at the baseline, which
     has none.
 
@@ -361,21 +493,22 @@ def _upstream_hashes(
     """
     hashes: list[str] = []
     for upstream in UPSTREAM_STAGES.get(stage, ()):
-        plan = _current_plan(study, case_study, label, upstream, predictions)
+        plan = _plan_in_force(study, case_study, label, upstream, in_force)
         if plan is not None:
             hashes.append(plan.hash)
     return tuple(hashes)
 
 
-def _current_plan(
-    study: Study, case_study: str, label: str, stage: str, predictions: str
+def _plan_in_force(
+    study: Study, case_study: str, label: str, stage: str, in_force: frozenset[str] | None
 ) -> OfficialPopulation | None:
-    """The plan in force for this stage, complete and attested, or ``None`` where none is recorded.
+    """The plan in force for this stage, complete, attested and covering the current pool.
 
-    Absent is distinct from empty: ``create`` refuses an empty member list, so a recorded plan
-    always admits something. It is also distinct from unreadable and from ambiguous - a name
-    resolving to two current identities is a forked lineage that needs a person, and reading
-    either of those as absence would drop the membership filter and admit historical rows.
+    ``None`` where no plan is recorded for this stage of this label at all. Absent is distinct
+    from empty: ``create`` refuses an empty member list, so a recorded plan always admits
+    something. It is also distinct from unreadable and from ambiguous - a name resolving to two
+    current identities is a forked lineage that needs a person, and reading either of those as
+    absence would drop the membership filter and admit historical rows.
 
     A recorded plan is required to be complete before its members are handed back. Plans are
     published *before* their sweep executes, so a current-but-incomplete plan is exactly what
@@ -387,28 +520,142 @@ def _current_plan(
     Completeness is necessary and not sufficient, so the attestation is required too. See
     :func:`sweep_attestation_name`: a member that failed against a registered artifact from a
     different prediction window leaves the plan complete, and only the run knows it failed.
+
+    **And it has to describe the pool in force, which is asked of the plan's contents rather
+    than of its name.** The name used to carry :func:`predictions_identity` and the lookup used
+    to be an equality on it, because the member-side inference that was tried - does every
+    planned member still ride a prediction in force - catches a prediction the pool lost and
+    cannot see one it gained, "because the backtests that would ride a new prediction do not
+    exist until the sweep runs". That is true of that direction, and the other direction is
+    readable off the same two sets. Both are asked here, and each names what it found:
+
+    * ``in_force - planned`` is the predictions that have **no** planned backtest. Nothing has
+      priced them, so the grid really is short. Asked of the baseline only: it is the one stage
+      whose grid is drawn from the pool, while allocation and risk price the configurations
+      their upstream advanced - ten of sixty on ``sp500_equity_option_analytics``'s direction
+      labels - and charging those against the pool reports fifty uncovered on a chain doing
+      exactly what it declares.
+    * ``planned - in_force`` is the predictions this grid priced that the pool has since lost.
+      Asked of every stage, because a removal moves the ranking the stage after it advances
+      from: drop one of ten advancing configurations and the eleventh should now advance, while
+      the allocation plan is still complete, still attested against an unchanged baseline plan
+      hash, and prices nine. Narrowing the members and ranking the nine would publish a grid
+      the rule no longer specifies.
+
+    So what the plan is held to is the rule - does it price exactly the predictions this label's
+    pool admits today - rather than an equality against the digest that rule produced on some
+    earlier day. The difference is not cosmetic: the digest is computed from
+    ``prediction_members_in_force``, whose screen is repo code, so it moves when that code is
+    corrected and nothing else has changed at all. That is what retired all fifteen of one case
+    study's plans in one afternoon - see :func:`sweep_plan_name` - and it is also why the two
+    findings are reported separately: one is a sweep to run and the other is a stage to re-derive.
     """
-    name = sweep_plan_name(case_study, label, stage, predictions)
+    recorded = _plan_names_in_force(study, case_study, label, stage)
+    if not recorded:
+        return None
+    first_failure: _PlanDoesNotCover | None = None
+    for name in recorded:
+        try:
+            return _plan_under_name(study, name, case_study, label, stage, in_force)
+        except _PlanDoesNotCover as exc:
+            # Only this one. An incomplete or unattested plan is not a plan for a different
+            # pool, it is a sweep that has to be reported, and falling past it would let an
+            # older plan answer for it. That is reachable rather than theoretical: a plan name
+            # hashes the whole pool while coverage is checked per label, so changing one
+            # label's predictions mints a new plan name for every *other* label whose
+            # predictions did not move. If one of those new sweeps is interrupted, its
+            # predecessor covers the same predictions exactly - and would be accepted.
+            if first_failure is None:
+                first_failure = exc
+    assert first_failure is not None
+    raise first_failure
+
+
+def _plan_under_name(
+    study: Study,
+    name: str,
+    case_study: str,
+    label: str,
+    stage: str,
+    in_force: frozenset[str] | None,
+) -> OfficialPopulation | None:
+    """One recorded plan, held to every condition :func:`_plan_in_force` documents."""
     names = _population_names(study)
-    if names is None or name not in names:
+    if names is None:
         return None
     plan = OfficialPopulation.one(study, name=name)
     plan.require_complete()
-    upstream = _upstream_hashes(study, case_study, label, stage, predictions)
+    upstream = _upstream_hashes(study, case_study, label, stage, in_force)
     if not _attested(names, plan, upstream):
         raise ValueError(
             f"sweep plan {name} is complete but records no attestation for the grid it now "
             "describes, so the run that filled it either reported failures, did not finish, "
             "or ran against an upstream grid that has since been superseded; re-run that sweep"
         )
+    if in_force is not None:
+        wanted = _in_force_for_label(study, in_force, label)
+        planned = _plan_predictions(study, plan.members)
+        # A stage whose grid is drawn from the pool has to price all of it. The baseline is the
+        # only such stage; the two after it price what their upstream advanced.
+        if not UPSTREAM_STAGES.get(stage, ()):
+            _refuse(
+                sorted(wanted - planned),
+                f"sweep plan {name} prices {len(plan.members)} backtests and none of them "
+                f"rides {{count}} of the {len(wanted)} {label} prediction sets in force: "
+                "{listed}. This grid was not asked to include them, so ranking what it does "
+                "hold would rank a grid the pool no longer describes. Whether some earlier run "
+                f"priced them is a separate question - what is missing is a {stage!r} plan "
+                f"covering the pool in force. Run the {stage!r} sweep for {label}.",
+            )
+        # Every stage, including the ones above it in the chain. A prediction leaving the pool
+        # moves the ranking the next stage advances from - drop one of ten advancing
+        # configurations and the eleventh should now advance - while the downstream plan stays
+        # complete and stays attested, because the upstream plan's identity did not change.
+        _refuse(
+            sorted(planned - wanted),
+            f"sweep plan {name} prices {{count}} {label} prediction sets the pool no longer "
+            "admits: {listed}. What the rule selects from has changed under this grid, so "
+            f"ranking the members that are left would publish a {stage!r} grid the rule no "
+            f"longer specifies - and any stage derived from it advanced from a ranking that "
+            f"has moved. Re-run the {stage!r} sweep for {label}.",
+        )
     return plan
 
 
+class _PlanDoesNotCover(RuntimeError):
+    """This plan's grid and the pool in force do not describe the same predictions.
+
+    Its own type, because it is the one failure that says something about *which* plan was
+    asked rather than about the sweep behind it: another recorded plan may cover the pool, and
+    :func:`_plan_in_force` goes on to ask. Completeness and attestation are not like that - a
+    plan failing either is a sweep to re-run, and it has to be reported rather than fallen
+    past. A ``RuntimeError`` so that :func:`unfinished_sweep_plans`, which catches that, keeps
+    reporting it unchanged.
+    """
+
+
+def _refuse(missing: Sequence[str], template: str) -> None:
+    """Raise ``template`` naming up to five of ``missing``, or return where there are none."""
+    if not missing:
+        return
+    listed = ", ".join(missing[:5])
+    if len(missing) > 5:
+        listed += f" (+{len(missing) - 5} more)"
+    raise _PlanDoesNotCover(template.format(count=len(missing), listed=listed))
+
+
 def _plan_members(
-    study: Study, case_study: str, label: str, stage: str, predictions: str
+    study: Study, case_study: str, label: str, stage: str, in_force: frozenset[str] | None
 ) -> set[str] | None:
-    """The backtests the plan in force admits, or ``None`` where no plan is recorded."""
-    plan = _current_plan(study, case_study, label, stage, predictions)
+    """The backtests the plan in force admits, or ``None`` where no plan is recorded.
+
+    The members are handed back whole. :func:`_plan_in_force` has already required that every
+    prediction this plan priced is still in the pool, so there is nothing to narrow: a plan
+    carrying a member the pool dropped raises there rather than being quietly trimmed here.
+    Trimming was the first shape of this and it is the wrong one - it hands a caller a grid the
+    rule no longer specifies while reporting nothing.
+    """
+    plan = _plan_in_force(study, case_study, label, stage, in_force)
     return None if plan is None else set(plan.members)
 
 
@@ -427,9 +674,12 @@ def upstream_plan_hashes(
     attested it. A sweep that ranks before calling it is ranking rows that no current upstream
     plan need contain.
     """
-    return _upstream_hashes(
-        study, case_study, label, stage, predictions_identity(prediction_hashes)
-    )
+    return _upstream_hashes(study, case_study, label, stage, _in_force(prediction_hashes))
+
+
+def _in_force(prediction_hashes: Collection[str] | None) -> frozenset[str] | None:
+    """The prediction pool a plan has to cover, or ``None`` where the case study declares none."""
+    return None if prediction_hashes is None else frozenset(prediction_hashes)
 
 
 def planned_backtests(
@@ -444,16 +694,17 @@ def planned_backtests(
 
     ``None`` where this case study records no plan for any stage, which is how the case studies
     that predate plans keep the field they were published with. Where it records plans and this
-    one is absent, the sweep has not run against the prediction sets in force and ranking its
-    historical rows would rank another generation's grid, so it raises.
+    one is absent, the sweep has never run for this label and stage and ranking its historical
+    rows would rank a grid nothing declared, so it raises. A plan that exists but does not
+    cover the pool in force raises from :func:`_plan_in_force`, naming the members it misses.
     """
-    predictions = predictions_identity(prediction_hashes)
-    members = _plan_members(study, case_study, label, stage, predictions)
+    in_force = _in_force(prediction_hashes)
+    members = _plan_members(study, case_study, label, stage, in_force)
     if members is None and publishes_sweep_plans(study, case_study):
         raise RuntimeError(
             f"{case_study} publishes sweep plans, and none is recorded for {label} "
-            f"at the {stage!r} stage against the prediction sets in force ({predictions}). "
-            "That sweep has not been run against them, so the rows this stage does have "
+            f"at the {stage!r} stage under any generation of the prediction pool. "
+            "That sweep has not been run, so the rows this stage does have "
             "belong to another generation. Run the sweep for this label."
         )
     return members
@@ -489,15 +740,14 @@ def unfinished_sweep_plans(
     there is no path that stops a label at its baseline. Should one ever be added, it has to
     publish that decision, because nothing in the rows distinguishes it from an unstarted run.
 
-    **Which predictions a plan ran against is in its name, not inferred from its members.** A
-    plan supersedes only when its own sweep re-runs, so after a refit the previous generation
-    would otherwise still be the plan in force under a fixed name - and still complete, because
-    its members are still registered. Two inferences were tried and each answered one direction:
-    asking whether the members ride predictions still in force catches a prediction the refit
-    removed, and cannot see one it added, because the backtests that would ride a new prediction
-    do not exist until the sweep runs. The name carries :func:`predictions_identity` instead, so
-    a sweep that has not run against the predictions in force is simply absent under the name
-    being looked up, and absent is a case this already handles.
+    **Which predictions a plan ran against is read from its members, not matched into its
+    name.** The name carries :func:`predictions_identity` and it used to be part of the lookup,
+    so a sweep that had not run against the pool in force was absent under the name being
+    looked up - and absent was already handled. That answered the question, and it answered a
+    second one the same way: a pool that moved for any reason at all, including a correction to
+    the screen that computes it, made every plan absent with no sweep, row or grid having
+    changed. :func:`_plan_in_force` asks the covering question of the plan's contents instead,
+    and reports the members it misses rather than the plan being gone.
 
     Absent and incomplete are reported the same way on purpose. A plan that was never written
     is a sweep that either has not run or ran before plans were recorded, and neither is a
@@ -505,24 +755,31 @@ def unfinished_sweep_plans(
 
     ``OperationalError`` is caught alongside the rest because a registry that predates official
     populations has no table to query, which is an absent plan and not a broken one.
+    ``RuntimeError`` is caught because that is what an uncovered pool raises.
     """
+    in_force = _in_force(prediction_hashes)
     predictions = predictions_identity(prediction_hashes)
-    names = _population_names(study)
     unfinished: list[str] = []
     for label in labels:
         for stage in stages:
-            name = sweep_plan_name(case_study, label, stage, predictions)
+            # The name a sweep run now would publish under, so an absent plan is still reported
+            # against something addressable rather than against `None`.
+            recorded = _plan_names_in_force(study, case_study, label, stage)
+            name = (
+                recorded[0] if recorded else sweep_plan_name(case_study, label, stage, predictions)
+            )
             try:
-                plan = OfficialPopulation.one(study, name=name)
-                plan.require_complete()
-                upstream = _upstream_hashes(study, case_study, label, stage, predictions)
-                if not _attested(names, plan, upstream):
-                    raise ValueError(
-                        "complete, but no attestation for the grid it now describes - the run "
-                        "that filled it reported failures, did not finish, or ran against an "
-                        "upstream grid that has since been superseded"
+                if _plan_in_force(study, case_study, label, stage, in_force) is None:
+                    raise KeyError(
+                        f"no sweep plan is recorded for {label} at the {stage!r} stage "
+                        "under any generation of the prediction pool"
                     )
-            except (KeyError, ValueError, sqlite3.OperationalError) as exc:
+            except (
+                KeyError,
+                ValueError,
+                RuntimeError,
+                sqlite3.OperationalError,
+            ) as exc:
                 unfinished.append(f"{label} {stage} ({name}): {exc}")
     return unfinished
 
@@ -678,8 +935,15 @@ def label_of(study: Study, result: Result) -> str:
     The selection ranges over every declared label, so the label the stages after it must
     use is a property of what won - never ``labels.primary``, which is only the winner's
     label by coincidence.
+
+    The registry read is ``result.root``, not ``study.root``: the result carries the root it
+    was actually resolved from, which under a preview study is ``.preview/<case>`` and under
+    a released baseline is the release root. Reading ``study.root`` asked the canonical
+    registry about a hash that only the preview one holds, and raised "has no label in this
+    registry" about a backtest the line above had just ranked. For a canonical workspace
+    result the two are the same path.
     """
-    registry = study.root / "run_log" / "registry.db"
+    registry = result.root / "run_log" / "registry.db"
     with sqlite3.connect(f"file:{registry}?mode=ro", uri=True) as db:
         row = db.execute(
             """

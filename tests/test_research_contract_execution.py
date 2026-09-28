@@ -1470,3 +1470,127 @@ def test_a_sweep_that_computes_nothing_reports_that_it_computed_nothing(tmp_path
     assert len(warm.results) == 2, "the re-run still resolves both members"
     assert (warm.n_computed, warm.n_reused) == (0, 2)
     assert {r.hash for r in warm.results} == {r.hash for r in cold.results}
+
+
+def test_reuse_disclosure_never_opens_on_a_zero_count() -> None:
+    """A warm re-run reads as reuse, not as a section that computed nothing.
+
+    The phrasing this replaced was a count pair, so the all-reused case rendered as
+    ``0 computed, 262 served from the registry``. Read by someone reading the chapter
+    rather than the run, the leading zero says the backtest section did nothing, when
+    what happened is that an earlier execution computed all 262 and this one reused
+    them. This asserts the reader-facing property directly: no wording this function
+    produces begins with a zero.
+    """
+    from case_studies.research import reuse_disclosure
+
+    assert reuse_disclosure(0, 262) == (
+        "reused all 262 from the registry, computed by an earlier run"
+    )
+    assert reuse_disclosure(262, 0) == "computed all 262"
+    assert reuse_disclosure(40, 222) == "computed 40, reused 222 from the registry"
+    assert reuse_disclosure(0, 0) == "nothing to compute"
+
+    for computed, reused, failed in [
+        (0, 262, 0),
+        (262, 0, 0),
+        (40, 222, 0),
+        (0, 0, 0),
+        (0, 5, 2),
+        (5, 0, 1),
+        (3, 4, 1),
+    ]:
+        text = reuse_disclosure(computed, reused, failed)
+        assert not text.lstrip().startswith("0 "), text
+        if failed:
+            assert text.endswith(f", {failed} failed"), text
+        else:
+            assert "failed" not in text, text
+
+
+def test_backtest_execution_discloses_its_own_counts(tmp_path: Path, monkeypatch) -> None:
+    """The property on the execution and the free function agree.
+
+    Four notebooks report through ``execution.disclosure()`` and ten through the free
+    function over counts they track themselves. If the two could disagree the sweep would
+    word the same fact two ways across the nine case studies, which is the reason the
+    wording lives in one place at all.
+    """
+    from case_studies.research import reuse_disclosure
+    from case_studies.research.execution import BacktestExecution
+
+    execution = BacktestExecution(
+        results=(),
+        catalog_rows=pl.DataFrame(),
+        diagnostics=(
+            {"status": "completed"},
+            {"status": "completed"},
+            {"status": "reused"},
+        ),
+        population=None,
+    )
+    assert execution.n_computed == 2
+    assert execution.n_reused == 1
+    assert execution.disclosure() == reuse_disclosure(2, 1)
+    assert execution.disclosure(3) == reuse_disclosure(2, 1, 3)
+
+
+def test_no_case_study_notebook_spells_its_own_reuse_disclosure() -> None:
+    """Every sweep summary routes through the shared wording, and none rebuilds it.
+
+    The wording was worth fixing only because it is the same sentence in fourteen
+    notebooks; fixing one and leaving the rest would make that one the odd case study out,
+    which is worse for a reader than the phrasing it replaced. So the regression to guard
+    is not the old text returning to a line already changed - it is the next sweep
+    spelling its own count pair beside the shared one, which no unit test of
+    ``reuse_disclosure`` can see.
+
+    What is banned is a count interpolated directly before ``computed`` or ``served from
+    the registry``, which is the shape that renders as ``0 computed, 262 served from the
+    registry`` against a warm registry. The model notebooks' ``{n} configurations:
+    {fitted} folds fitted, {reused} reused`` is deliberately not banned: its leading count
+    is the configuration total, which is never zero, so the sentence reads correctly warm
+    - twenty configurations, none refitted, five hundred folds reused. Same for the
+    ``Planned {n} backtests; {m} already complete`` lines, which state a plan before the
+    sweep rather than what the sweep did.
+
+    The scan is over the ``.py`` halves, which is where a notebook is edited, and skips
+    comment lines: a markdown cell explaining what reuse means is not a disclosure, and
+    several of these notebooks carry one.
+    """
+    import re
+
+    case_studies = Path(__file__).resolve().parents[1] / "case_studies"
+    spellings = re.compile(r"\{[^{}]+\}\s*(?:computed|served from the registry)|computed\s*=\s*\{")
+    offenders = []
+    for path in sorted(case_studies.glob("*/[0-9]*.py")):
+        for number, line in enumerate(path.read_text().splitlines(), start=1):
+            stripped = line.lstrip()
+            if stripped.startswith("#"):
+                continue
+            if "reuse_disclosure(" in line or ".disclosure(" in line:
+                continue
+            if spellings.search(line):
+                offenders.append(f"{path.relative_to(case_studies.parent)}:{number}: {stripped}")
+    assert not offenders, (
+        "these lines build a reuse disclosure instead of calling reuse_disclosure():\n"
+        + "\n".join(offenders)
+    )
+
+
+def test_the_reuse_disclosure_guard_catches_the_phrasing_it_replaced() -> None:
+    """The guard above passes; this is what shows it can fail.
+
+    A scan that finds nothing is indistinguishable from a scan whose pattern is broken, so
+    the exact line #1083 was filed against is run through the same expression here.
+    """
+    import re
+
+    spellings = re.compile(r"\{[^{}]+\}\s*(?:computed|served from the registry)|computed\s*=\s*\{")
+    assert spellings.search('f"  this execution: {execution.n_computed} computed, "')
+    assert spellings.search('f"{execution.n_reused} served from the registry"')
+    assert spellings.search('f"completed={completed}, skipped={skipped}"') is None
+    assert (
+        spellings.search('f"{len(execution.runs)} configurations: {fitted} folds fitted"') is None
+    )
+    assert spellings.search('f"  this execution: {execution.disclosure()}"') is None

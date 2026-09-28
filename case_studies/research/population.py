@@ -81,6 +81,36 @@ def retired_prediction_hashes(connection: sqlite3.Connection) -> set[str]:
     return published - live
 
 
+SUPERSEDES_LIVE = "live"
+"""A declaration that names the lineage's live generation rather than a hash.
+
+A ``SUPERSEDES_*`` hash is a committed constant that has to equal a value the registry moves on
+every publish, and the two sides cannot both be kept. Measured over the committed corpus on
+2026-09-11: of 48 declared literals, 6 named the generation ``create`` would accept, 19 named the
+one it had already replaced, 8 named a generation no lineage holds, and 5 named a hash that
+cannot be placed at all. So the hash pins which generation was replaced in 6 cases out of 48,
+and in the other 19 it is a value ``create`` refuses - at the freeze, after the fit.
+
+``"live"`` states the thing the declaration is actually for: *this run intends to extend the
+lineage published under this name*. That is a property of the run, so it does not go stale, and
+it is the only part of the declaration ``create`` cannot work out for itself - the resolvers are
+already called with ``name=``, and the predecessor's hash is a lookup under that name. The
+record of which generation was replaced is written by ``create`` into
+``official_populations.supersedes_hash`` and ``candidate_set_names.supersedes_hash``, which is
+where a reader looks for a lineage anyway; it was never recoverable from the source.
+
+It does not weaken any refusal. A lineage this run does not name is still refused when its
+membership moves, which is the guard's whole job, and on a clean clone ``"live"`` resolves to
+nothing at all because there is no generation under the name - so a reader still publishes
+generation one. What it removes is the case where the author named the lineage, meant to extend
+it, and was refused for quoting a hash that had moved underneath them.
+
+A hash remains valid and is still the stronger statement where an author genuinely knows which
+generation they are replacing. ``scripts/check_supersedes_literals.py`` reports one that has
+drifted and names ``"live"`` as the repair.
+"""
+
+
 def research_name(case_study_id: str, suffix: str, *, scope: str = "") -> str:
     """Name one published artifact, isolated as a whole chain when a run is narrowed.
 
@@ -372,6 +402,11 @@ def population_supersedes(study: Study, *, name: str, declared: str | None) -> s
     - **The refit.** The declaration names the tip itself, ``current.hash == declared``, and
       offering it publishes the next generation over that tip.
 
+    A declaration of :data:`SUPERSEDES_LIVE` resolves to the tip in every one of those three, and
+    is the form that does not decay: the other two arms are a quotation of a value the registry
+    moves. The clean-clone case is unchanged by it - the lookup above fails and nothing is
+    offered - so the reader still publishes generation one.
+
     Anything else is withheld, and ``create`` then refuses and names the hash it requires - a
     better answer than this function guessing. Note that the two matching conditions are both
     needed: testing only the first withholds the hash from an author holding generation one who
@@ -408,6 +443,12 @@ def population_supersedes(study: Study, *, name: str, declared: str | None) -> s
             # predecessor. Same rule as `_lineage`.
             raise
         return None
+    if declared == SUPERSEDES_LIVE:
+        # The lineage is named, so the predecessor is a lookup rather than a quotation. See
+        # `SUPERSEDES_LIVE`: this is the only branch whose correctness does not decay when the
+        # registry publishes, and it reaches here only after the clean-clone and preview cases
+        # above have already withheld it.
+        return current.hash
     return declared if declared in (current.supersedes, current.hash) else None
 
 
@@ -420,9 +461,11 @@ def supersedes_for_run(
 ) -> str | None:
     """Resolve the ``supersedes`` hash a model-execution run should pass.
 
-    Notebooks declare the hash their published population replaced as a literal in the parameter
-    cell, so that running the committed ``.py`` as it stands recomputes the population on record.
-    Whether that literal may be offered is :func:`population_supersedes`' decision, and this
+    Notebooks declare what their published population replaced as a literal in the parameter
+    cell - either the predecessor's hash, or :data:`SUPERSEDES_LIVE` to name the lineage's live
+    generation without quoting it - so that running the committed ``.py`` as it stands recomputes
+    the population on record. Whether that literal may be offered is
+    :func:`population_supersedes`' decision, and this
     function is the model-execution entry point to it: it adds the one thing that decision cannot
     see, which is the tier the run was planned in.
 
@@ -519,15 +562,46 @@ def split_retired_members(
     import polars as pl
 
     if column not in index.columns:
+        carried = (
+            "no columns at all, so it is an empty result rather than a mis-shaped one"
+            if not index.columns
+            else f"{sorted(index.columns)}"
+        )
         raise ValueError(
             f"candidate index has no {column!r} column, so retirement cannot be decided on it; "
-            f"it carries {sorted(index.columns)}"
+            f"it carries {carried}"
         )
     retired = superseded_members(study, member_kind=member_kind)
     if not retired:
         return RetirementSplit(live=index, retired=index.clear())
     is_retired = pl.col(column).is_in(list(retired))
     return RetirementSplit(live=index.filter(~is_retired), retired=index.filter(is_retired))
+
+
+def _membership_root(study: Study) -> Path:
+    """The registry whose populations answer for the rows this study is reading.
+
+    ``study.root`` is the released case directory whatever tier the study was opened for -
+    ``activate`` redirects every later path lookup into ``.preview/<case>`` and deliberately
+    leaves ``root`` where it is. Asking membership of it under a preview therefore asks the
+    CANONICAL registry whether the predictions this run has just fitted are published, and they
+    never are: measured on the etfs smoke chain 2026-09-05, a preview workspace holding 247
+    prediction sets scored zero against the release's published set, and every stage from
+    ``13_model_analysis`` on refused with "nothing published to sweep" or "no live prediction
+    sets". Six notebooks, one cause.
+
+    A preview root answers ``None`` instead, because it declares no populations and cannot:
+    :func:`_refuse_preview_activation` stops a reduced run from publishing one, on the grounds
+    that a population is canonical by definition. ``None`` is the documented "membership cannot
+    be asked here" case, so the caller falls back to the exclusion split and the index passes
+    through - the same answer a fixture registry gets, and the only honest one for rows nothing
+    has published or retired.
+
+    Canonical is untouched: ``storage_root(CANONICAL)`` is ``study.root``.
+    """
+    if _preview_is_active(study) and not study.read_only:
+        return study.storage_root(ExecutionTier.PREVIEW)
+    return study.root
 
 
 def split_unpublished_members(
@@ -562,11 +636,16 @@ def split_unpublished_members(
     import polars as pl
 
     if column not in index.columns:
+        carried = (
+            "no columns at all, so it is an empty result rather than a mis-shaped one"
+            if not index.columns
+            else f"{sorted(index.columns)}"
+        )
         raise ValueError(
             f"candidate index has no {column!r} column, so membership cannot be decided on it; "
-            f"it carries {sorted(index.columns)}"
+            f"it carries {carried}"
         )
-    published = published_members_at(study.root, member_kind=member_kind)
+    published = published_members_at(_membership_root(study), member_kind=member_kind)
     if published is None:
         return split_retired_members(study, index, member_kind=member_kind, column=column)
     is_published = pl.col(column).is_in(list(published))

@@ -8,12 +8,34 @@ import numpy as np
 import pandas as pd
 import polars as pl
 import torch
-from torch.utils.data import Dataset
-
-from utils.modeling import RANDOM_SEED
+from torch.utils.data import Dataset, default_collate
 
 _SEQUENCE_PERIOD_COL = "__sequence_period__"
 _SEQUENCE_PERIOD_CACHE_ATTR = "ml4t_sequence_period_cache"
+
+# Sequence windows are built on the panel's expected observation calendar, not
+# on the symbol's own row order. A symbol that is not quoted on a session keeps
+# its cell in the window; the cell carries no feature values and is marked
+# unobserved. Dropping the cell instead would present a window of `lookback`
+# observations spanning more calendar periods than `lookback` as if it were
+# contiguous, which silently rescales every horizon the model learns - a
+# five-day-ahead target predicted from what the model reads as five days but
+# which actually covers eight.
+OBSERVED_FEATURE = "__observed__"
+STALENESS_FEATURE = "__periods_since_observation__"
+GAP_MASK_FEATURES: tuple[str, str] = (OBSERVED_FEATURE, STALENESS_FEATURE)
+
+# Eligibility bounds, measured rather than assumed. Across the nine panels the
+# observed-cell share of a 60-period window sits at 100% for the median symbol
+# in eight of them, with a thin left tail; 0.90 is the tenth percentile of the
+# four densest panels and keeps 93-100% of their windows. The consecutive bound
+# separates six scattered absences from one six-period outage, which the
+# fraction alone cannot: at a lookback of 60 a 0.90 floor already caps a run at
+# six, so 5 removes only the single-outage case. Distributions and the script
+# that produced them: work/2026-09-08-sequence-gap-policy/ in the agents repo.
+DEFAULT_MIN_OBSERVED_FRACTION = 0.90
+DEFAULT_MAX_CONSECUTIVE_GAP = 5
+GAP_POLICY_ID = "calendar_grid_observation_mask/min_observed=0.90,max_gap=5/v1"
 
 
 @dataclass(slots=True)
@@ -39,12 +61,162 @@ class SequenceStore:
         return int(len(self.entities))
 
 
-class FoldSequenceDataset(Dataset):
-    """Lazy map-style dataset yielding lookback windows on demand."""
+# The share of the card's free memory a fold's feature store may take. Training also
+# needs the model, its gradients and a batch of activations, and the card is shared with
+# whatever else this machine is running, so the store - the one allocation here big
+# enough to decide whether a fold fits - gets a minority of what is free, and the host
+# gather takes the fold when it does not fit.
+DEVICE_STORE_MAX_FREE_FRACTION = 0.4
 
-    def __init__(self, store: SequenceStore, *, include_metadata: bool = False) -> None:
+
+@dataclass(slots=True)
+class GatheredBatch:
+    """A batch ``FoldSequenceDataset.__getitems__`` assembled in one gather.
+
+    torch's map-style fetcher passes whatever ``__getitems__`` returns straight to
+    ``collate_fn``, so the assembled batch travels in this wrapper and the collate
+    functions below hand ``payload`` back untouched. Returning a list of per-sequence
+    samples is the documented shape, and it puts back into the collate step the
+    per-sequence Python work that the batch gather exists to remove.
+    """
+
+    payload: tuple
+
+
+def _device_available_bytes(device: torch.device) -> int:
+    """Bytes this process can still allocate on ``device``.
+
+    ``mem_get_info`` reports what the driver has free, which excludes the blocks torch's
+    caching allocator already holds for this process. Those are reusable, so a fold that
+    has just released its predecessor's store would otherwise read the card as fuller
+    than it is and fall back to the host for the rest of the run.
+    """
+
+    free, _total = torch.cuda.mem_get_info(device)
+    reusable = torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
+    return int(free) + int(reusable)
+
+
+def _resolve_gather_device(store: SequenceStore, device: torch.device | str | None) -> torch.device:
+    """Decide where this fold's flat store lives, by measuring it against the card."""
+
+    if device is None:
+        return torch.device("cpu")
+    device = torch.device(device)
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return torch.device("cpu")
+    if not store.features:
+        return device
+    rows = sum(len(feats) for feats in store.features)
+    sample = store.features[0]
+    # The target column is float32 whatever the features are, because __getitem__ casts it.
+    needed = rows * (int(sample.shape[1]) * sample.dtype.itemsize + 4)
+    if needed > DEVICE_STORE_MAX_FREE_FRACTION * _device_available_bytes(device):
+        return torch.device("cpu")
+    return device
+
+
+def _flatten_store(store: SequenceStore, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    """Concatenate the per-symbol arrays into one feature and one target tensor.
+
+    On a CUDA device each symbol is copied straight to the card, so the host never holds
+    a second copy of the fold. The host path concatenates, which does hold one: that is
+    what the fallback's vectorized gather costs.
+    """
+
+    if not store.features:
+        return (
+            torch.zeros((0, 0), dtype=torch.float32, device=device),
+            torch.zeros(0, dtype=torch.float32, device=device),
+        )
+
+    if device.type == "cpu":
+        features = torch.from_numpy(np.concatenate(store.features))
+        targets = torch.from_numpy(np.concatenate(store.targets)).to(torch.float32)
+        return features, targets
+
+    total = int(sum(len(feats) for feats in store.features))
+    width = int(store.features[0].shape[1])
+    features = torch.empty(
+        (total, width), dtype=torch.from_numpy(store.features[0][:0]).dtype, device=device
+    )
+    targets = torch.empty(total, dtype=torch.float32, device=device)
+    start = 0
+    for feats, tgts in zip(store.features, store.targets, strict=True):
+        stop = start + len(feats)
+        features[start:stop] = torch.from_numpy(feats)
+        targets[start:stop] = torch.from_numpy(tgts).to(torch.float32)
+        start = stop
+    return features, targets
+
+
+class FoldSequenceDataset(Dataset):
+    """Map-style dataset gathering lookback windows one batch at a time.
+
+    ``__getitems__`` (note the plural) is the method that carries the work. torch's
+    map-style fetcher calls it with the whole index list the sampler chose and hands
+    whatever it returns straight to ``collate_fn``, so one strided gather replaces one
+    Python call per sequence. The sampler still decides which indices land in which
+    batch and in what order, so the batches are the ones ``__getitem__`` would have
+    produced, in the same order and with the same values.
+
+    The fold's features are held as one flat ``(total_rows, n_features)`` tensor with a
+    row offset per symbol, which makes a window a contiguous row range and a batch of
+    windows a single index. ``device`` decides where that tensor lives. On a CUDA device
+    the gather runs on the card and the batch is already there when the model reads it;
+    otherwise it runs on the host, which still removes the per-sequence Python call. The
+    choice is made here, at fold setup, by measuring the store against what the card has
+    free - not by attempting the allocation and catching the failure, which would leave
+    the fold half set up and the card fragmented.
+
+    ``__getitem__`` is unchanged and still reads the store's per-symbol arrays. It is the
+    reference the batch gather is tested against.
+    """
+
+    def __init__(
+        self,
+        store: SequenceStore,
+        *,
+        include_metadata: bool = False,
+        device: torch.device | str | None = None,
+    ) -> None:
         self.store = store
         self.include_metadata = include_metadata
+
+        self._symbol_idx = np.asarray(store.symbol_idx, dtype=np.int64)
+        self._end_idx = np.asarray(store.end_idx, dtype=np.int64)
+        lengths = np.asarray([len(feats) for feats in store.features], dtype=np.int64)
+        self._row_offset = np.concatenate(([0], np.cumsum(lengths)[:-1])).astype(np.int64)
+        # The flat row holding each sequence's target. Its window is the ``lookback``
+        # rows before it, which is the slice [end - lookback, end) that __getitem__ takes.
+        self._target_row = self._row_offset[self._symbol_idx] + self._end_idx
+
+        gather_device = _resolve_gather_device(store, device)
+        self._features, self._targets = _flatten_store(store, gather_device)
+        self._target_row_t = torch.as_tensor(self._target_row, device=gather_device)
+        self._window_offsets = torch.arange(
+            -store.lookback, 0, dtype=torch.long, device=gather_device
+        )
+        # Only the evaluation dataset emits these, and a fold's timestamp column is tens
+        # of megabytes, so the training dataset does not build a flat copy it never reads.
+        self._entities = np.asarray(store.entities, dtype="U64") if include_metadata else None
+        self._timestamps = (
+            np.concatenate(store.timestamps)
+            if include_metadata and store.timestamps
+            else np.zeros(0, dtype="datetime64[ns]")
+        )
+
+    @property
+    def gather_device(self) -> torch.device:
+        """Where a gathered batch is produced, and so where it already lives."""
+
+        return self._features.device
+
+    @property
+    def returns_device_tensors(self) -> bool:
+        """Whether batches arrive off the host. This is what decides ``pin_memory``."""
+
+        return self._features.device.type != "cpu"
 
     def __len__(self) -> int:
         return self.store.n_sequences
@@ -61,10 +233,32 @@ class FoldSequenceDataset(Dataset):
         entity = self.store.entities[symbol_id]
         return window, target, timestamp, entity
 
+    def __getitems__(self, indices) -> GatheredBatch:
+        device = self._features.device
+        rows = self._target_row_t[torch.as_tensor(indices, dtype=torch.long, device=device)]
+        X = self._features[rows.unsqueeze(1) + self._window_offsets]
+        y = self._targets[rows]
+        if not self.include_metadata:
+            return GatheredBatch((X, y))
+        host_idx = np.asarray(indices, dtype=np.int64)
+        timestamps = self._timestamps[self._target_row[host_idx]]
+        entities = self._entities[self._symbol_idx[host_idx]]
+        return GatheredBatch((X, y, timestamps, entities))
+
+
+def collate_sequences(batch):
+    """Collate training batches, handing a pre-gathered batch straight back."""
+
+    if isinstance(batch, GatheredBatch):
+        return batch.payload
+    return default_collate(batch)
+
 
 def collate_with_metadata(batch):
     """Collate evaluation batches while preserving timestamps/entities."""
 
+    if isinstance(batch, GatheredBatch):
+        return batch.payload
     X = torch.stack([item[0] for item in batch])
     y = torch.stack([item[1] for item in batch])
     timestamps = np.asarray([item[2] for item in batch])
@@ -133,10 +327,29 @@ def materialize_sequences(
 def _sample_sequence_positions(
     counts: np.ndarray,
     max_sequences: int,
+    stride: int = 0,
 ) -> list[np.ndarray | None]:
-    """Sample sequence endpoints while preserving full symbol coverage."""
+    """Sample sequence endpoints while preserving full symbol coverage.
+
+    ``stride`` spaces the endpoints and lets the count follow, which is what
+    ``modeling.dl.train_sequence_stride_horizons`` declares. It is applied per symbol and
+    counts valid endpoints of that symbol, not panel rows: a symbol that is missing bars has
+    no window ending in the gap, so spacing its endpoints is the closest thing to spacing them
+    in time that a per-symbol index supports. Every symbol with any valid endpoint keeps at
+    least its first, so striding never drops a symbol from the universe.
+
+    ``max_sequences`` is the other form. It fixes the total and derives the spacing from it, so
+    two folds of different length get different spacing; that is the price of a fixed budget.
+    """
 
     sampled_positions: list[np.ndarray | None] = [None] * len(counts)
+    if stride > 1:
+        for idx, n_seq in enumerate(counts):
+            if n_seq > stride:
+                sampled_positions[idx] = np.arange(0, int(n_seq), stride, dtype=np.int64)
+            elif n_seq > 1:
+                sampled_positions[idx] = np.zeros(1, dtype=np.int64)
+        return sampled_positions
     if max_sequences <= 0 or int(counts.sum()) <= max_sequences:
         return sampled_positions
 
@@ -180,6 +393,42 @@ def _sample_sequence_positions(
     return sampled_positions
 
 
+def _period_timestamp_grid(sorted_df: pd.DataFrame, *, date_col: str) -> tuple[int, np.ndarray]:
+    """Return ``(first_period, timestamps)`` covering every period in the panel.
+
+    Indexing is ``timestamps[period - first_period]``. Periods no symbol has a
+    row for still get a cell, because for a fixed-cadence panel the period
+    numbers are generated from the cadence rather than from the observed rows,
+    so a bar the whole panel is missing leaves a hole in the numbering that a
+    per-symbol window can span. Their timestamp is reconstructed from the
+    panel's own period spacing; a lookup that fell through to the next present
+    period instead would put the same timestamp on two adjacent cells and make
+    a window's own time axis non-monotonic.
+    """
+
+    pairs = sorted_df[[_SEQUENCE_PERIOD_COL, date_col]].drop_duplicates(
+        subset=[_SEQUENCE_PERIOD_COL]
+    )
+    pairs = pairs.sort_values(_SEQUENCE_PERIOD_COL, kind="stable")
+    periods = pairs[_SEQUENCE_PERIOD_COL].to_numpy(dtype=np.int64)
+    stamps = pairs[date_col].to_numpy(dtype="datetime64[ns]").astype("int64")
+    first = int(periods[0])
+    span = int(periods[-1]) - first + 1
+    grid = np.full(span, np.iinfo(np.int64).min, dtype=np.int64)
+    grid[periods - first] = stamps
+    missing = grid == np.iinfo(np.int64).min
+    if missing.any():
+        step_periods = np.diff(periods)
+        step_time = np.diff(stamps)
+        cadence = int(np.median(step_time[step_periods == 1])) if (step_periods == 1).any() else 0
+        if cadence <= 0:
+            cadence = int(np.median(step_time // np.maximum(step_periods, 1)))
+        positions = np.arange(span, dtype=np.int64)
+        anchor = np.maximum.accumulate(np.where(~missing, positions, -1))
+        grid[missing] = grid[anchor[missing]] + (positions[missing] - anchor[missing]) * cadence
+    return first, grid.astype("datetime64[ns]")
+
+
 def _build_symbol_arrays(
     fold_df: pd.DataFrame,
     *,
@@ -188,8 +437,30 @@ def _build_symbol_arrays(
     date_col: str,
     entity_col: str,
     lookback: int,
+    min_observed_fraction: float = DEFAULT_MIN_OBSERVED_FRACTION,
+    max_consecutive_gap: int = DEFAULT_MAX_CONSECUTIVE_GAP,
+    emit_gap_mask: bool = True,
+    min_end_timestamp: pd.Timestamp | None = None,
 ) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray], list[str], list[np.ndarray]]:
-    """Convert a fold dataframe into per-symbol arrays and valid endpoints."""
+    """Convert a fold dataframe into per-symbol calendar-grid arrays and endpoints.
+
+    Each symbol is laid out on the panel's expected observation periods between
+    its first and last row, so index arithmetic on the arrays is arithmetic in
+    calendar periods. Periods the symbol has no row for are present as cells
+    with missing features, an ``observed`` flag of zero, and the number of
+    periods since its last real observation. A window is eligible when it ends
+    on a real observation with a finite target, at least
+    ``min_observed_fraction`` of its cells are real, and no run of consecutive
+    missing cells exceeds ``max_consecutive_gap``.
+
+    ``min_end_timestamp`` bounds which targets a window may predict. The
+    validation frame carries priming rows from before the fold boundary so the
+    first validation window has a full input history; without this bound those
+    priming rows would themselves be predicted, emitting validation predictions
+    for training-period targets. The boundary is enforced here rather than left
+    to the size of the priming tail, which is sized for calendar coverage and
+    is not a statement about where predictions begin.
+    """
 
     if fold_df.empty:
         return [], [], [], [], []
@@ -210,24 +481,92 @@ def _build_symbol_arrays(
     date_col_dtype = sorted_df[date_col].dtype
     if hasattr(date_col_dtype, "tz") and date_col_dtype.tz is not None:
         sorted_df = sorted_df.assign(**{date_col: sorted_df[date_col].dt.tz_convert(None)})
+
+    # Inserted cells still need a timestamp, because a store's timestamp array
+    # is indexed by grid position. Take it from the panel's own period/timestamp
+    # pairing rather than interpolating, so an inserted cell carries the session
+    # it stands for and never a date the panel does not trade on.
+    panel_first_period, panel_timestamps = _period_timestamp_grid(sorted_df, date_col=date_col)
+
+    n_features = len(feature_names)
+    n_mask = len(GAP_MASK_FEATURES) if emit_gap_mask else 0
+
     for symbol, sym_df in sorted_df.groupby(entity_col, sort=False):
-        n_rows = len(sym_df)
-        if n_rows < lookback + 1:
+        periods = sym_df[_SEQUENCE_PERIOD_COL].to_numpy(dtype=np.int64)
+        if len(periods) == 0:
             continue
-        feats = np.nan_to_num(sym_df[feature_names].to_numpy(dtype=np.float32), nan=0.0)
-        targets = sym_df[label_col].to_numpy(dtype=np.float32)
+        first_period = int(periods[0])
+        span = int(periods[-1]) - first_period + 1
+        if span < lookback + 1:
+            continue
+        grid_index = periods - first_period
+
+        observed = np.zeros(span, dtype=bool)
+        observed[grid_index] = True
+
+        feats = np.full((span, n_features + n_mask), np.nan, dtype=np.float32)
+        if n_features:
+            raw = sym_df[feature_names].to_numpy(dtype=np.float32, copy=True)
+            # Keep missing values missing until after normalization. Filling here
+            # would put a raw 0.0 into _compute_feature_stats, which is not the
+            # feature's mean on its own scale - for a strictly positive feature
+            # like a conditional volatility it sits below the observed minimum, so
+            # a symbol with no model-based estimate is presented to the model as
+            # the calmest name in the panel rather than a neutral one. Infinities
+            # are treated as missing for the same reason: np.nan_to_num leaves
+            # posinf on its default, the float32 maximum, which would destroy the
+            # feature's mean and standard deviation for every other symbol.
+            raw[~np.isfinite(raw)] = np.nan
+            feats[grid_index, :n_features] = raw
+
+        # Periods since the last real observation. The grid starts on the
+        # symbol's first observation, so this is defined at every cell.
+        positions = np.arange(span, dtype=np.int64)
+        last_observed = np.maximum.accumulate(np.where(observed, positions, -1))
+        staleness = positions - last_observed
+        if n_mask:
+            # Clipped at the eligibility bound: a longer run never appears inside
+            # an accepted window, and leaving one in would let a symbol that
+            # stopped quoting for five thousand sessions set the scale of this
+            # channel for every other symbol in _compute_feature_stats.
+            feats[:, n_features] = observed.astype(np.float32)
+            feats[:, n_features + 1] = np.minimum(staleness, max_consecutive_gap).astype(np.float32)
+
+        targets = np.full(span, np.nan, dtype=np.float32)
+        targets[grid_index] = sym_df[label_col].to_numpy(dtype=np.float32)
+
         # Cast to datetime64[ns] explicitly so concat/np.asarray downstream
         # never falls back to object dtype.
-        timestamps = sym_df[date_col].to_numpy(dtype="datetime64[ns]")
-        periods = sym_df[_SEQUENCE_PERIOD_COL].to_numpy(dtype=np.int64)
-        candidate_positions = np.arange(lookback, n_rows, dtype=np.int32)
-        steps = np.diff(periods)
-        bad_step_prefix = np.concatenate(([0], np.cumsum(steps != 1, dtype=np.int64)))
-        gap_free = (
-            bad_step_prefix[candidate_positions] == bad_step_prefix[candidate_positions - lookback]
+        timestamps = panel_timestamps[first_period - panel_first_period + positions]
+
+        gap_bound = min(max_consecutive_gap, lookback)
+        candidate_positions = np.arange(lookback, span, dtype=np.int32)
+        # The window a model reads is [end - lookback, end); the target is at end.
+        observed_prefix = np.concatenate(([0], np.cumsum(observed, dtype=np.int64)))
+        observed_in_window = (
+            observed_prefix[candidate_positions] - observed_prefix[candidate_positions - lookback]
         )
+        enough_observed = observed_in_window >= np.ceil(min_observed_fraction * lookback)
+
+        # A run longer than the bound exists in [s, e) exactly when some cell in
+        # [s + max_consecutive_gap, e) closes a run of at least
+        # max_consecutive_gap + 1 missing cells.
+        run_too_long = staleness >= gap_bound + 1
+        run_prefix = np.concatenate(([0], np.cumsum(run_too_long, dtype=np.int64)))
+        gap_within_bound = (
+            run_prefix[candidate_positions] - run_prefix[candidate_positions - lookback + gap_bound]
+        ) == 0
+
+        ends_on_observation = observed[candidate_positions]
         target_is_finite = np.isfinite(targets[candidate_positions])
-        valid_positions = candidate_positions[gap_free & target_is_finite]
+        eligible = ends_on_observation & target_is_finite & enough_observed & gap_within_bound
+        if min_end_timestamp is not None:
+            boundary = pd.Timestamp(min_end_timestamp)
+            if boundary.tz is not None:
+                boundary = boundary.tz_localize(None)
+            eligible &= timestamps[candidate_positions] >= boundary.to_datetime64()
+        valid_positions = candidate_positions[eligible]
+
         features_list.append(feats)
         targets_list.append(targets)
         timestamps_list.append(timestamps)
@@ -243,8 +582,18 @@ def _build_symbol_arrays(
     )
 
 
-def _compute_feature_stats(features_list: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
-    """Compute mean/std across raw training rows without concatenating arrays."""
+def _compute_feature_stats(
+    features_list: list[np.ndarray], *, n_passthrough: int = 0
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute mean/std across raw training rows without concatenating arrays.
+
+    The last ``n_passthrough`` channels are left on their own scale, reported as
+    a mean of zero and a scale of one. They are the observation mask and the
+    staleness count, which already occupy fixed ranges. Standardizing them would
+    tie the value that means "this cell was never observed" to how much of the
+    fold happened to be missing, so the same absence would reach the model as a
+    different number in a dense fold than in a sparse one.
+    """
 
     if not features_list:
         raise ValueError("No feature arrays available to compute scaling statistics")
@@ -252,17 +601,26 @@ def _compute_feature_stats(features_list: list[np.ndarray]) -> tuple[np.ndarray,
     n_features = features_list[0].shape[1]
     sum_x = np.zeros(n_features, dtype=np.float64)
     sum_x2 = np.zeros(n_features, dtype=np.float64)
-    n_rows = 0
+    n_rows = np.zeros(n_features, dtype=np.int64)
 
     for feats in features_list:
-        sum_x += feats.sum(axis=0, dtype=np.float64)
-        sum_x2 += np.square(feats, dtype=np.float64).sum(axis=0, dtype=np.float64)
-        n_rows += feats.shape[0]
+        observed = np.isfinite(feats)
+        values = np.where(observed, feats, 0.0).astype(np.float64)
+        sum_x += values.sum(axis=0, dtype=np.float64)
+        sum_x2 += np.square(values).sum(axis=0, dtype=np.float64)
+        n_rows += observed.sum(axis=0, dtype=np.int64)
 
-    means = sum_x / max(n_rows, 1)
-    variances = np.maximum(sum_x2 / max(n_rows, 1) - np.square(means), 0.0)
+    denominator = np.maximum(n_rows, 1)
+    means = sum_x / denominator
+    variances = np.maximum(sum_x2 / denominator - np.square(means), 0.0)
     stds = np.sqrt(variances)
     stds[stds == 0] = 1.0
+    # A feature observed nowhere in training normalizes to zero everywhere,
+    # which is what the post-normalization fill would give it anyway.
+    means[n_rows == 0] = 0.0
+    if n_passthrough:
+        means[-n_passthrough:] = 0.0
+        stds[-n_passthrough:] = 1.0
     return means.astype(np.float32), stds.astype(np.float32)
 
 
@@ -276,17 +634,26 @@ def _normalize_feature_arrays(
     for feats in features_list:
         feats -= means
         feats /= stds
+        # Now that the arrays are on the training scale, 0.0 is the training
+        # mean of the observed rows, so a row with no observation reads as
+        # average rather than as an extreme. The linear and tabular families
+        # reach the same place by a different route - SimpleImputer fills the
+        # training median and StandardScaler is then fitted on the filled
+        # data - so the normalized values differ; what is shared is that the
+        # fill is a central value of the feature rather than a raw zero.
+        np.nan_to_num(feats, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def _build_sequence_index(
     valid_positions_list: list[np.ndarray],
     entities: list[str],
     max_sequences: int,
+    stride: int = 0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Build flat symbol/end-position indices for a sequence store."""
 
     counts = np.asarray([len(positions) for positions in valid_positions_list], dtype=np.int64)
-    sampled_offsets = _sample_sequence_positions(counts, max_sequences)
+    sampled_offsets = _sample_sequence_positions(counts, max_sequences, stride)
     symbol_parts: list[np.ndarray] = []
     end_parts: list[np.ndarray] = []
 
@@ -399,20 +766,30 @@ def _build_val_df_with_priming(
     date_col: str,
     val_start: pd.Timestamp,
     lookback: int,
+    min_observed_fraction: float = DEFAULT_MIN_OBSERVED_FRACTION,
 ) -> pd.DataFrame:
-    """Per-symbol, keep last `lookback` pre-validation rows plus all validation rows.
+    """Per-symbol, keep the pre-validation priming rows plus all validation rows.
 
     Pre-validation rows provide the input window for the first validation
     target prediction; their labels are not emitted as val targets because
-    sequence positions start at index `lookback` within each symbol's
-    sorted array, and with exactly `lookback` priming rows the first
-    target falls at val_start.
+    sequence positions start at index `lookback` within each symbol's grid,
+    and the priming tail is sized so the first target falls at val_start.
+
+    The tail is counted in observations but the window is counted in calendar
+    periods, and a sparsely quoted symbol needs more of the former to fill the
+    latter. Taking `lookback` observations always spans at least `lookback`
+    periods, so the first window exists either way - but it can be mostly
+    inserted cells and fail the observed-fraction test that the same symbol
+    passes in production, where more history is available. Sizing the tail by
+    the fraction removes that difference between the first validation window
+    and every later one.
     """
+    priming_rows = int(np.ceil(lookback / max(min_observed_fraction, 1e-9)))
     pieces: list[pd.DataFrame] = []
     for _, sym_df in full_val_source.groupby(entity_col, sort=False):
         sym_df = sym_df.sort_values(date_col, kind="stable")
         is_val = sym_df[date_col] >= val_start
-        context_tail = sym_df.loc[~is_val].tail(lookback)
+        context_tail = sym_df.loc[~is_val].tail(priming_rows)
         val_part = sym_df.loc[is_val]
         if context_tail.empty and val_part.empty:
             continue
@@ -466,8 +843,10 @@ def sequence_validation_keys(
     lookback: int,
     calendar_id: str | None = None,
     max_predict_sequences: int = 0,
+    min_observed_fraction: float = DEFAULT_MIN_OBSERVED_FRACTION,
+    max_consecutive_gap: int = DEFAULT_MAX_CONSECUTIVE_GAP,
 ) -> pl.DataFrame:
-    """Return exact validation keys eligible for gap-free sequence prediction.
+    """Return the exact validation keys a sequence model may predict.
 
     ``max_predict_sequences`` caps the windows drawn per fold, using the same
     even-spacing rule and full-symbol-coverage guarantee that
@@ -489,6 +868,7 @@ def sequence_validation_keys(
             date_col=date_col,
             val_start=val_start,
             lookback=lookback,
+            min_observed_fraction=min_observed_fraction,
         )
         _, _, timestamps, entities, valid_positions = _build_symbol_arrays(
             val_df,
@@ -497,6 +877,10 @@ def sequence_validation_keys(
             date_col=date_col,
             entity_col=entity_col,
             lookback=lookback,
+            min_observed_fraction=min_observed_fraction,
+            max_consecutive_gap=max_consecutive_gap,
+            emit_gap_mask=False,
+            min_end_timestamp=val_start,
         )
         sampled = _sample_sequence_positions(
             np.asarray([len(positions) for positions in valid_positions], dtype=np.int64),
@@ -537,12 +921,15 @@ def prepare_fold_sequence_stores(
     lookback: int,
     max_train_sequences: int = 0,
     max_predict_sequences: int = 0,
+    train_sequence_stride: int = 0,
     temporal_by_fold=None,
     temporal_keys: list[str] | None = None,
     temporal_feature_names: list[str] | None = None,
     fold_id: int | None = None,
     val_start: pd.Timestamp | str | None = None,
     calendar_id: str | None = None,
+    min_observed_fraction: float = DEFAULT_MIN_OBSERVED_FRACTION,
+    max_consecutive_gap: int = DEFAULT_MAX_CONSECUTIVE_GAP,
 ) -> tuple[SequenceStore, SequenceStore, dict[str, int]]:
     """Build normalized train/validation sequence stores for a fold.
 
@@ -558,6 +945,7 @@ def prepare_fold_sequence_stores(
     """
 
     _ensure_sequence_periods(dataset_pd, date_col=date_col, calendar_id=calendar_id)
+    feature_names = [name for name in feature_names if name not in GAP_MASK_FEATURES]
     use_cols = [date_col, entity_col, label_col, _SEQUENCE_PERIOD_COL, *feature_names]
     val_start_ts: pd.Timestamp | None
     if val_start is None:
@@ -598,6 +986,7 @@ def prepare_fold_sequence_stores(
                 date_col=date_col,
                 val_start=val_start_ts,
                 lookback=lookback,
+                min_observed_fraction=min_observed_fraction,
             ).copy()
         else:
             val_df = replace_temporal_columns(
@@ -632,6 +1021,8 @@ def prepare_fold_sequence_stores(
             date_col=date_col,
             entity_col=entity_col,
             lookback=lookback,
+            min_observed_fraction=min_observed_fraction,
+            max_consecutive_gap=max_consecutive_gap,
         )
     )
     val_features, val_targets, val_timestamps, val_entities, val_positions = _build_symbol_arrays(
@@ -641,6 +1032,9 @@ def prepare_fold_sequence_stores(
         date_col=date_col,
         entity_col=entity_col,
         lookback=lookback,
+        min_observed_fraction=min_observed_fraction,
+        max_consecutive_gap=max_consecutive_gap,
+        min_end_timestamp=val_start_ts,
     )
 
     if not train_features or not val_features:
@@ -658,12 +1052,12 @@ def prepare_fold_sequence_stores(
             },
         )
 
-    means, stds = _compute_feature_stats(train_features)
+    means, stds = _compute_feature_stats(train_features, n_passthrough=len(GAP_MASK_FEATURES))
     _normalize_feature_arrays(train_features, means, stds)
     _normalize_feature_arrays(val_features, means, stds)
 
     train_symbol_idx, train_end_idx = _build_sequence_index(
-        train_positions, train_entities, max_train_sequences
+        train_positions, train_entities, max_train_sequences, train_sequence_stride
     )
     val_symbol_idx, val_end_idx = _build_sequence_index(
         val_positions, val_entities, max_predict_sequences

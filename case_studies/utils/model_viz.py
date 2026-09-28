@@ -87,7 +87,7 @@ def plot_cv_timeline(
     if fold_ranges.height == 0:
         return
 
-    fig, ax = plt.subplots(figsize=(12, max(4, n_splits * 0.6)))
+    fig, ax = plt.subplots(figsize=(12, max(4, n_splits * 0.6)), layout="tight")
 
     for row in fold_ranges.iter_rows(named=True):
         fold = row["fold_id"]
@@ -222,7 +222,7 @@ def plot_fold_boxplot(
     families = fold_ic["model_label"].unique().sort().to_list()
     n_families = len(families)
 
-    fig, ax = plt.subplots(figsize=(max(8, n_families * 1.5), 5))
+    fig, ax = plt.subplots(figsize=(max(8, n_families * 1.5), 5), layout="tight")
 
     bp_data = []
     for fam in families:
@@ -288,7 +288,7 @@ def plot_bucket_monotonicity(
     if not bucket_results:
         return
 
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig, ax = plt.subplots(figsize=(10, 6), layout="tight")
 
     for i, (label, buckets) in enumerate(bucket_results.items()):
         color = _family_color(label, i)
@@ -400,7 +400,7 @@ def plot_learning_curves(
     n_panels = len(cp_families)
     plotted_ic: list[np.ndarray] = []
     n_configs = 0
-    fig, axes = plt.subplots(n_panels, 1, figsize=(12, 4 * n_panels), squeeze=False)
+    fig, axes = plt.subplots(n_panels, 1, figsize=(12, 4 * n_panels), squeeze=False, layout="tight")
 
     for idx, family in enumerate(sorted(cp_families)):
         ax = axes[idx, 0]
@@ -492,19 +492,34 @@ def plot_feature_importance_heatmap(
         f"scale from 0 to 1.",
     )
 
-    # Recurrence summary
+    # Recurrence summary, on the same aggregation the heatmap above is drawn from.
+    #
+    # `importance_df` carries one row per (config, fold, feature), so a fold's five
+    # highest RAW rows can be five configs agreeing on one feature - measured on
+    # `nasdaq100_microstructure`, fold 0's top five were `time_since_open` five times
+    # over. Counting those rows then made a feature that reached the top five in a
+    # single fold clear a threshold meant to say "in most folds": with two folds the
+    # bar is 1.5, and two configs inside one fold pass it.
+    #
+    # So aggregate to one value per (feature, fold) first, take each fold's top five
+    # from that, and count DISTINCT FOLDS rather than rows. On the same registry the
+    # row count reported two persistent features and the fold count reports three -
+    # `rv_30m` is in both folds' top five and the raw count never saw it.
     n_total_folds = importance_df["fold_id"].n_unique()
+    per_fold = importance_df.group_by(["feature", "fold_id"]).agg(
+        pl.col("importance_norm").mean().alias("importance_norm")
+    )
     top5_per_fold = (
-        importance_df.sort(["fold_id", "importance_norm"], descending=[False, True])
+        per_fold.sort(["fold_id", "importance_norm"], descending=[False, True])
         .group_by("fold_id")
         .head(5)
     )
     recurrence = (
         top5_per_fold.group_by("feature")
-        .agg(pl.len().alias("n_top5"))
-        .sort("n_top5", descending=True)
+        .agg(pl.col("fold_id").n_unique().alias("n_folds_top5"))
+        .sort("n_folds_top5", descending=True)
     )
-    persistent = recurrence.filter(pl.col("n_top5") >= n_total_folds * 0.75)
+    persistent = recurrence.filter(pl.col("n_folds_top5") >= n_total_folds * 0.75)
     if persistent.height > 0:
         print(f"\nPersistent features (top-5 in ≥75% of folds): {persistent['feature'].to_list()}")
 
@@ -526,7 +541,7 @@ def plot_regime_bars(
     families = sorted(regime_df["family"].unique().to_list())
     n_fam = len(families)
 
-    fig, ax = plt.subplots(figsize=(max(8, n_fam * 2), 5))
+    fig, ax = plt.subplots(figsize=(max(8, n_fam * 2), 5), layout="tight")
 
     x = np.arange(n_fam)
     plotted_ic: list[float] = []
@@ -634,7 +649,7 @@ def plot_hac_ci_leaderboard(
         df = df.head(top_n)
 
     n = df.height
-    fig, ax = plt.subplots(figsize=(8, max(3.5, n * 0.28)))
+    fig, ax = plt.subplots(figsize=(8, max(3.5, n * 0.28)), layout="tight")
 
     family_order = list(dict.fromkeys(df[family_col].to_list()))
     palette = {
@@ -884,7 +899,7 @@ def plot_rolling_daily_ic(
     dates = df["date"].to_numpy()
     ic = df["ic"].to_numpy()
 
-    fig, ax = plt.subplots(figsize=(8, 3.2))
+    fig, ax = plt.subplots(figsize=(8, 3.2), layout="tight")
     ax.plot(dates, ic, color="0.7", linewidth=0.4, alpha=0.6, label="Daily IC")
     if window > 1 and df.height >= window:
         roll_mean = (

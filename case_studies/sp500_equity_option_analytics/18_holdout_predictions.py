@@ -68,14 +68,11 @@
 
 import hashlib
 import sqlite3
-import warnings
 from pathlib import Path
 
 import polars as pl
 
-warnings.filterwarnings("ignore")
-
-from case_studies.research import CandidateSet, open_selection_field, open_study
+from case_studies.research import open_selection_field, open_study
 from case_studies.research.holdout import build_holdout_training_spec
 from case_studies.research.models import (
     reconstruct_locked_model_request,
@@ -86,12 +83,24 @@ from case_studies.utils.backtest_presets import strategy_view
 from case_studies.utils.notebook_contracts import prediction_members_in_force
 from case_studies.utils.registry import resolve_best_backtest_runs
 from case_studies.utils.registry.specs import training_hash_from_spec
+from case_studies.utils.strategy_analysis import (
+    holdout_generations_to_retire,
+    refuse_a_second_look,
+    resolve_solvent_carrier,
+)
 
 # %% tags=["parameters"]
 CASE_STUDY_ID = "sp500_equity_option_analytics"
 EXECUTION_TIER = "canonical"
 WORKSPACE: str = ""
 LABEL = ""
+# Prediction sets this run accepts retiring, when the holdout window already carries a refit
+# of a different configuration. Empty is the default and the refusal is the default with it.
+# Per generation rather than a boolean on purpose: a boolean is set once and left set, and the
+# guard is decorative after that. Naming the prediction set makes each override a statement
+# about one window that somebody had to look up, and the run fails if what it names is not
+# what is registered. Section 2.1 prints what was retired when this is non-empty.
+RETIRE_HOLDOUT_GENERATIONS: list[str] = []
 
 # %% [markdown]
 # ### What is asked for, and what it resolves to
@@ -154,23 +163,47 @@ CANDIDATE_SET_NAME = f"{CASE_STUDY_ID}:holdout-candidates"
 # be separate copies and they disagreed: the freeze spanned every declared label and this
 # fallback spanned one, so which configuration a reader selected depended on whether their
 # registry held a `candidate_sets` table.
+# The notes are printed rather than discarded, because the second element is where the filter
+# says what it removed. On this registry it drops 143 of the 947 members in force - every
+# `deep_learning` fit and every `pca` one - for covering less of the cross-section than their
+# feature panels offered. Taking `[0]` alone applies that filter and publishes a holdout
+# selection over the survivors with nothing saying which candidates were never in the running.
+# `14_backtest`, `19_holdout_backtest` and `20_strategy_analysis` all print it.
+MEMBERS_IN_FORCE, _population_notes = prediction_members_in_force(study)
+for _note in _population_notes:
+    print(_note)
 FIELD = open_selection_field(
     study,
     case_study=CASE_STUDY_ID,
     name=CANDIDATE_SET_NAME,
-    prediction_hashes=prediction_members_in_force(study)[0],
+    prediction_hashes=MEMBERS_IN_FORCE,
     resolve_best_backtest_runs=resolve_best_backtest_runs,
 )
 CANDIDATES = FIELD.candidate_set
-SELECTED = FIELD.selected
 FIELD_HASHES = list(FIELD.members)
 FIELD_NAME = f"frozen candidate set {CANDIDATES.hash}" if CANDIDATES is not None else "live ranking"
 SELECTION_SOURCE = FIELD.source
+# The field says which backtests may be chosen from; the resolver says which one is chosen,
+# and it is handed the field rather than the whole registry. `SelectionField.selected` is
+# `CandidateSet.best_validation_sharpe`, which ranks the stored Sharpe column with a hash
+# tie-break and applies nothing else - no re-ranking onto the timestamps every candidate
+# prices, no label or universe restriction, no refusal of a run whose equity reached zero.
+# This case study's field holds a conformal allocator that sits out its warm-up and books it
+# as returns of exactly zero, so the two rankings read two different samples: they name the
+# same backtest on this registry and value it at 2.6087 stored against 2.6329 over the shared
+# sessions. `20_strategy_analysis` resolves the same way, so all three notebooks describe one
+# configuration.
+CARRIER = resolve_solvent_carrier(CASE_STUDY_ID, admitted=frozenset(FIELD_HASHES))
+SELECTED = study.results.open(CARRIER["val_backtest_hash"])
+print(
+    f"{FIELD_NAME}: {len(FIELD_HASHES)} members, resolver picks {SELECTED.hash}, "
+    f"stored-Sharpe pick {FIELD.selected.hash}"
+)
 
 # The label the stages after the selection run under is the winner's, not the case study's
 # primary. An injected LABEL is a request to run a different one, and it has to agree with what
 # was selected or the holdout refit would be keyed to a contract the selection does not name.
-HOLDOUT_LABEL = FIELD.label
+HOLDOUT_LABEL = CARRIER["label"]
 if REQUESTED_LABEL and REQUESTED_LABEL != HOLDOUT_LABEL:
     raise RuntimeError(
         f"LABEL={REQUESTED_LABEL!r} was requested but the selection carried forward is "
@@ -241,9 +274,24 @@ _on_disk = {
     for _path in sorted(CASE_DIR.glob(_pattern))
     if _path.is_file()
 }
+# `feature_artifacts` has two shapes in the registry and both are current, and they differ in two
+# ways rather than one. The older rows store a list of `{"role": ..., "sha256": "sha256:<hex>"}`;
+# the newer ones a mapping of role -> `{"sha256": "<hex>", "size": ...}` - no prefix. This case
+# study holds 15 of the first and 175 of the second, so which the selected fit carries is not
+# knowable in advance. Reading the mapping as a list raises `TypeError: string indices must be
+# integers` because iterating it yields its keys; reading it without restoring the prefix is
+# worse, because the comparison below then fails on artifacts that are byte-identical on disk
+# and reports them as retired.
+_artifacts = VALIDATION_SPEC["computation"].get("feature_artifacts") or {}
+if isinstance(_artifacts, dict):
+    _entries = [{"role": _role, **_value} for _role, _value in _artifacts.items()]
+else:
+    _entries = list(_artifacts)
 _pinned = {
-    entry["role"]: entry["sha256"]
-    for entry in VALIDATION_SPEC["computation"].get("feature_artifacts", [])
+    _entry["role"]: _entry["sha256"]
+    if str(_entry["sha256"]).startswith("sha256:")
+    else f"sha256:{_entry['sha256']}"
+    for _entry in _entries
 }
 _moved = [
     f"{_role} (pinned {_sha[:19]}...)" for _role, _sha in _pinned.items() if _sha not in _on_disk
@@ -322,6 +370,41 @@ HOLDOUT_SPEC = build_holdout_training_spec(
     study, VALIDATION_SPEC, timeline=OBSERVATIONS, case_study=CASE_STUDY_ID
 )
 HOLDOUT_TRAINING_HASH = training_hash_from_spec(HOLDOUT_SPEC)
+
+# The window is evaluated once. `refuse_a_second_look` divides what is already registered
+# against it into three buckets and refuses on any of them; with the selected configuration
+# unchanged this is an idempotent replay, because the derivation is deterministic and the
+# training identity covers it, so the same identity comes back and nothing is in any bucket.
+#
+# This case study reached 2026-09-14 with no such check and 253 backtest rows registered in
+# the five days after its own holdout was spent. Its rank-1 did not move, so nothing was
+# refused and nothing was wrong - but nothing here would have stopped a second evaluation
+# either, which is the state `fx_pairs` was in a week earlier.
+RETIRED_GENERATIONS = refuse_a_second_look(
+    holdout_generations_to_retire(
+        CASE_DIR,
+        this_generation=(HOLDOUT_TRAINING_HASH, (CHECKPOINT_KIND, CHECKPOINT_VALUE)),
+    ),
+    # `.get`, like the summary at line 227: a spec without the key must reach the guard
+    # and be refused on what the registry holds, not crash before the check runs.
+    this_configuration=str(VALIDATION_SPEC.get("config_name")),
+    this_training_hash=HOLDOUT_TRAINING_HASH,
+    checkpoint=(CHECKPOINT_KIND, CHECKPOINT_VALUE),
+    retiring=RETIRE_HOLDOUT_GENERATIONS,
+)
+if RETIRED_GENERATIONS:
+    # Printed rather than left in the launch line: the registry will show two evaluations of
+    # this window and the notebook has to show the same thing, or a reader learns about only
+    # one of them.
+    print(
+        "This run retired an earlier evaluation of the holdout window, named at launch:\n"
+        + "\n".join(
+            f"  {row['prediction_hash']}  {row['config_name']}  training {row['training_hash']}"
+            for row in RETIRED_GENERATIONS
+        )
+        + "\nThe window has now been measured more than once, and the registry carries both."
+    )
+
 holdout_cv = HOLDOUT_SPEC["computation"]["cv"]
 holdout_fold = holdout_cv["folds"][0]
 cv_request = holdout_cv["request"]
@@ -556,9 +639,12 @@ print(
 # The information coefficient is the rank correlation between the prediction and
 # the realized label. Reading the holdout's beside the validation figure for the
 # same configuration says whether the signal decayed, and by how much; it does
-# not license a claim about either number on its own, because the validation
-# figure is the one the configuration was selected on and is optimistic by
-# construction.
+# not license a claim about either number on its own. The configuration was
+# selected on validation backtest Sharpe and never on an information coefficient
+# (`reference/CASE_STUDY_PIPELINE.md` section 5), so the validation row below is the
+# selected configuration's IC rather than the quantity the selection ranked - and it
+# is still optimistic, because the configuration it describes is the maximum of a
+# search.
 
 # %%
 with sqlite3.connect(REGISTRY_DB) as db:
@@ -575,7 +661,7 @@ if _holdout_ic is None:
 
 split_table = pl.DataFrame(
     {
-        "split": ["validation (selected on)", "holdout (2021)"],
+        "split": ["validation (selected configuration)", "holdout (2021)"],
         "prediction": [selected_prediction.hash, HOLDOUT_PREDICTION.hash],
         "ic_mean": [
             None if _validation_ic is None else _validation_ic[0],

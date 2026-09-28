@@ -9,6 +9,7 @@ import os
 import re
 import time
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -24,6 +25,7 @@ from darts.models import NBEATSModel, TSMixerModel
 from ml4t.diagnostic.metrics import cross_sectional_ic
 
 from case_studies.utils.cv_results import assemble_cv_result
+from case_studies.utils.folds import fold_seed
 from utils.modeling import RANDOM_SEED, seed_everything
 
 SUPPORTED_DARTS_ARCHITECTURES = {"nbeats", "tsmixer"}
@@ -127,6 +129,43 @@ def load_darts_checkpoint(path: Path, *, device: str = "cpu"):
     return model, record["metadata"]
 
 
+def _darts_checkpoint_defect(path: Path, *, config_name: str, architecture: str) -> str | None:
+    """Why this one Darts checkpoint is not usable fitted state, or None when it is.
+
+    The strict population check and the per-fold report below both decide a single
+    checkpoint here, so a resume can never adopt a fold the promote would reject.
+    """
+    try:
+        _model_path, _weights_path, sidecar_path = _darts_checkpoint_files(path)
+        if not all(item.is_file() for item in _darts_checkpoint_files(path)):
+            raise FileNotFoundError(path)
+        record = json.loads(sidecar_path.read_text())
+        if (
+            record.get("schema_version") != 1
+            or record.get("model_sha256") != _file_sha256(path)
+            or record.get("weights_sha256") != _file_sha256(Path(f"{path}.ckpt"))
+        ):
+            raise ValueError(path)
+    except (FileNotFoundError, json.JSONDecodeError, ValueError) as error:
+        return f"Darts fitted checkpoint population is incomplete: {path} ({error})"
+    required_metadata = {
+        "config_name": config_name,
+        "fold": int(path.parent.name.removeprefix("fold_")),
+        "checkpoint_kind": "epoch",
+        "checkpoint_value": int(path.stem.removeprefix("epoch_")),
+    }
+    mismatches = {
+        key: (record.get("metadata", {}).get(key), value)
+        for key, value in required_metadata.items()
+        if record.get("metadata", {}).get(key) != value
+    }
+    if record.get("architecture") != architecture:
+        mismatches["architecture"] = (record.get("architecture"), architecture)
+    if mismatches:
+        return f"Darts fitted checkpoint metadata mismatch at {path}: {mismatches}"
+    return None
+
+
 def validate_darts_checkpoint_population(
     root: Path,
     *,
@@ -146,36 +185,9 @@ def validate_darts_checkpoint_population(
     expected_files: set[Path] = set()
     for path in expected:
         expected_files.update(_darts_checkpoint_files(path))
-        try:
-            _model_path, _weights_path, sidecar_path = _darts_checkpoint_files(path)
-            if not all(item.is_file() for item in _darts_checkpoint_files(path)):
-                raise FileNotFoundError(path)
-            record = json.loads(sidecar_path.read_text())
-            if (
-                record.get("schema_version") != 1
-                or record.get("model_sha256") != _file_sha256(path)
-                or record.get("weights_sha256") != _file_sha256(Path(f"{path}.ckpt"))
-            ):
-                raise ValueError(path)
-        except (FileNotFoundError, json.JSONDecodeError, ValueError) as error:
-            raise ValueError(f"Darts fitted checkpoint population is incomplete: {path}") from error
-        fold = int(path.parent.name.removeprefix("fold_"))
-        checkpoint = int(path.stem.removeprefix("epoch_"))
-        required_metadata = {
-            "config_name": config_name,
-            "fold": fold,
-            "checkpoint_kind": "epoch",
-            "checkpoint_value": checkpoint,
-        }
-        mismatches = {
-            key: (record.get("metadata", {}).get(key), value)
-            for key, value in required_metadata.items()
-            if record.get("metadata", {}).get(key) != value
-        }
-        if record.get("architecture") != architecture:
-            mismatches["architecture"] = (record.get("architecture"), architecture)
-        if mismatches:
-            raise ValueError(f"Darts fitted checkpoint metadata mismatch at {path}: {mismatches}")
+        defect = _darts_checkpoint_defect(path, config_name=config_name, architecture=architecture)
+        if defect is not None:
+            raise ValueError(defect)
 
     config_root = Path(root) / config_name
     actual_files = {path for path in config_root.glob("fold_*/epoch_*.pt*") if path.is_file()}
@@ -186,6 +198,33 @@ def validate_darts_checkpoint_population(
             f"{[str(path) for path in sorted(extras)]}"
         )
     return expected
+
+
+def complete_darts_checkpoint_folds(
+    root: Path,
+    *,
+    config_name: str,
+    fold_ids: list[int] | tuple[int, ...],
+    checkpoints: list[int] | tuple[int, ...],
+    architecture: str,
+) -> tuple[int, ...]:
+    """Declared folds under `root` that already hold every declared Darts checkpoint.
+
+    Reports rather than raises, so a partial tree is a fold list instead of an error.
+    A fold counts only when all of its declared checkpoints pass the same check
+    `validate_darts_checkpoint_population` applies, digests included.
+    """
+    wanted = sorted({int(value) for value in checkpoints})
+    complete = []
+    for fold in sorted({int(value) for value in fold_ids}):
+        paths = [darts_checkpoint_path(root, config_name, fold, value) for value in wanted]
+        if paths and all(
+            _darts_checkpoint_defect(path, config_name=config_name, architecture=architecture)
+            is None
+            for path in paths
+        ):
+            complete.append(fold)
+    return tuple(complete)
 
 
 def uses_darts_backend(configs: list[dict[str, Any]]) -> bool:
@@ -224,7 +263,12 @@ def _metric_to_float(value: Any) -> float | None:
     return float(value)
 
 
-from case_studies.utils.registry.store import _save_parquet, flush_fold_training_log
+from case_studies.utils.registry.store import (
+    _save_parquet,
+    clear_fold_predictions,
+    flush_fold_training_log,
+    incremental_shard_path,
+)
 
 
 def _flush_darts_fold_training_log(
@@ -240,12 +284,42 @@ def _flush_darts_fold_preds(
     incr_dir: Path,
     config_name: str,
     fold: int,
-    prediction_frames: list[pl.DataFrame],
-) -> None:
-    """Flush pre-assembled prediction DataFrames (darts builds these during training)."""
-    if not prediction_frames:
-        return
-    _save_parquet(incr_dir / f"{config_name}_fold{fold}.parquet", pl.concat(prediction_frames))
+    epoch: int,
+    frame: pl.DataFrame,
+) -> Path | None:
+    """Write one checkpoint's predictions to its own shard and return its path.
+
+    This used to take every checkpoint the fold had reached and rewrite one file per fold
+    from all of them, so the work and the bytes written grew with the square of the
+    checkpoint schedule and the last checkpoint of a fold concatenated the whole fold to
+    write a file it had already written once per checkpoint.
+
+    The path is the return value because the caller scores and assembles from the shard.
+    Keeping the frame as well was one held copy of every checkpoint of every fold of every
+    config, for the length of the run, of something already on disk.
+    """
+    if frame.is_empty():
+        return None
+    path = incremental_shard_path(incr_dir, config_name, fold, epoch)
+    _save_parquet(path, frame)
+    return path
+
+
+def _darts_slice_frame(slices: Sequence[Path | pl.DataFrame]) -> pl.DataFrame:
+    """One frame from a run's checkpoint slices, in the order given.
+
+    A slice is the shard the checkpoint was written to, or the frame itself on a run with
+    no save directory to write one. Reading shards back is what lets the scoring loop hold
+    one checkpoint at a time instead of every checkpoint the run has produced.
+    """
+    values = list(slices)
+    if not values:
+        return pl.DataFrame()
+    if isinstance(values[0], pl.DataFrame):
+        return pl.concat(values)
+    from case_studies.utils.deep_learning import _read_prediction_shards
+
+    return _read_prediction_shards(values)
 
 
 class _DartsEpochProgressCallback(pl_lightning.callbacks.Callback):
@@ -404,6 +478,7 @@ def darts_training_identity(
     case_study: str,
     input_data_spec: dict[str, Any] | None,
     max_train_sequences: int,
+    train_sequence_stride: int = 0,
 ) -> dict[str, Any]:
     """Return the runtime parameters that define a Darts training run."""
     input_chunk_length, output_chunk_length = _resolve_chunk_lengths(
@@ -427,6 +502,9 @@ def darts_training_identity(
         "lookback": cfg.get("params", {}).get("lookback", input_chunk_length),
         "max_train_sequences": max_train_sequences,
         "output_chunk_length": output_chunk_length,
+        # Written only when declared, because `computation` is hashed whole and no
+        # registered Darts run strides its windows.
+        **({"train_sequence_stride": train_sequence_stride} if train_sequence_stride else {}),
     }
 
 
@@ -473,7 +551,7 @@ def select_full_coverage_checkpoint(
 def _build_darts_model(
     cfg: dict[str, Any],
     device: str,
-    fold_seed: int,
+    split_seed: int,
     input_chunk_length: int,
     output_chunk_length: int,
     trainer_callbacks: list[Any] | None = None,
@@ -503,7 +581,12 @@ def _build_darts_model(
         params.setdefault("use_static_covariates", False)
     params["n_epochs"] = cfg.get("n_epochs", 100)
     params["batch_size"] = cfg.get("batch_size", 2048)
-    params["random_state"] = fold_seed
+    # The caller derived this from the fold's number (`folds.fold_seed`), so unlike the
+    # other five sites the fold index reaches a declared model hyperparameter rather than
+    # only the process-global RNG. It still reaches no stored spec: `params` is built at
+    # fit time and passed straight to the constructor, and this family records no
+    # effective params, so a renumbered run looks correct everywhere it is written down.
+    params["random_state"] = split_seed
     params["save_checkpoints"] = False
     params["force_reset"] = True
     trainer = dict(params.pop("pl_trainer_kwargs", {}))
@@ -523,7 +606,20 @@ def _resolve_sampling(
     input_chunk_length: int,
     output_chunk_length: int,
     max_train_sequences: int,
+    train_sequence_stride: int = 0,
 ) -> tuple[int, int | None]:
+    """Return the ``(stride, max_samples_per_ts)`` this fold draws its training windows on.
+
+    A declared ``train_sequence_stride`` is the stride, and no count is derived from it: the
+    declaration says how far apart windows sit, so the number of them is whatever the fold
+    holds and differs between folds of different length. Deriving a count instead and letting
+    the count reconstruct a stride would round the spacing differently in every fold.
+
+    ``max_train_sequences`` is the other form. It fixes the number of windows and the spacing
+    follows, which is what a case study that wants overlapping windows declares.
+    """
+    if train_sequence_stride > 0:
+        return train_sequence_stride, None
     sample_counts = [
         max(state.n_train_samples - input_chunk_length - output_chunk_length + 1, 0)
         for state in fold_series
@@ -1027,6 +1123,7 @@ def run_darts_cv(
     register: bool,
     case_study: str | None,
     notebook: str | None,
+    train_sequence_stride: int = 0,
     prediction_split: str = "validation",
     identity_params: dict[str, Any] | None = None,
     input_data_spec: dict[str, Any] | None = None,
@@ -1035,6 +1132,7 @@ def run_darts_cv(
     temporal_feature_names: list[str] | None = None,
     checkpoint_root: Path | None = None,
     strict: bool = False,
+    already_fitted_folds: Sequence[int] | None = None,
 ) -> dict[str, Any]:
     """Run Darts-backed global forecasting models and emit standard DL artifacts."""
     if case_study is None:
@@ -1061,6 +1159,7 @@ def run_darts_cv(
             label_col=label_col,
             case_study=case_study,
             max_train_sequences=max_train_sequences,
+            train_sequence_stride=train_sequence_stride,
             device=device,
         )
 
@@ -1077,7 +1176,12 @@ def run_darts_cv(
     config_results: list[dict[str, Any]] = []
     learning_rows: list[dict[str, Any]] = []
     training_log: list[dict[str, Any]] = []
-    prediction_frames: list[pl.DataFrame] = []
+    # One entry per checkpoint of per fold of per config, and each is a path whenever
+    # there is a save directory to write shards to. `save_dir is None` is the in-memory
+    # run, which cannot register and has nowhere to put them.
+    run_slices: list[Path | pl.DataFrame] = []
+    incr_dir = save_dir / "_incremental" if save_dir is not None else None
+    log_dir = save_dir / "_incremental_logs" if save_dir is not None else None
     has_fold_temporal = temporal_by_fold is not None and temporal_keys and temporal_feature_names
     one_period_dataset: pd.DataFrame | None = None
 
@@ -1110,7 +1214,7 @@ def run_darts_cv(
         checkpoint_interval = int(cfg.get("checkpoint_interval", n_epochs))
         started_at = datetime.now(UTC).isoformat()
         elapsed_total = 0.0
-        cfg_prediction_frames: list[pl.DataFrame] = []
+        cfg_slices: dict[int, dict[int, Path | pl.DataFrame]] = {}
         expected_fold_ids: list[int] = []
 
         print(
@@ -1120,8 +1224,12 @@ def run_darts_cv(
         )
 
         for split in splits:
-            fold_seed = cfg_seed + split["fold"]
-            seed_everything(fold_seed)
+            # The fold's number is an input to the fit, not a label on it. This site
+            # goes one step further than the other five: the value is also assigned to
+            # `params["random_state"]` in `_build_darts_model`, so the fold number lands
+            # in the model's own declared hyperparameters. See `folds.fold_seed`.
+            split_seed = fold_seed(cfg_seed, split["fold"])
+            seed_everything(split_seed)
             fold_dataset = (
                 _overlay_fold_temporal_features(
                     config_dataset,
@@ -1161,9 +1269,25 @@ def run_darts_cv(
                 input_chunk_length,
                 output_chunk_length,
                 max_train_sequences,
+                train_sequence_stride,
             )
-            if max_train_sequences > 0:
-                msg = f"  Fold {split['fold']}: {len(fold_series)} series, stride={stride}"
+            if max_train_sequences > 0 or train_sequence_stride > 0:
+                drawn = sum(
+                    (
+                        max(
+                            state.n_train_samples - input_chunk_length - output_chunk_length + 1,
+                            0,
+                        )
+                        + stride
+                        - 1
+                    )
+                    // stride
+                    for state in training_states
+                )
+                msg = (
+                    f"  Fold {split['fold']}: {len(fold_series)} series, stride={stride}, "
+                    f"{drawn:,} training windows"
+                )
                 if max_samples_per_ts is not None:
                     msg += f", max_samples_per_ts={max_samples_per_ts}"
                 print(msg)
@@ -1176,21 +1300,19 @@ def run_darts_cv(
             train_series = [state.train_target for state in training_states]
             train_covariates = [state.train_covariates for state in training_states]
             epoch_rows: list[dict[str, Any]] = []
-            checkpoint_frames: list[pl.DataFrame] = []
             checkpoint_ics: dict[int, float] = {}
             checkpoint_n_days: dict[int, int] = {}
             n_val_points = 0
-            incr_dir = save_dir / "_incremental" if save_dir is not None else None
-            log_dir = save_dir / "_incremental_logs" if save_dir is not None else None
             if incr_dir is not None:
                 incr_dir.mkdir(parents=True, exist_ok=True)
+                clear_fold_predictions(incr_dir, config_name, split["fold"])
             if log_dir is not None:
                 log_dir.mkdir(parents=True, exist_ok=True)
             t0 = time.perf_counter()
             model = _build_darts_model(
                 cfg,
                 device,
-                fold_seed,
+                split_seed,
                 input_chunk_length,
                 output_chunk_length,
                 trainer_callbacks=[
@@ -1262,11 +1384,15 @@ def run_darts_cv(
                     pl.lit(config_name).alias("config"),
                     pl.lit(epochs_trained).alias("epoch"),
                 )
-                checkpoint_frames.append(checkpoint_preds)
-                cfg_prediction_frames.append(checkpoint_preds)
-                prediction_frames.append(checkpoint_preds)
+                slice_value: Path | pl.DataFrame | None = None
                 if incr_dir is not None:
-                    _flush_darts_fold_preds(incr_dir, config_name, split["fold"], checkpoint_frames)
+                    slice_value = _flush_darts_fold_preds(
+                        incr_dir, config_name, split["fold"], epochs_trained, checkpoint_preds
+                    )
+                if slice_value is None:
+                    slice_value = checkpoint_preds
+                cfg_slices.setdefault(epochs_trained, {})[int(split["fold"])] = slice_value
+                run_slices.append(slice_value)
 
                 _entity = entity_col if entity_col in checkpoint_preds.columns else None
                 ic_result = cross_sectional_ic(
@@ -1330,11 +1456,16 @@ def run_darts_cv(
             print(f"    fold best epoch={fold_best_epoch}, IC={fold_best_ic:+.4f} ({elapsed:.1f}s)")
 
         epoch_scores: list[tuple[int, float, float, int]] = []
-        if cfg_prediction_frames:
-            cfg_all_preds = pl.concat(cfg_prediction_frames)
-            expected_fold_ids = sorted(cfg_all_preds["fold_id"].unique().to_list())
-            for epoch in sorted(cfg_all_preds["epoch"].unique().to_list()):
-                ep_df = cfg_all_preds.filter(pl.col("epoch") == epoch)
+        if cfg_slices:
+            # A fold that reached no checkpoint with predictions is not part of the
+            # population a checkpoint has to cover, which is why this narrows the list the
+            # fold loop appended to rather than using it.
+            expected_fold_ids = sorted(
+                {fold for by_fold in cfg_slices.values() for fold in by_fold}
+            )
+            for epoch in sorted(cfg_slices):
+                epoch_slices = cfg_slices[epoch]
+                ep_df = _darts_slice_frame(list(epoch_slices.values()))
                 _entity = entity_col if entity_col in ep_df.columns else None
                 ic_mean = float(
                     cross_sectional_ic(
@@ -1348,13 +1479,15 @@ def run_darts_cv(
                         min_obs=5,
                     )["ic_mean"]
                 )
-                fold_ids = sorted(ep_df["fold_id"].unique().to_list())
+                fold_ids = sorted(epoch_slices)
                 if fold_ids != expected_fold_ids:
+                    del ep_df
                     continue
+                del ep_df
                 fold_epoch_ics = []
                 fold_n_days = []
                 for fold_id in fold_ids:
-                    fold_df = ep_df.filter(pl.col("fold_id") == fold_id)
+                    fold_df = _darts_slice_frame([epoch_slices[fold_id]])
                     _entity = entity_col if entity_col in fold_df.columns else None
                     ic_result = cross_sectional_ic(
                         fold_df,
@@ -1368,6 +1501,7 @@ def run_darts_cv(
                     )
                     fold_epoch_ics.append(float(ic_result["ic_mean"]))
                     fold_n_days.append(int(ic_result["n_periods"]))
+                    del fold_df
                 ic_std = float(np.nanstd(fold_epoch_ics)) if len(fold_epoch_ics) > 1 else 0.0
                 ic_n_days = sum(fold_n_days)
                 learning_rows.append(
@@ -1408,10 +1542,17 @@ def run_darts_cv(
         if checkpoint_root is not None:
             from case_studies.utils.deep_model_state import declared_epoch_checkpoints
 
+            # The tree holds the folds this run adopted as well as the ones it fitted, and
+            # `expected_fold_ids` is only the second set - it drives the per-checkpoint
+            # coverage comparison above, where a fold with no predictions from this run
+            # has no business being expected. Unioning the two there would skip every
+            # checkpoint and leave `assemble_cv_result` with no metrics at all.
             validate_darts_checkpoint_population(
                 checkpoint_root,
                 config_name=config_name,
-                fold_ids=expected_fold_ids,
+                fold_ids=sorted(
+                    set(expected_fold_ids) | {int(f) for f in (already_fitted_folds or [])}
+                ),
                 checkpoints=declared_epoch_checkpoints(n_epochs, checkpoint_interval),
                 architecture=str(params["architecture"]),
             )
@@ -1419,7 +1560,7 @@ def run_darts_cv(
     if not config_results:
         raise RuntimeError("Darts run produced no config results.")
 
-    all_predictions = pl.concat(prediction_frames) if prediction_frames else pl.DataFrame()
+    all_predictions = _darts_slice_frame(run_slices)
     learning_curves = pl.DataFrame(learning_rows) if learning_rows else pl.DataFrame()
     training_log_df = pl.DataFrame(training_log) if training_log else pl.DataFrame()
     result = assemble_cv_result(

@@ -99,6 +99,19 @@ def _prediction(
     )
 
 
+def test_an_empty_config_selection_is_blamed_on_the_caller_not_the_family() -> None:
+    """`config_names=[]` filters every row out, and the family's menu is not why.
+
+    The caller passes `config_names` in code, never from a parameters cell, so an empty list
+    cannot be an empty-means-all idiom; it is a mistake, and reporting it as "no declared
+    requests for 'linear'" sends a reader to the training menu to look for a row that is there.
+    """
+    assert model_request_catalog("linear").height > 0
+
+    with pytest.raises(ValueError, match="config_names is empty"):
+        model_request_catalog("linear", config_names=[])
+
+
 def test_resolved_model_plan_accepts_flat_sequence_specs(tmp_path: Path) -> None:
     study = _study(tmp_path)
     expected = pl.DataFrame(
@@ -339,7 +352,12 @@ def test_real_prediction_subset_is_identity_covered_and_preview_only(tmp_path: P
     assert prediction.complete
     assert replayed.hash == prediction.hash
     assert prediction.execution_tier == "preview"
-    assert prediction.load().shape == (10, 5)
+    # Six columns, not five: a published frame now states the label it was produced under
+    # (ml4t/agent-workspace#887), which is data about the frame and is excluded from the
+    # digest that pins its content.
+    frame = prediction.load()
+    assert frame.shape == (10, 6)
+    assert frame.get_column("label").unique().to_list() == ["ret_to_expiry"]
     assert computation["input_data_spec"]["source_prediction_hash"] == source_hash
     assert computation["preview_reductions"] == {
         "source_prediction_hash": source_hash,

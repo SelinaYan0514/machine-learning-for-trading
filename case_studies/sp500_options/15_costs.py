@@ -61,9 +61,11 @@
 import plotly.express as px
 import polars as pl
 
-from case_studies.research import OfficialPopulation, Result
+from case_studies.research import OfficialPopulation, Result, supersedes_for_run
 from case_studies.sp500_options.research_workflow import (
+    ALL_LABELS,
     open_study,
+    preview_baseline_candidates,
     run_official_backtest_requests,
     strategy_request_frame,
 )
@@ -77,9 +79,19 @@ COST_POPULATION = "sp500-options-cost-sensitivity-validation-v1"
 # %% tags=["parameters"]
 EXECUTION_TIER = "canonical"
 WORKSPACE: str = ""
-PREVIEW_BASELINE_HASHES: tuple[str, ...] = ()
+PREVIEW_LABELS: list[str] = []
+PREVIEW_MAX_BASELINE_CONFIGS = 0
 PREVIEW_COST_FRACTIONS: tuple[float, ...] = (0.203,)
 PREVIEW_UNIVERSES: tuple[str, ...] = ("liquid",)
+# The generation this run retires. A population is immutable under its name, so a re-run
+# whose members have moved has to say which one it replaces; the refusal names the current
+# hash, and empty is correct only for a name this registry has never held. This notebook
+# published its population with no supersedes at all, so the first upstream change to move
+# a baseline identity left it unable to register what it had just computed - which is what
+# happened when the label buffer was corrected. Stale the moment the run it authorizes
+# succeeds, in the same way as the declarations `12_backtest` and `13_portfolio_management`
+# carry.
+SUPERSEDES_COST_POPULATION: str = ""
 
 # %% [markdown]
 # ## One strategy per model family
@@ -96,18 +108,24 @@ PREVIEW_UNIVERSES: tuple[str, ...] = ("liquid",)
 # %%
 study = open_study(execution_tier=EXECUTION_TIER, workspace=WORKSPACE or None)
 if EXECUTION_TIER == "canonical":
+    if PREVIEW_LABELS or PREVIEW_MAX_BASELINE_CONFIGS:
+        raise ValueError("canonical execution cannot declare preview reductions")
     population = OfficialPopulation.one(study, name=BASELINE_POPULATION)
     baseline_hashes = population.require_complete()
     baseline = study.backtests.table().filter(pl.col("backtest_hash").is_in(baseline_hashes))
-else:
-    if not WORKSPACE or not PREVIEW_BASELINE_HASHES:
-        raise ValueError("preview execution requires WORKSPACE and PREVIEW_BASELINE_HASHES")
-    baseline = study.backtests.table(include_preview=True).filter(
-        (pl.col("execution_tier") == "preview")
-        & pl.col("backtest_hash").is_in(PREVIEW_BASELINE_HASHES)
+elif EXECUTION_TIER == "preview":
+    if not WORKSPACE or not PREVIEW_LABELS or PREVIEW_MAX_BASELINE_CONFIGS < 1:
+        raise ValueError(
+            "preview execution requires WORKSPACE, PREVIEW_LABELS and PREVIEW_MAX_BASELINE_CONFIGS"
+        )
+    unknown = sorted(set(PREVIEW_LABELS) - set(ALL_LABELS))
+    if unknown:
+        raise ValueError(f"preview labels this case study does not declare: {unknown}")
+    baseline = preview_baseline_candidates(
+        study, labels=PREVIEW_LABELS, limit=PREVIEW_MAX_BASELINE_CONFIGS
     )
-    if baseline.height != len(PREVIEW_BASELINE_HASHES):
-        raise ValueError("preview baseline selection is missing or ambiguous")
+else:
+    raise ValueError(f"unsupported execution tier: {EXECUTION_TIER!r}")
 if baseline.is_empty() or baseline.filter(~pl.col("complete")).height:
     raise RuntimeError("cost sensitivity requires complete baseline results")
 if baseline.get_column("sharpe").null_count():
@@ -171,6 +189,21 @@ print(f"Universes: {list(universes)}; symbols held per decision date: {cost_top_
 # representative's signal and overrides three fields: the universe restriction, the concentration,
 # and the spread fraction. Within one representative and universe only the fraction varies, which
 # is what makes a curve a curve.
+#
+# **Why the four fractions are these four.** They are anchors rather than a linear sweep. `1.0` is
+# the order crossing the full quoted spread, which is what a marketable order pays if nothing goes
+# its way. `0.75` is close to the population-average ratio of effective to quoted spread, so it
+# stands for ordinary execution. `0.203` is the best case reported for algorithmic execution in
+# at-the-money equity options, and it is the number that decides whether this strategy is viable
+# at all: if the result only survives there, it survives only for a desk that executes as well as
+# anyone has been measured to. `0.5` sits between the two middle cases so the curve is not read
+# from three points.
+#
+# **The universe axis is not a robustness check, it is a second question.** `full` prices the
+# strategy on every name it selects; `liquid` restricts to the bottom quintile of quoted
+# half-spread at each rebalance. A strategy that only clears its costs on the liquid subset is a
+# different, smaller strategy than the one selected upstream, and reporting the two together is
+# what keeps that from being presented as the same result at a better cost assumption.
 
 # %%
 request_rows = []
@@ -220,12 +253,25 @@ print(
 # are eligible and the concentration changes how many are held. The engine validates the paired
 # option lifecycle, that every selected contract ends either by cash settlement or by liquidation,
 # the retained hedge, and every cost input before publishing.
+#
+# **Re-resolving contracts per request is what makes the comparison honest and what makes it
+# slow.** The alternative - resolving once and re-pricing - would compare one contract set at
+# several cost assumptions, which answers a narrower question than the one asked here: under a
+# liquid-universe restriction the strategy does not hold the same options more cheaply, it holds
+# different options. Sharing a contract set across requests would hide that substitution and
+# report the cost of a portfolio the strategy would not have held.
 
 # %%
 execution = run_official_backtest_requests(
     study,
     requests,
     population_name=COST_POPULATION if EXECUTION_TIER == "canonical" else None,
+    supersedes=supersedes_for_run(
+        study,
+        population_name=COST_POPULATION,
+        declared=SUPERSEDES_COST_POPULATION or None,
+        execution_tier=EXECUTION_TIER,
+    ),
 )
 catalog = execution.catalog_rows.sort("request_name")
 if catalog.height != requests.height or catalog.filter(~pl.col("complete")).height:

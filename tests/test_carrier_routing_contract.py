@@ -68,10 +68,14 @@ def _resolver_db(path: Path, *, backtest_hash: str) -> None:
                 backtest_hash TEXT PRIMARY KEY, prediction_hash TEXT, stage TEXT, spec_json TEXT
             );
             CREATE TABLE backtest_metrics (backtest_hash TEXT PRIMARY KEY, sharpe REAL);
-            CREATE TABLE fold_metrics (prediction_hash TEXT, ic REAL);
+            CREATE TABLE fold_metrics (prediction_hash TEXT, ic REAL, ic_std REAL);
+            CREATE TABLE prediction_metrics (
+                prediction_hash TEXT PRIMARY KEY, ic_mean REAL, ic_n_days REAL
+            );
             INSERT INTO training_runs VALUES ('train_us', 'owner_config', 'gbm', 'fwd_ret_1m', NULL);
             INSERT INTO prediction_sets VALUES ('pred_us', 'train_us', 'validation');
-            INSERT INTO fold_metrics VALUES ('pred_us', 0.02);
+            INSERT INTO fold_metrics (prediction_hash, ic) VALUES ('pred_us', 0.02);
+            INSERT INTO prediction_metrics VALUES ('pred_us', 0.02, 250);
             """
         )
         db.execute(
@@ -99,10 +103,7 @@ def test_carrier_pins_are_single_sourced_and_well_formed() -> None:
         )
 
     repo = Path(__file__).parents[1]
-    for relative in (
-        "20_strategy_synthesis/holdout.py",
-        "20_strategy_synthesis/01_aggregate_synthesis.py",
-    ):
+    for relative in ("20_strategy_synthesis/01_aggregate_synthesis.py",):
         tree = ast.parse((repo / relative).read_text())
         assignments = [
             node
@@ -116,78 +117,84 @@ def test_carrier_pins_are_single_sourced_and_well_formed() -> None:
         assert assignments == []
 
 
-def _module_level_literal(path: Path, name: str) -> object:
-    """Read a module-level constant without importing the module.
+def test_the_carrier_restriction_has_no_second_implementation() -> None:
+    """One rule, and where it is not applied, no machinery pretending to apply it.
 
-    `20_strategy_synthesis/holdout.py` imports lightgbm, which `test-unit` does not
-    install, so executing it to read two constants makes this test depend on the
-    modelling environment for no reason. Parsing gets the same values.
+    `_apply_carrier_pin` was defined twice with different signatures - a mapping lookup in
+    `20_strategy_synthesis/01_aggregate_synthesis.py` and a predicate argument in
+    `case_studies/utils/paired_metrics.py` - and both had become unreachable: the mapping
+    was permanently empty and no caller anywhere supplied the predicate. Two dead
+    implementations of one rule is how the config-name copy came to select
+    `us_firm_characteristics`' weakest advanced configuration for a whole registry rebuild
+    while every notebook inside that case study reported its best.
 
-    `ast.literal_eval` alone is not enough: these are declared as
-    ``frozenset({"..."})``, and a call node is not a literal. The frozenset call is
-    unwrapped here rather than evaluated, so nothing in the parsed file runs.
+    Where an owner does pin a carrier, the live mechanism is
+    `carrier_pins.carrier_config_name`, which resolves the pin against the registry and
+    raises when it matches nothing - checked behaviourally elsewhere in this file. What is
+    checked here is that nothing has grown a second one beside it.
+
+    Read by parsing: `01_aggregate_synthesis.py` is a notebook, and importing one runs it.
     """
-    tree = ast.parse(path.read_text())
-    for node in ast.walk(tree):
-        targets = (
-            node.targets
-            if isinstance(node, ast.Assign)
-            else [node.target]
-            if isinstance(node, ast.AnnAssign)
-            else []
+    repo = Path(__file__).parents[1]
+    for relative in (
+        "20_strategy_synthesis/01_aggregate_synthesis.py",
+        "case_studies/utils/paired_metrics.py",
+    ):
+        tree = ast.parse((repo / relative).read_text())
+        defined = sorted(
+            node.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and "carrier_pin" in node.name
         )
-        if not any(isinstance(t, ast.Name) and t.id == name for t in targets):
-            continue
-        value = node.value
-        assert value is not None, f"{name} in {path.name} is annotated with no value"
-        return _as_value(value)
-    raise AssertionError(f"{path.name} declares no module-level {name}")
-
-
-def _as_value(node: ast.expr) -> object:
-    if isinstance(node, ast.Call):
-        func = node.func
-        builtin = func.id if isinstance(func, ast.Name) else None
-        assert builtin in {"frozenset", "set"}, (
-            f"unsupported call {ast.dump(func)} in a mirrored constant; this reader "
-            "evaluates nothing, so extend it deliberately rather than importing"
+        assert defined == [], (
+            f"{relative} defines {defined}; the carrier restriction has one implementation, "
+            "in case_studies/utils/carrier_pins.py, and a second copy is what drifted"
         )
-        assert len(node.args) == 1, f"{builtin}() with {len(node.args)} arguments"
-        return frozenset(_as_value(node.args[0]))
-    if isinstance(node, ast.Dict):
-        return {
-            _as_value(k): _as_value(v)
-            for k, v in zip(node.keys, node.values, strict=True)
-            if k is not None
-        }
-    if isinstance(node, (ast.Set, ast.List, ast.Tuple)):
-        return [_as_value(e) for e in node.elts]
-    return ast.literal_eval(node)
 
 
-def test_mirrored_selection_restrictions_have_not_drifted() -> None:
-    """The two copies of each selection restriction must still hold the same value.
+def test_the_selection_restrictions_are_declared_once() -> None:
+    """One declaration of each selection restriction in the whole tree.
 
-    `case_studies/utils/strategy_analysis.py` and `20_strategy_synthesis/holdout.py`
-    each declare `LABEL_RESTRICTIONS` and `UNIVERSE_RESTRICTIONS`, and both carry a
-    "keep these in sync" comment where a mechanism should be. A comment is not a
-    mechanism: the same arrangement one directory over - `_CARRIER_PIN_PREDICATES`
-    hand-copying a carrier choice under a "keep in sync" note - had been out of sync
-    across a whole registry rebuild with nothing failing.
+    `case_studies/utils/strategy_analysis.py` and the retired
+    `20_strategy_synthesis/holdout.py` each used to declare `LABEL_RESTRICTIONS` and
+    `UNIVERSE_RESTRICTIONS`, under a "keep these in sync" comment where a mechanism should
+    be. A comment is not a mechanism: the same arrangement one directory over -
+    `_CARRIER_PIN_PREDICATES` hand-copying a carrier choice under a "keep in sync" note -
+    had been out of sync across a whole registry rebuild with nothing failing.
 
-    These two are exact duplicates rather than translations, so drift is directly
-    checkable and this test costs nothing. It says nothing about whether either value
-    is correct; it says the two copies agree, which is the property the comments
-    claim and nothing else enforces.
+    That earlier check read the two named files. `holdout.py` is deleted, so the question
+    is asked of every module instead, which is the property that was wanted all along: a
+    second copy anywhere is a restriction a case study declares and the holdout selection
+    does not read, and naming the file it may appear in is guessing where.
+
+    Read by parsing rather than by importing, because the property is a source-level one -
+    whether a module DECLARES the name or imports it - and an imported module cannot tell
+    those apart. Importing `01_aggregate_synthesis.py` would also run a notebook.
     """
-    holdout = Path(__file__).parents[1] / "20_strategy_synthesis" / "holdout.py"
+    repo = Path(__file__).parents[1]
+    sources = sorted(
+        path
+        for root in ("case_studies", "20_strategy_synthesis", "utils", "tests")
+        for path in (repo / root).rglob("*.py")
+    )
+    assert sources, "found no modules to read; the search roots are wrong"
+
     for name in ("LABEL_RESTRICTIONS", "UNIVERSE_RESTRICTIONS"):
-        here = getattr(strategy_analysis, name)
-        there = _module_level_literal(holdout, name)
-        assert here == there, (
-            f"{name} has drifted between case_studies/utils/strategy_analysis.py and "
-            f"20_strategy_synthesis/holdout.py: {here!r} against {there!r}. Both files "
-            "say to keep these in sync; whichever is right, they cannot disagree."
+        declaring = [
+            path.relative_to(repo).as_posix()
+            for path in sources
+            for node in ast.walk(ast.parse(path.read_text()))
+            if isinstance(node, (ast.Assign, ast.AnnAssign))
+            and any(
+                isinstance(target, ast.Name) and target.id == name
+                for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+            )
+        ]
+        assert declaring == ["case_studies/utils/strategy_analysis.py"], (
+            f"{name} is declared in {declaring}. One declaration, in "
+            "case_studies/utils/strategy_analysis.py, imported everywhere else - a second "
+            "copy is a restriction a case study declares and the selection that spends its "
+            "holdout does not read."
         )
 
 
@@ -294,3 +301,56 @@ def test_pbo_with_two_combinations_is_not_reportable() -> None:
         "status": "insufficient combinations (2 < 10)",
         "n_combinations": 2,
     }
+
+
+def test_declared_canonical_universe_is_pinned() -> None:
+    """A case study that declares a canonical universe must also pin rank-1 to it.
+
+    ``backtest.sweep.universe_filter`` says which universe a case study's sweep treats
+    as canonical, and several readers honour it: ``17_costs`` pools only runs carrying
+    it, ``20_strategy_analysis`` rebuilds derived tables off it. Rank-1 selection is the
+    one that decides what the case study reports, and it reads
+    ``UNIVERSE_RESTRICTIONS`` instead.
+
+    The two are separate by design - a case study may sweep one universe and still rank
+    across everything - but a declaration with no entry here is a rule nobody applies.
+    Both case studies that declare the key also register full-universe rows on purpose
+    (sp500_options for the Ch18 HTM cost cascade, nasdaq100_microstructure for the
+    full-versus-screened comparison), which is exactly the population that leaks into
+    rank-1 by raw Sharpe when the pin is absent.
+
+    Read from each ``setup.yaml`` rather than from a list typed here, so a tenth case
+    study declaring the key fails this rather than joining silently.
+    """
+    import yaml
+
+    from case_studies.utils.strategy_analysis import UNIVERSE_RESTRICTIONS
+
+    case_studies_dir = Path(__file__).parents[1] / "case_studies"
+    declared: dict[str, str] = {}
+    for setup_path in sorted(case_studies_dir.glob("*/config/setup.yaml")):
+        setup = yaml.safe_load(setup_path.read_text()) or {}
+        universe = ((setup.get("backtest") or {}).get("sweep") or {}).get("universe_filter")
+        # "full" and "none" name the unrestricted universe, which is not a restriction.
+        if universe and str(universe).lower() not in ("full", "none"):
+            declared[setup_path.parents[1].name] = str(universe)
+
+    assert declared, "no case study declares backtest.sweep.universe_filter; the fixture moved"
+
+    missing = sorted(name for name in declared if name not in UNIVERSE_RESTRICTIONS)
+    assert not missing, (
+        f"{missing} declare backtest.sweep.universe_filter and have no UNIVERSE_RESTRICTIONS "
+        "entry, so rank-1 selection ranks their full-universe rows beside the screened ones "
+        "by raw Sharpe and the declaration applies to nothing."
+    )
+
+    disagreeing = {
+        name: (value, UNIVERSE_RESTRICTIONS[name])
+        for name, value in declared.items()
+        if UNIVERSE_RESTRICTIONS[name] != value
+    }
+    assert not disagreeing, (
+        f"the declared canonical universe and the rank-1 pin disagree: {disagreeing}. "
+        "The pin decides what the case study reports and the declaration decides what its "
+        "sweep and cost pool read, so two values means two different strategies."
+    )

@@ -42,14 +42,15 @@
 import json
 import sqlite3
 import time
-import warnings
 
 import matplotlib.pyplot as plt
 import polars as pl
 
-warnings.filterwarnings("ignore")
-
-from case_studies.research import CandidateSet, Study, open_selection_field
+from case_studies.research import (
+    Study,
+    open_selection_field,
+    open_study,
+)
 from case_studies.utils.backtest_loaders import (
     get_backtest_config,
     load_backtest_prices_for,
@@ -77,10 +78,12 @@ from case_studies.utils.sweep_config import (
     get_top_n_predictions,
 )
 from utils.paths import get_case_study_dir
-from utils.style import COLORS, FIGSIZE, add_message_title
+from utils.style import COLORS, FIGSIZE, add_message_title, show_with_alt
 
 # %% tags=["parameters"]
 CASE_STUDY_ID = "sp500_equity_option_analytics"
+EXECUTION_TIER = "canonical"
+WORKSPACE: str = ""
 LABEL = ""
 MAX_SYMBOLS = 0
 TOP_N_COMBOS = 1
@@ -93,6 +96,29 @@ TOP_N_COMBOS = 1
 # parameter wins; otherwise the case study's own declaration does.
 
 # %%
+# A run given a workspace reads and registers there rather than in the released case
+# directory, and `open_study` is what activates that root. Activation rewrites
+# `ML4T_OUTPUT_DIR` for the rest of the process, so it has to happen before the first
+# `get_case_study_dir` rather than beside the registry read further down: `CASE_DIR` has to
+# already answer for the workspace.
+#
+# `WORKSPACE` is read at both tiers. It used to be read on the preview branch only, so a
+# canonical run that passed one was answered with `Study.regenerate` and registered its
+# backtests in the published store while its caller read from the workspace it asked for -
+# no exception, no warning, and an exit status that said the run had refused (#1100). A
+# canonical run with a workspace is the same full-fidelity sweep writing to that root, which
+# is what a rehearsal against a private registry needs. A preview still requires one, because
+# a preview with no workspace has nowhere of its own to write.
+_workspace_study = None
+if EXECUTION_TIER == "preview" and not WORKSPACE:
+    raise ValueError("preview execution requires WORKSPACE")
+if WORKSPACE or EXECUTION_TIER == "preview":
+    _workspace_study = open_study(
+        CASE_STUDY_ID,
+        execution_tier=EXECUTION_TIER,
+        workspace=WORKSPACE or None,
+        entry_point="17_costs",
+    )
 CASE_DIR = get_case_study_dir(CASE_STUDY_ID)
 REGISTRY_DB = CASE_DIR / "run_log" / "registry.db"
 bt_config = get_backtest_config(CASE_STUDY_ID)
@@ -119,13 +145,19 @@ print(
 
 # `Study.at` is the read-only form: one root, no activation. These notebooks only read the
 # populations - their backtests reach the registry by their own paths - and every other way in
-# ends in `activate()`, which rewrites `ML4T_OUTPUT_DIR` process-wide. `open_study` with the
-# canonical tier routes to `Study.regenerate`, which refuses unless `features`, `labels` and
-# `run_log` are symlinks: true in a maintainer worktree, false in every clean clone and CI run.
-# `CASE_DIR` is already the directory this notebook resolved, including under a preview, so
+# ends in `activate()`, which rewrites `ML4T_OUTPUT_DIR` process-wide. `open_study` at the
+# canonical tier with no workspace routes to `Study.regenerate`, which refuses unless
+# `features`, `labels` and `run_log` are symlinks: true in a maintainer worktree, false in
+# every clean clone and CI run. Given a workspace it routes to `Study.open` instead, which is
+# why the branch above opens one whenever `WORKSPACE` is set rather than only for a preview.
+# `CASE_DIR` is already the directory this notebook resolved, including under a workspace, so
 # asking it directly answers for the registry the rest of the notebook reads.
-_study = Study.at(CASE_DIR, case_study=CASE_STUDY_ID, entry_point="17_costs")
-_members, _population_notes = prediction_members_in_force(_study)
+_study = (
+    _workspace_study
+    if _workspace_study is not None
+    else Study.at(CASE_DIR, case_study=CASE_STUDY_ID, entry_point="17_costs")
+)
+_members, _population_notes = prediction_members_in_force(_study, CASE_DIR)
 for _note in _population_notes:
     print(_note)
 CURRENT_MEMBERS = _members
@@ -262,6 +294,26 @@ print(
 # `PER_SHARE_COMMISSION` and varies a uniform half-spread. It omits a per-order commission floor and does
 # not estimate name-specific spreads, so it is an exploratory convention rather
 # than a second production-cost estimate.
+#
+# **What the grid spans, and where the declared estimate sits inside it.** The percentage
+# axis runs from 0 to 50 basis points round-trip. `config/setup.yaml` declares this strategy's
+# own cost at 13 basis points round-trip, from a 3 to 10 basis point per-leg range, so the
+# sweep reaches roughly four times the estimate rather than bracketing it narrowly. That is
+# deliberate: the question a cost sweep answers is not "does the result survive the number we
+# believe" but "how far past that number does it survive", and a grid that stops near the
+# estimate cannot answer the second.
+#
+# **The equal split between commission and slippage is an assumption, not a measurement.**
+# Nothing in this data separates the two, and the backtest charges their sum, so the split
+# changes no result here. It is stated because it would matter to a reader carrying these
+# numbers to a venue where commission is negotiable and spread is not.
+#
+# **Why a second surface at all.** A percentage charge scales with notional, so it taxes a
+# large position in a cheap name and a small one in an expensive name identically. A per-share
+# charge does not, and the two therefore disagree most exactly where this strategy trades: the
+# S&P 500 spans share prices wide enough that a half-spread of a fixed number of cents is a
+# very different cost at 20 dollars than at 500. The second surface is what makes that
+# disagreement visible rather than assumed away.
 
 # %%
 base_specs = []
@@ -278,8 +330,9 @@ for combo in top_combos.iter_rows(named=True):
     base_specs.append((combo, prediction_hash, base_spec))
 
 # %% [markdown]
-# The percentage-cost surface divides each one-way charge equally between
-# commission and slippage.
+# The eleven points below are one backtest each, at the same specification and prediction set,
+# differing only in the cost charged. Everything else is held so that the curve they trace is
+# attributable to cost and to nothing else.
 
 # %%
 plans = []
@@ -507,7 +560,12 @@ add_message_title(
     "Exploratory flat-dollar convention; band: conditional bootstrap",
 )
 
-fig.show()
+show_with_alt(
+    fig,
+    "Two panels of annualized validation Sharpe against a cost axis, each a line with a shaded "
+    "95% bootstrap band and a dashed line at zero: one-way cost in basis points on the left with "
+    "the configured level marked, a uniform per-share half-spread on the right.",
+)
 
 # %% [markdown]
 # ## Key takeaways

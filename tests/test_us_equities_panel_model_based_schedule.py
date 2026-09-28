@@ -1,0 +1,370 @@
+"""`us_equities_panel` stage 04 emits a value that cannot move once it is emitted.
+
+The notebook's two fitted transforms - the Wasserstein regime clustering and the per-stock
+GARCH volatility - are driven by `walk_forward_feature`, so a value at a session is a
+function of that session's own past and of parameters estimated strictly earlier. Neither
+property is visible in the artifact: a value fitted on its own future looks exactly like one
+that was not, and the file records no estimation window. So it is checked here, on synthetic
+series, by the only thing that distinguishes them - whether a value moves when later
+observations arrive.
+
+The functions are pulled out of the notebook source rather than reimplemented. A copy of the
+logic would pass while the notebook drifted away from it.
+"""
+
+from __future__ import annotations
+
+import ast
+from dataclasses import dataclass
+from datetime import date, timedelta
+from pathlib import Path
+
+import numpy as np
+import pytest
+import yaml
+
+from case_studies.utils.temporal import (
+    fit_wasserstein_kmeans,
+    garch11_conditional_volatility,
+    lift_stream,
+    refit_boundaries,
+    walk_forward_feature,
+    wasserstein_distance_1d,
+)
+
+NOTEBOOK = (
+    Path(__file__).resolve().parents[1]
+    / "case_studies"
+    / "us_equities_panel"
+    / "04_model_based_features.py"
+)
+
+SETUP = (
+    Path(__file__).resolve().parents[1]
+    / "case_studies"
+    / "us_equities_panel"
+    / "config"
+    / "setup.yaml"
+)
+
+# The declared schedule, mirrored from `config/setup.yaml`. A change there is meant to change
+# what the notebook fits; it is not meant to change whether the values are causal, which is
+# what this module asserts, so the numbers are restated rather than read.
+REGIME = dict(window=21, overlap=5, n_clusters=2, burnin=756, refit_every=63)
+GARCH = dict(burnin=504, refit_every=63)
+
+
+def _garch_kwargs() -> dict:
+    """The `arch_model` keywords the notebook builds, with the values it would read.
+
+    The *keys* are parsed from the notebook rather than restated, because they are a structural
+    dependency rather than a value this module reasons about: the notebook's fit closure reads
+    `GARCH_KW` by key, so a key it consumes and this stub omits raises `KeyError` inside the
+    walk. `walk_forward_feature` runs the per-block fit under `on_fit_error="skip"`, so that
+    exception is swallowed, the walk emits nothing, and the failure surfaces two assertions
+    later as "the shorter walk emitted no volatility" - naming neither the key nor the notebook.
+
+    Restating the keys is what produced exactly that, when the notebook gained `o`. Parsing them
+    means the list cannot drift again. The values come from the declaration the notebook reads,
+    so the stub fits the specification the case study declares.
+
+    This asserts nothing about whether the declared specification is the right one; what it
+    establishes is that the stub and the notebook agree on the call. Measured by flipping the
+    declaration: under `o: 1` five of the six tests here still pass, and the sixth fails because
+    two of twenty-four GJR fits do not converge on this module's synthetic series and are skipped,
+    which is the notebook's convergence rejection working rather than a value moving.
+    """
+    declared = yaml.safe_load(SETUP.read_text())["model_based"]["garch"]
+    assignment = next(
+        node
+        for node in ast.parse(NOTEBOOK.read_text()).body
+        if isinstance(node, ast.Assign)
+        and any(getattr(target, "id", None) == "GARCH_KW" for target in node.targets)
+    )
+    if not isinstance(assignment.value, ast.Dict):
+        raise AssertionError(
+            f"{NOTEBOOK.name} no longer builds GARCH_KW as a dict literal, so its keys cannot "
+            "be read; update this helper alongside the notebook"
+        )
+    keys = [key.value for key in assignment.value.keys if isinstance(key, ast.Constant)]
+    missing = [key for key in keys if key not in declared]
+    if missing:
+        raise AssertionError(
+            f"{NOTEBOOK.name} passes {missing} to arch_model and "
+            "config/setup.yaml::model_based.garch declares no such key"
+        )
+    return {key: declared[key] for key in keys}
+
+
+# What the notebook composes, not what it imports. The Wasserstein estimator moved into
+# `case_studies.utils.temporal` beside the HMM helpers, so it is injected below the way
+# `walk_forward_feature` and `garch11_conditional_volatility` already were: these tests are
+# about whether a value reads the sessions before it, and that is a property of the walk the
+# notebook builds rather than of the estimator it calls.
+DEFINITIONS = (
+    "fit_regime_centroids",
+    "assign_regime_features",
+    "garch_walk",
+)
+
+
+def _load(arch_model) -> dict:
+    """The notebook's transform definitions, executed against a stub of its globals."""
+    body = [
+        node
+        for node in ast.parse(NOTEBOOK.read_text()).body
+        if getattr(node, "name", None) in DEFINITIONS
+    ]
+    missing = set(DEFINITIONS) - {node.name for node in body}
+    assert not missing, f"{NOTEBOOK.name} no longer defines {sorted(missing)}"
+
+    namespace = {
+        "np": np,
+        "dataclass": dataclass,
+        "arch_model": arch_model,
+        "walk_forward_feature": walk_forward_feature,
+        "garch11_conditional_volatility": garch11_conditional_volatility,
+        "lift_stream": lift_stream,
+        "fit_wasserstein_kmeans": fit_wasserstein_kmeans,
+        "wasserstein_distance_1d": wasserstein_distance_1d,
+        "FloatArray": np.ndarray,
+        "IntArray": np.ndarray,
+        "WASSERSTEIN_WINDOW": REGIME["window"],
+        "WASSERSTEIN_OVERLAP": REGIME["overlap"],
+        "N_CLUSTERS": REGIME["n_clusters"],
+        "SEED": 42,
+        "GARCH_KW": _garch_kwargs(),
+        "GARCH_BURNIN": GARCH["burnin"],
+        "GARCH_REFIT_EVERY": GARCH["refit_every"],
+    }
+    exec(compile(ast.Module(body=body, type_ignores=[]), str(NOTEBOOK), "exec"), namespace)
+    return namespace
+
+
+@pytest.fixture(scope="module")
+def notebook_functions() -> dict:
+    return _load(pytest.importorskip("arch").arch_model)
+
+
+@pytest.fixture(scope="module")
+def returns() -> np.ndarray:
+    """Two thousand daily returns with a variance break two-thirds of the way through.
+
+    The break is what makes the test able to fail: on a homoskedastic series a later
+    observation barely moves a refit, so a leaky implementation and a causal one agree to
+    several decimals.
+    """
+    rng = np.random.default_rng(0)
+    return np.concatenate([rng.normal(0.0005, 0.008, 1200), rng.normal(-0.001, 0.02, 800)])
+
+
+def _sessions(n: int) -> list:
+    """One strictly increasing session per row.
+
+    `walk_forward_feature` requires this and will not take the array's word for it: a
+    bare `(n_obs, n_features)` block cannot tell a sorted frame from an unsorted one,
+    nor one entity's series from two concatenated.
+    """
+    return [date(2015, 1, 1) + timedelta(days=i) for i in range(n)]
+
+
+def _regime_walk(functions: dict, series: np.ndarray, freeze_after: int) -> np.ndarray:
+    return walk_forward_feature(
+        series.reshape(-1, 1),
+        timestamps=_sessions(len(series)),
+        burnin=REGIME["burnin"],
+        refit_every=REGIME["refit_every"],
+        fit=functions["fit_regime_centroids"],
+        apply=functions["assign_regime_features"],
+        n_features=5,
+        freeze_after=freeze_after,
+    )
+
+
+def test_regime_values_do_not_move_when_later_sessions_arrive(notebook_functions, returns):
+    full = _regime_walk(notebook_functions, returns, len(returns))
+    short = _regime_walk(notebook_functions, returns[:1500], 1500)
+
+    emitted = ~np.isnan(short[:, 1])
+    assert emitted.sum() > 0, "the shorter walk emitted no regime value to compare"
+    np.testing.assert_array_equal(
+        full[:1500][emitted],
+        short[emitted],
+        err_msg="a regime value moved when 500 later sessions were appended",
+    )
+
+
+def test_a_regime_value_reads_the_sessions_before_it_and_no_others(notebook_functions, returns):
+    centroids = notebook_functions["fit_regime_centroids"](returns[:900].reshape(-1, 1))
+    assign = notebook_functions["assign_regime_features"]
+
+    base = assign(centroids, returns[:1000].reshape(-1, 1))
+    poked = returns[:1000].copy()
+    poked[900] += 0.5
+    after = assign(centroids, poked.reshape(-1, 1))
+
+    np.testing.assert_array_equal(
+        base[:901], after[:901], err_msg="session 900 reached a value dated at or before it"
+    )
+    assert not np.allclose(base[901], after[901]), (
+        "session 900 did not reach the value at 901, so the window is not the one declared"
+    )
+
+
+def test_volatility_values_do_not_move_when_later_sessions_arrive(notebook_functions, returns):
+    walk = notebook_functions["garch_walk"]
+    percent = returns * 100
+
+    _, full, fits = walk(("TEST", percent, len(returns), _sessions(len(percent))))
+    _, short, _ = walk(("TEST", percent[:1500], 1500, _sessions(1500)))
+
+    emitted = ~np.isnan(short)
+    assert emitted.sum() > 0, "the shorter walk emitted no volatility to compare"
+    np.testing.assert_array_equal(
+        full[:1500][emitted],
+        short[emitted],
+        err_msg="a conditional volatility moved when 500 later sessions were appended",
+    )
+    assert np.all(full[~np.isnan(full)] > 0), "a conditional volatility left the positive reals"
+    assert np.all(np.isnan(full[: GARCH["burnin"]])), "a value was emitted inside the burn-in"
+    assert len(fits) == len(
+        refit_boundaries(len(returns), GARCH["burnin"], GARCH["refit_every"])
+    ), f"{len(fits)} estimations against the declared schedule"
+
+
+def test_freezing_stops_estimation_without_stopping_emission(notebook_functions, returns):
+    walk = notebook_functions["garch_walk"]
+    percent = returns * 100
+
+    _, unfrozen, all_fits = walk(("TEST", percent, len(returns), _sessions(len(percent))))
+    _, frozen, frozen_fits = walk(("TEST", percent, 1500, _sessions(len(percent))))
+
+    assert len(frozen_fits) < len(all_fits), "freezing stopped no estimation"
+    assert max(fit["fit_end"] for fit in frozen_fits) <= 1500, (
+        "an estimation read observations past the freeze point"
+    )
+    assert not np.isnan(frozen[-1]), (
+        "freezing stopped emission as well as estimation; the holdout would carry no value"
+    )
+
+
+def test_a_fit_the_optimizer_did_not_converge_on_is_not_an_estimate(returns):
+    """`arch` returns a result whatever the search did, and only warns.
+
+    `show_warning=False` swallows the warning, so without an explicit check a parameter
+    vector the optimizer never converged on would be filtered forward and written to the
+    artifact as a feature value. What must happen instead is that the block is left empty.
+
+    The stub is a *usable* result rather than one that raises on access: a stub that raised
+    would be caught by `on_fit_error="skip"` and leave exactly the empty fits and NaN values
+    asserted below, so the test would pass with the convergence check deleted. This one
+    yields coefficients that would filter forward perfectly well, and records every field
+    read, so the only thing that can produce an empty walk is the check itself.
+    """
+    read: list[str] = []
+
+    class _Volatility:
+        @staticmethod
+        def backcast(resid):
+            read.append("backcast")
+            return 1.0
+
+    class _Model:
+        volatility = _Volatility()
+
+    class _Unconverged:
+        convergence_flag = 1
+
+        @property
+        def params(self):
+            read.append("params")
+            return {"mu": 0.0, "omega": 0.1, "alpha[1]": 0.05, "beta[1]": 0.9}
+
+        @property
+        def resid(self):
+            read.append("resid")
+            return np.zeros(10)
+
+        @property
+        def model(self):
+            read.append("model")
+            return _Model()
+
+    class _ArchModel:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def fit(self, **kwargs):
+            return _Unconverged()
+
+    functions = _load(_ArchModel)
+    _, values, fits = functions["garch_walk"](
+        ("TEST", returns * 100, len(returns), _sessions(len(returns)))
+    )
+
+    assert fits == [], "a non-converged fit was recorded as an estimation"
+    assert np.all(np.isnan(values)), "a non-converged fit produced a feature value"
+    assert read == [], f"a non-converged result was read for {read}"
+
+
+def test_every_payload_consumer_takes_what_the_producer_builds():
+    """The GARCH payload is built in one place and unpacked in several.
+
+    `garch_walk` takes a tuple, and the tests above call it directly, so nothing here
+    exercises the module-level loop that builds those tuples or the schedule count that
+    reads them back. When `timestamps` became required and the payload grew a fourth
+    element, the `_scheduled_blocks` comprehension still unpacked three - which raises
+    `ValueError: too many values to unpack` on any non-empty payload list, before a
+    single stock is fitted, and no test noticed.
+
+    That is the same shape as the defect it was fixing: a consumer left behind by its
+    producer. Checked statically because the loop needs the panel to run at all.
+
+    Both kinds of consumer count: the comprehension that reads `payloads` back, and any
+    call site that writes its own tuple - the market-level walk does, outside the pool.
+    """
+    tree = ast.parse(NOTEBOOK.read_text(encoding="utf-8"))
+
+    built = {
+        len(arg.elts)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "append"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "payloads"
+        for arg in node.args
+        if isinstance(arg, ast.Tuple)
+    }
+    assert len(built) == 1, f"payloads are built with differing arity: {sorted(built)}"
+    arity = built.pop()
+
+    consumed = {
+        (node.iter.lineno, len(node.target.elts))
+        for node in ast.walk(tree)
+        if isinstance(node, ast.comprehension)
+        and isinstance(node.iter, ast.Name)
+        and node.iter.id == "payloads"
+        and isinstance(node.target, ast.Tuple)
+    }
+    # And every payload built at a call site rather than by the loop. The market-level
+    # walk at the bottom of Section 4 runs outside the ProcessPoolExecutor and writes its
+    # own tuple, so a change that touches only the loop leaves it raising "not enough
+    # values to unpack" - found by agents-72, whose second fixture run failed there after
+    # the first got past the regime walk.
+    consumed |= {
+        (node.lineno, len(arg.elts))
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "garch_walk"
+        for arg in node.args
+        if isinstance(arg, ast.Tuple)
+    }
+    wrong = sorted(line for line, size in consumed if size != arity)
+
+    assert not wrong, (
+        f"a payload is built or unpacked with the wrong arity at line(s) {wrong}; it "
+        f"disagrees with the {arity}-element tuple the loop builds, so this raises "
+        "before any fit runs"
+    )

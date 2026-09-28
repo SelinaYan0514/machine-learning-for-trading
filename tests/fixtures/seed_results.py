@@ -21,6 +21,7 @@ import yaml
 
 from case_studies.utils.registry.specs import IDENTITY_VERSION
 from case_studies.utils.registry.store import _open_registry
+from tests.fixture_registry import choose_reference_panel, panel_signature
 
 REPO_ROOT = Path(__file__).parent.parent.parent
 CS_ROOT = REPO_ROOT / "case_studies"
@@ -882,20 +883,11 @@ def _reference_panels(cs_dir: Path, hash_rows: list, survives, _pl) -> dict:
             entity = next((c for c in ENTITY_COLUMN_CANDIDATES if c in frame.columns), None)
             if entity is None or not {"timestamp", "actual"} <= set(frame.columns):
                 continue
-            # Only ever compared for equality, so stringifying the identifiers is
-            # enough and keeps a column carrying nulls from raising in sorted().
-            signature = (
-                frame.height,
-                tuple(sorted(map(str, frame[entity].unique().to_list()))),
-                tuple(map(str, frame["timestamp"].unique().sort().to_list())),
-            )
+            signature = panel_signature(frame, entity)
             by_signature.setdefault(signature, []).append((p_hash, frame, entity))
         if not by_signature:
             continue
-        _, entries = min(
-            by_signature.items(),
-            key=lambda item: (-len(item[1]), -item[0][0], item[1][0][0]),
-        )
+        _, entries = choose_reference_panel(by_signature)
         _, frame, entity = entries[0]
         panels[key] = _subsampled_panel(frame, entity, _pl)
     return panels
@@ -1253,6 +1245,77 @@ def _record_prediction_artifact_digests(cs_dir: Path) -> None:
         db.commit()
 
 
+def _declared_long_short(cs_id: str) -> bool:
+    """The case study's declared selection mode, or long-only if it cannot be read.
+
+    `get_declared_long_short` goes through `get_backtest_config`, which resolves more of the
+    case study's configuration than a fixture needs. Falling back to long-only on failure keeps
+    the seeder's old behaviour for a case study whose backtest block does not load, rather than
+    failing every fixture in the repo over one of them.
+    """
+    try:
+        from case_studies.utils.sweep_config import get_declared_long_short
+
+        return get_declared_long_short(cs_id)
+    except Exception:
+        return False
+
+
+def _seeded_panel_width(setup: dict, *, long_short: bool) -> int:
+    """How many entities a fabricated prediction panel has to carry.
+
+    Ten was a speed cap, and it silently decided what CI measures about concentration.
+    `get_top_k_values_for` drops every k at or above the traded universe, because holding
+    everything is the equal-weight benchmark rather than a prediction-based portfolio - so
+    a ten-name panel deletes `top_k` 10 and 20 from the declared grid instead of running
+    them degenerately. Six of the nine case studies declare a k of 20 or more, and none of
+    those arms has ever executed in CI.
+
+    The width is therefore whatever the widest declared concentration needs in order to be
+    a restriction, floored at the old ten so a case study that declares nothing wide is
+    unaffected, and capped by what the case study's own label carries at the call site.
+
+    What "a restriction" needs is not one number. A long-only arm at ``k`` needs ``k + 1``
+    names: the arm then selects a strict subset, which is the property the filter checks for.
+    A long-short arm takes ``k`` names on each side, so ``get_top_k_values_for`` drops every
+    ``k`` with ``2k > n_assets`` and it needs ``2k + 1``. Sizing every case study as if it were
+    long-only left the widest arms of the seven that declare a cross-sectional short sleeve
+    filtered out exactly as before, which is the defect this function exists to fix.
+
+    The selection mode comes from ``mapping.position_state_space``, read through the same
+    ``get_declared_long_short`` the sweep itself calls - not from ``account.allow_short_selling``,
+    which is an execution permission that ``sp500_options`` holds while selecting long-only.
+    """
+    sweep = ((setup.get("backtest") or {}).get("sweep")) or {}
+    declared: set[int] = set()
+    for values in (sweep.get("top_k_grid") or {}).values():
+        declared.update(values if isinstance(values, list) else [values])
+    cascade_k = (sweep.get("htm_cost_cascade") or {}).get("top_k")
+    if cascade_k:
+        declared.add(cascade_k)
+    numeric = {int(k) for k in declared if isinstance(k, int | float)}
+    if not numeric:
+        return 10
+    sides = 2 if long_short else 1
+    return max(10, sides * max(numeric) + 1)
+
+
+def _label_files_primary_first(cs_dir: Path, primary_label: str | None) -> list[Path]:
+    """The case study's label parquets, its primary label first.
+
+    The rest keep their alphabetical order, so a case study whose primary label has no
+    parquet - or whose parquet lacks the key columns - falls back to exactly the file it
+    used before.
+    """
+    files = sorted((cs_dir / "labels").glob("*.parquet"))
+    if not primary_label:
+        return files
+    primary = cs_dir / "labels" / f"{primary_label}.parquet"
+    if primary not in files:
+        return files
+    return [primary, *(path for path in files if path != primary)]
+
+
 def _backfill_all_prediction_parquets(cs_dir: Path, cs_id: str) -> None:
     """Generate synthetic prediction parquets for every hash in the registry.
 
@@ -1385,14 +1448,20 @@ def _backfill_all_prediction_parquets(cs_dir: Path, cs_id: str) -> None:
     # canonical registries, every artifact of a label named here carries the column
     # and no other artifact does - so it is also what tells this function which
     # synthetic artifacts need it.
+    # The label whose universe the seeded panel is keyed on, and how wide that panel
+    # has to be. Both come from the case study's own configuration.
+    primary_label: str | None = None
+    panel_width = 10
     eval_target_labels: set = set()
     if setup_path.exists():
         setup = yaml.safe_load(setup_path.read_text())
         eval_target_labels = set((setup.get("labels") or {}).get("classification_eval_label") or {})
+        primary_label = (setup.get("labels") or {}).get("primary")
+        panel_width = _seeded_panel_width(setup, long_short=_declared_long_short(cs_id))
         universe = setup.get("universe", {})
         assets = universe.get("assets", [])
         if assets:
-            symbols = assets[:10]  # Cap at 10 for test speed
+            symbols = assets[:panel_width]
         if cs_id == "cme_futures":
             label_entity_col = "product"
         eval_cfg = setup.get("evaluation", {})
@@ -1466,9 +1535,19 @@ def _backfill_all_prediction_parquets(cs_dir: Path, cs_id: str) -> None:
     # So both the entity values and the two key dtypes come from the case study's own labels
     # where it has them, and fall back to setup.yaml's symbol list otherwise. Only the fabricated
     # grid needs this: a panel borrowed from a copied artifact already carries production's types.
+    #
+    # Which label file, and not simply the first one on disk. The panel these artifacts
+    # are keyed on is what every downstream join meets the case study's labels and
+    # features on, so it has to be the label the predictions were fitted for. Taking the
+    # first parquet alphabetically was that label in eight case studies and was not in
+    # sp500_options, whose `fwd_ret_10d` is a diagnostic-only label carrying the full
+    # 621-name production universe while the modelled `ret_to_expiry` carries 22. Every
+    # seeded prediction there was keyed on the alphabetical head of the wrong universe -
+    # A, AAP, ABBV, ABC, ABMD, ABT, ACN, ADBE - of which two names, AAL and AAPL, are in
+    # the label the case study actually trades.
     entity_dtype = None
     timestamp_dtype = None
-    for label_file in sorted((cs_dir / "labels").glob("*.parquet")):
+    for label_file in _label_files_primary_first(cs_dir, primary_label):
         try:
             schema = _pl.read_parquet_schema(label_file)
         except Exception:  # noqa: BLE001 - an unreadable label is not ours to fix here
@@ -1482,7 +1561,7 @@ def _backfill_all_prediction_parquets(cs_dir: Path, cs_id: str) -> None:
                 _pl.read_parquet(label_file, columns=[label_entity_col])[label_entity_col]
                 .unique()
                 .sort()
-                .head(10)
+                .head(panel_width)
                 .to_list()
             )
         except Exception:  # noqa: BLE001
@@ -1852,115 +1931,6 @@ def _seed_demo_predictions(cs_dir: Path, cs_id: str, primary_label: str) -> None
         df.write_parquet(str(pred_file))
 
 
-def _seed_news_features(output_dir: Path) -> None:
-    """Seed a minimal news_features.parquet for Ch10/08_text_feature_evaluation.
-
-    The notebook loads from get_output_dir(8, "fnspid") / "news_features.parquet".
-    In test mode that becomes {ML4T_OUTPUT_DIR}/ch08_fnspid/news_features.parquet.
-    Required columns: symbol, timestamp, fwd_ret_1d, fwd_ret_5d, fwd_ret_20d,
-    weighted_surprise, sentiment_mean, sentiment_momentum, coverage_count.
-    """
-    try:
-        import numpy as np
-        import polars as _pl
-    except ImportError:
-        return
-
-    out_dir = output_dir / "ch08_fnspid"
-    path = out_dir / "news_features.parquet"
-    if path.exists():
-        return
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    rng = np.random.default_rng(42)
-    symbols = ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "JPM"]
-    from datetime import date, timedelta
-
-    start = date(2023, 1, 3)
-    dates = [
-        start + timedelta(days=i) for i in range(60) if (start + timedelta(days=i)).weekday() < 5
-    ]
-    n = len(symbols) * len(dates)
-
-    df = _pl.DataFrame(
-        {
-            "symbol": [s for _ in dates for s in symbols],
-            "timestamp": _pl.Series([d for d in dates for _ in symbols]).cast(_pl.Date),
-            "fwd_ret_1d": rng.normal(0, 0.01, n).tolist(),
-            "fwd_ret_5d": rng.normal(0, 0.02, n).tolist(),
-            "fwd_ret_20d": rng.normal(0, 0.04, n).tolist(),
-            "weighted_surprise": rng.normal(0, 0.5, n).tolist(),
-            "sentiment_mean": rng.normal(0, 0.3, n).tolist(),
-            "sentiment_momentum": rng.normal(0, 0.2, n).tolist(),
-            "coverage_count": rng.poisson(3, n).tolist(),
-        }
-    )
-    df.write_parquet(str(path))
-
-
-def _seed_ch16_parity_json() -> None:
-    """Seed cached parity JSON artifacts for Ch16 notebooks 15-18.
-
-    These notebooks read from get_chapter_dir(16) / "resources" / "<name>.json".
-    That path is NOT redirected by ML4T_OUTPUT_DIR — it's a real code-repo path.
-    """
-    resources_dir = REPO_ROOT / "16_strategy_simulation" / "resources"
-    resources_dir.mkdir(parents=True, exist_ok=True)
-
-    # NB15: lean_parity_results.json
-    _write_if_missing(
-        resources_dir / "lean_parity_results.json",
-        {
-            "artifact_source": "fixture",
-            "scenario_id": "multi_250_20yr",
-            "scenario_label": "250 assets, 20 years daily",
-            "data_source": "fixture",
-            "cached": True,
-            "limitations": ["Fixture data for CI testing"],
-            "results": [
-                {
-                    "framework_id": "ml4t-lean",
-                    "label": "ml4t-backtest (LEAN profile)",
-                    "num_trades": 428459,
-                    "final_value": 1234567.89,
-                    "runtime_sec": 12.5,
-                    "data_points": 1250000,
-                },
-                {
-                    "framework_id": "lean",
-                    "label": "QuantConnect LEAN CLI",
-                    "num_trades": 428459,
-                    "final_value": 1234566.34,
-                    "runtime_sec": 95.3,
-                    "data_points": 1250000,
-                },
-            ],
-            "comparison": {
-                "trade_gap": 0,
-                "trade_gap_pct": 0.0,
-                "final_value_gap": 1.55,
-                "final_value_gap_pct": 1.255e-06,
-                "runtime_speedup": 7.62,
-                "remaining_gap_driver": "price_precision",
-                "notes": [
-                    "next-bar open execution is aligned",
-                    "margin-enabled LEAN account semantics are aligned",
-                    "decoded fill chronology matches exactly at event identity and 4-decimal price",
-                ],
-            },
-        },
-    )
-
-    # NB16 (case_study_lean_parity_results.json), NB17
-    # (backtrader_zipline_parity_results.json), and NB18
-    # (vectorbt_parity_results.json) are intentionally NOT seeded here.
-    # Their artifacts hold genuine engine-parity numbers and are committed under
-    # 16_strategy_simulation/resources/ (version-controlled, always present on
-    # checkout), so the fabricated CI fallbacks were removed. NB16 is reproducible
-    # via ml4t.backtest._validation.case_study_lean; NB17 and NB18 via
-    # validation/benchmark_suite.py.
-
-
 def _write_if_missing(path: Path, data: dict) -> None:
     """Write JSON file only if it doesn't already exist."""
     if path.exists():
@@ -2046,7 +2016,3 @@ def seed_results(output_dir: Path, case_study_ids: list[str]) -> None:
 
         # Ch25 live-simulation demo predictions
         _seed_demo_predictions(cs_dir, cs_id, primary_label)
-
-    # --- Non-case-study chapter fixtures ---
-    _seed_news_features(output_dir)
-    _seed_ch16_parity_json()

@@ -13,7 +13,7 @@ This opening section reframes risk management as part of system design rather th
 
 ## Sections
 
-### 19.1 Risk in the ML4T Workflow: From Backtest Winner to Tradable System
+### 19.1 Turning Your Backtest Winner into a Tradable System
 
 This opening section reframes risk management as part of system design rather than post hoc reporting. It explains why a strategy is not deployable until its limits, escalation rules, and governance artifacts are defined in advance, auditable, and point-in-time safe.
 
@@ -42,7 +42,7 @@ This section shifts the focus from point losses to lived investor experience. By
 - [`03_position_sizing_mae_mfe`](03_position_sizing_mae_mfe.ipynb) — This notebook demonstrates position sizing methods and MAE/MFE analysis for stop calibration. We implement fixed fractional and volatility-based sizing, then use trade excursion analysis to optimize stop placement.
 - [`10_ml4t_backtest_risk_demo`](10_ml4t_backtest_risk_demo.ipynb) — Demonstrates the ml4t.backtest.risk module—the library implementation of risk management concepts discussed in Chapter 19. This provides production-ready stop-loss rules, rule composition, and portfolio-level kill switches.
 
-### 19.5 Decomposing Risk: Factor, Sector, and Macro Exposure
+### 19.5 Decomposing Factor, Sector, and Macro Exposures
 
 This section asks where portfolio risk really comes from. It shows how factor, sector, geographic, and macro decomposition reveal whether performance reflects intended exposures, accidental bets, or risks that were never part of the original thesis.
 
@@ -65,7 +65,7 @@ This is the chapter's operational core for live implementation. It explains how 
 - [`09_deep_hedging`](09_deep_hedging.ipynb) — This notebook demonstrates deep hedging (Buehler et al., 2019): a neural network learns hedging positions that minimize CVaR of terminal PnL under transaction costs. Where Section 19.7 builds adaptive risk controls from rules (vol targeting, regime caps, stops), this notebook shows how the same risk objective can be optimized end-to-end by a neural network — bridging the gap between measurement (Section 19.3) and learned control.
 - [`11_systematic_risk_sweep`](11_systematic_risk_sweep.ipynb) — Demonstrates how to systematically optimize position-level exit rules (StopLoss, TakeProfit, TrailingStop) through 1D sweeps, 2D grid searches, and MAE/MFE-calibrated stops. Rather than hand-picking 3-5 configurations, we sweep the full parameter space and visualize Sharpe/Calmar trade-offs as heatmaps --- letting the data reveal the optimal risk regime.
 
-### 19.8 Kill Switches and Risk Governance
+### 19.8 Applying Kill Switches and Risk Governance
 
 This section turns metrics and controls into institutional process. It defines what failure conditions look like, how escalation should work, when re-research is required, and why drift detection and written risk governance are necessary for any strategy that is meant to survive contact with the market.
 
@@ -81,32 +81,33 @@ The cross-case-study risk-overlay comparison lives in Chapter 20: see [`20_strat
 uv run python 19_risk_management/<notebook>.py
 
 # Test mode (reduced data via Papermill)
-uv run pytest tests/test_notebooks.py -v -k "19_risk_management"
+uv run pytest tests/test_chapter_notebooks.py -v -k "19_risk_management"
 ```
 
 ## References
 
-- **Ashwin Alankar et al.** (2023). [Fairy Tails: Lessons from 150 Years of Drawdowns](https://doi.org/10.3905/jpm.2023.1.503). *The Journal of Portfolio Management*.
-- **Andrew Ang and Allan Timmermann** (2011). [Regime Changes and Financial Markets](https://doi.org/10.2139/ssrn.1919497).
-- **Michele Leonardo Bianchi et al.** (2023). [Fat and Heavy Tails in Asset Management](https://doi.org/10.3905/jpm.2023.1.501). *The Journal of Portfolio Management*.
-- **Tim Bollerslev** (1986). [Generalized autoregressive conditional heteroskedasticity](https://doi.org/10.1016/0304-4076(86)90063-1). *Journal of Econometrics*.
 - **Aaron Brixton et al.** (2022). [A Changing Stock-Bond Correlation](https://www.aqr.com/Insights/Research/Journal-Article/A-Changing-Stock-Bond-Correlation). *AQR Alternative Thinking*.
-- **Sid Browne et al.** (2023). [Timing and Sizing Skills of Systematic Strategies across Time and Economic Regimes](https://doi.org/10.3905/jpm.2023.1.505). *The Journal of Portfolio Management*.
-- **H. Buehler et al.** (2019). [Deep hedging](https://doi.org/10.1080/14697688.2019.1571683). *Quantitative Finance*.
-- **R. Cont** (2001). [Empirical properties of asset returns: stylized facts and statistical issues](https://doi.org/10.1080/713665670). *Quantitative Finance*.
-- **Kent Daniel and Tobias J. Moskowitz** (2016). [Momentum crashes](https://doi.org/10.1016/j.jfineco.2015.12.002). *Journal of Financial Economics*.
-- **Peter Reinhard Hansen and Asger Lunde** (2006). [Consistent ranking of volatility models](https://doi.org/10.1016/j.jeconom.2005.01.005). *Journal of Econometrics*.
-- **Campbell R. Harvey et al.** (2022). [An Investor’s Guide to Crypto](https://doi.org/10.2139/ssrn.4124576).
-- **Brian Hurst** (2010). Understanding Risk Parity.
-- **Kevin Khang** (2022). [Toward Regime-Aware Risk Forecasts](https://doi.org/10.3905/jpm.2022.48.5.049). *The Journal of Portfolio Management*.
-- **R. Douglas Martin et al.** (2024). [Minimum Downside Risk Portfolios](https://doi.org/10.3905/jpm.2024.1.642). *The Journal of Portfolio Management*.
+- **A. E. Whalley and P. Wilmott** (1997). [An Asymptotic Analysis of an Optimal Hedging Model for Option Pricing with Transaction Costs](https://doi.org/10.1111/1467-9965.00034). *Mathematical Finance*.
 - **Alan Moreira and Tyler Muir** (2017). [Volatility-Managed Portfolios](https://doi.org/10.1111/jofi.12513). *The Journal of Finance*.
-- **Giuseppe A. Paleologo** (2025). The Elements of Quantitative Investing. *John Wiley & Sons*.
+- **Andrew Ang and Allan Timmermann** (2011). [Regime Changes and Financial Markets](https://doi.org/10.2139/ssrn.1919497).
 - **Andrew J. Patton** (2011). [Volatility forecast comparison using imperfect volatility proxies](https://doi.org/10.1016/j.jeconom.2010.03.034). *Journal of Econometrics*.
-- **Marcos Lopez de Prado** (2018). Advances in Financial Machine Learning. *John Wiley & Sons*.
-- **R. Tyrrell Rockafellar and Stanislav Uryasev** (2000). [Optimization of conditional value-at-risk](https://doi.org/10.21314/JOR.2000.038). *The Journal of Risk*.
-- **G. William Schwert** (1989). [Why Does Stock Market Volatility Change Over Time?](https://doi.org/10.1111/j.1540-6261.1989.tb02647.x). *The Journal of Finance*.
-- **Yizhan Shu and John M. Mulvey** (2025). [Dynamic Factor Allocation Leveraging Regime-Switching Signals](https://doi.org/10.3905/jpm.2024.1.649). *The Journal of Portfolio Management*.
+- **Ashwin Alankar et al.** (2023). [Fairy Tails: Lessons from 150 Years of Drawdowns](https://doi.org/10.3905/jpm.2023.1.503). *The Journal of Portfolio Management*.
 - **{Board of Governors of the Federal Reserve System** (2011). [Supervisory Guidance on Model Risk Management - SR Letter 11-7](https://www.federalreserve.gov/supervisionreg/srletters/sr1107.htm).
-- **Samir Varma** (2025). [The False Promise of Drawdown Rules: New Evidence and a Better Framework](https://doi.org/10.3905/jpm.2025.1.765). *The Journal of Portfolio Management*.
+- **Brian Hurst** (2010). Understanding Risk Parity.
+- **Campbell R. Harvey et al.** (2022). [An Investor’s Guide to Crypto](https://doi.org/10.2139/ssrn.4124576).
+- **Giuseppe A. Paleologo** (2025). The Elements of Quantitative Investing. *John Wiley & Sons*.
+- **G. William Schwert** (1989). [Why Does Stock Market Volatility Change Over Time?](https://doi.org/10.1111/j.1540-6261.1989.tb02647.x). *The Journal of Finance*.
+- **H. Buehler et al.** (2019). [Deep hedging](https://doi.org/10.1080/14697688.2019.1571683). *Quantitative Finance*.
 - **Hervé Zumbach and Gilles Zumbach** (2025). [A Quantitative Approach to Historical Stress Tests](https://doi.org/10.3905/jpm.2025.1.742). *The Journal of Portfolio Management*.
+- **Kent Daniel and Tobias J. Moskowitz** (2016). [Momentum crashes](https://doi.org/10.1016/j.jfineco.2015.12.002). *Journal of Financial Economics*.
+- **Kevin Khang** (2022). [Toward Regime-Aware Risk Forecasts](https://doi.org/10.3905/jpm.2022.48.5.049). *The Journal of Portfolio Management*.
+- **Marcos Lopez de Prado** (2018). Advances in Financial Machine Learning. *John Wiley & Sons*.
+- **Michele Leonardo Bianchi et al.** (2023). [Fat and Heavy Tails in Asset Management](https://doi.org/10.3905/jpm.2023.1.501). *The Journal of Portfolio Management*.
+- **Peter Reinhard Hansen and Asger Lunde** (2006). [Consistent ranking of volatility models](https://doi.org/10.1016/j.jeconom.2005.01.005). *Journal of Econometrics*.
+- **R. Cont** (2001). [Empirical properties of asset returns: stylized facts and statistical issues](https://doi.org/10.1080/713665670). *Quantitative Finance*.
+- **R. Douglas Martin et al.** (2024). [Minimum Downside Risk Portfolios](https://doi.org/10.3905/jpm.2024.1.642). *The Journal of Portfolio Management*.
+- **R. Tyrrell Rockafellar and Stanislav Uryasev** (2000). [Optimization of conditional value-at-risk](https://doi.org/10.21314/JOR.2000.038). *The Journal of Risk*.
+- **Samir Varma** (2025). [The False Promise of Drawdown Rules: New Evidence and a Better Framework](https://doi.org/10.3905/jpm.2025.1.765). *The Journal of Portfolio Management*.
+- **Sid Browne et al.** (2023). [Timing and Sizing Skills of Systematic Strategies across Time and Economic Regimes](https://doi.org/10.3905/jpm.2023.1.505). *The Journal of Portfolio Management*.
+- **Tim Bollerslev** (1986). [Generalized autoregressive conditional heteroskedasticity](https://doi.org/10.1016/0304-4076(86)90063-1). *Journal of Econometrics*.
+- **Yizhan Shu and John M. Mulvey** (2025). [Dynamic Factor Allocation Leveraging Regime-Switching Signals](https://doi.org/10.3905/jpm.2024.1.649). *The Journal of Portfolio Management*.

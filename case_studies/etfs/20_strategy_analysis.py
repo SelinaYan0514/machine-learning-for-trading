@@ -62,18 +62,17 @@
 
 import json
 import sqlite3
-import warnings
-from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import polars as pl
-import torch  # ml4t.diagnostic loads cudart; torch must import first
+
+# ml4t.diagnostic loads cudart; torch must import first, so its bundled runtime wins symbol
+# resolution. Imported for that side effect alone, which ruff cannot see - without the noqa
+# a dead-import sweep deletes it and the notebook fails on the cudart load.
+import torch  # noqa: F401
 import yaml
-
-warnings.filterwarnings("ignore")
-
 from ml4t.diagnostic.evaluation import PortfolioAnalysis
 from ml4t.diagnostic.integration import (
     BacktestReportMetadata,
@@ -111,18 +110,21 @@ from case_studies.utils.strategy_analysis import (
     plot_concentration_curve,
     plot_equity_drawdown,
     plot_sharpe_waterfall,
-    resolve_canonical_rank1_lineage,
     resolve_holdout_self_backtest,
+    resolve_solvent_carrier,
     write_strategy_assessment,
 )
 from case_studies.utils.uncertainty import STAGE_SEQUENCE, descends_from
 from utils.paths import get_case_study_dir, get_output_dir
+from utils.style import show_with_alt
 
 # %% tags=["parameters"]
-MAX_SYMBOLS = 0
-# Both names stay bound here although nothing below reads them: that is what makes the harness
-# force preview and supply a workspace (`tests/pm_helpers.py:954`). Without them the canonical
-# branch regenerates in place, which needs symlinks a CI checkout does not have.
+# MAX_SYMBOLS is gone. Nothing below read it, and a declared cap the run does not apply is
+# worse than no cap: a reader who sets it gets a full run and no warning. The two names that
+# remain are read - `_declares_tier_and_workspace` (tests/pm_helpers.py) looks for exactly
+# this pair - which is why they stay bound although nothing below references them. Without
+# them the canonical branch regenerates in place, which needs symlinks a CI checkout has not
+# got.
 EXECUTION_TIER = "canonical"
 WORKSPACE: str = ""
 
@@ -305,10 +307,15 @@ SELECTED_LABEL = top_signal.row(0, named=True)["label"]
 # The resolver is given the same field, not the whole registry: it re-ranks on common timestamp
 # support wherever a conformal candidate is present, so a row this notebook never admitted would
 # otherwise decide how far the intersection reaches and therefore which admitted row wins.
-CARRIER = resolve_canonical_rank1_lineage(CASE_STUDY, admitted=ADMITTED)
+#
+# `resolve_solvent_carrier` rather than the bare lineage resolver, so a selected configuration whose
+# equity reached zero is refused rather than reported. A long-short book with no margin call keeps
+# compounding through zero, so every metric it reports after that point - including a Sharpe high
+# enough to top a ranking - is arithmetic on a balance that no longer exists.
+CARRIER = resolve_solvent_carrier(CASE_STUDY, admitted=ADMITTED)
 if CARRIER["val_backtest_hash"] != TOP_HASH:
     raise RuntimeError(
-        "this notebook's ranking and the canonical resolver disagree on the carrier: "
+        "this notebook's ranking and the canonical resolver disagree on the selected configuration: "
         f"{TOP_HASH} against {CARRIER['val_backtest_hash']}. Everything below reports the "
         "first and the paired rows would be written against the second, so the decay would "
         "compare the right holdout against a different strategy."
@@ -340,7 +347,15 @@ if missing_kinds or stale_paired:
         if missing_kinds
         else f"{stale_paired} pair(s) challenged by a retired prediction"
     )
-    rows = populate_paired_metrics(CASE_STUDY, prediction_hashes=LIVE_PREDICTIONS, carrier=CARRIER)
+    # `replace_all=False` is additive: the pairs this call does not produce stay. That is
+    # what this notebook has always done, and it is stated now because the argument
+    # decides what the table a reader loads below contains.
+    rows = populate_paired_metrics(
+        CASE_STUDY,
+        prediction_hashes=LIVE_PREDICTIONS,
+        carrier=CARRIER,
+        replace_all=False,
+    )
     written = sum(1 for r in rows if "skip" not in r)
     print(f"backtest_paired_metrics: wrote {written} pairs ({reason})")
 else:
@@ -603,11 +618,15 @@ ax.axvline(0, color="#9E9E9E", linewidth=0.8, linestyle="--")
 ax.set_yticks(y)
 ax.set_yticklabels(fams)
 ax.set_xlabel("Validation Sharpe")
-ax.set_title("Signal-stage Sharpe by family: interquartile range and maximum")
+ax.set_title("Baseline Sharpe by family: interquartile range and maximum")
 ax.invert_yaxis()
 ax.legend(loc="lower right", frameon=False)
 fig.tight_layout()
-fig.show()
+show_with_alt(
+    fig,
+    "Validation Sharpe by model family, one row per family: a marker at the median with a bar "
+    "spanning the interquartile range, a cross at the family maximum, and a dashed line at zero.",
+)
 
 # %% [markdown]
 # **The median and the maximum answer different questions, which is why both are drawn.** A
@@ -644,7 +663,11 @@ for s, info in lineage.items():
 
 # %%
 fig = plot_sharpe_waterfall(lineage, ci_lo=ci_lo, ci_hi=ci_hi)
-fig.show()
+show_with_alt(
+    fig,
+    "One bar per stage of the locked lineage, from the baseline backtest through allocation, cost "
+    "and risk overlay, each carrying its block-bootstrap interval as an error bar.",
+)
 
 # %%
 # Stage-transition deltas via load_paired_metrics — never recompute paired
@@ -728,10 +751,19 @@ for prev_stage, stage_name in zip(present, present[1:]):
 # that differs between them, and no paired row is written for it.
 
 # %%
-conc_df = explorer.concentration_curve(TOP_PHASH)
+# The stage is named rather than defaulted. This notebook plots one line per
+# allocator, so it wants the allocation stage, and it happens to be what the old
+# default gave it - but most predictions in this registry hold signal rows and no
+# allocation rows, so a carrier that had not been through the allocator menu used
+# to make this cell raise with the stage nowhere in the call.
+conc_df = explorer.concentration_curve(TOP_PHASH, stage="allocation")
 if not conc_df.is_empty():
     fig = plot_concentration_curve(conc_df)
-    fig.show()
+    show_with_alt(
+        fig,
+        "Validation Sharpe against the number of positions held, one marker per top-k with the "
+        "best allocator at that k annotated beside it and the best k highlighted.",
+    )
     best_per_k = conc_df.sort("sharpe", descending=True).group_by("top_k").first().sort("top_k")
     print("Allocation: best Sharpe by top_k:")
     print(best_per_k.select("top_k", "allocator", "sharpe", "max_drawdown"))
@@ -904,13 +936,19 @@ ax.errorbar(
     markersize=7,
 )
 ax.axvline(0, color="#9E9E9E", linestyle="--", linewidth=0.8)
-ax.axvline(
-    ew_val["sharpe"],
-    color="#43A047",
-    linestyle=":",
-    linewidth=1.0,
-    label=f"EW validation Sharpe ({ew_val['sharpe']:.2f})",
-)
+# `load_benchmark_metrics` returns None when the benchmark JSON is absent, which its docstring
+# states and which is the ordinary case in a workspace that holds only what this run wrote. The
+# reference line is a comparison against the equal-weight baseline, so without it there is
+# nothing to draw - and drawing the rest of the forest is still worth doing. Same shape as the
+# risk-overlay line below, which has always been conditional.
+if ew_val is not None:
+    ax.axvline(
+        ew_val["sharpe"],
+        color="#43A047",
+        linestyle=":",
+        linewidth=1.0,
+        label=f"EW validation Sharpe ({ew_val['sharpe']:.2f})",
+    )
 risk_sharpe = lineage.get("risk_overlay", {}).get("sharpe")
 if risk_sharpe is not None:
     ax.axvline(
@@ -927,7 +965,12 @@ ax.set_xlabel("Value")
 ax.set_title("The selected configuration Headline Metrics with 95% CIs")
 ax.legend(loc="lower right", fontsize=8, frameon=False)
 fig.tight_layout()
-fig.show()
+show_with_alt(
+    fig,
+    "One row per headline metric, each a point estimate with a bar spanning its 95% interval, "
+    "against a dashed line at zero and dotted reference lines for the equal-weight and risk- "
+    "overlay comparisons where those are available.",
+)
 
 # %%
 # Equity-curve overlay vs validation EW benchmark
@@ -966,7 +1009,11 @@ ax.set_ylabel("Cumulative return")
 ax.set_title("Validation-window cumulative return: rank-1 strategy vs EW universe")
 ax.legend(loc="best", frameon=False)
 fig.tight_layout()
-fig.show()
+show_with_alt(
+    fig,
+    "Cumulative return over the validation window, one line for the selected strategy and one for "
+    "the equal-weight universe, against a dashed line at zero.",
+)
 
 # %% [markdown]
 # **The lower bound of the Sharpe interval is what the first gate reads**, and it answers a
@@ -1016,7 +1063,11 @@ print(dd)
 
 # %%
 fig = plot_equity_drawdown(strat_returns_path)
-fig.show()
+show_with_alt(
+    fig,
+    "Two panels sharing a date axis: cumulative return of the strategy above, and its peak-to- "
+    "trough drawdown below.",
+)
 
 # %%
 # Rolling Sharpe + rolling beta (window 126 ~ 6 months)
@@ -1180,10 +1231,15 @@ ax.axvspan(0.2, 1.0, color="#43A047", alpha=0.10, label="most-liquid ETF (0.2–
 ax.axvspan(2.0, 5.0, color="#FB8C00", alpha=0.10, label="typical ETF (2 to 5 bps)")
 ax.set_xlabel("Per-leg cost (bps)")
 ax.set_ylabel("Sharpe (validation)")
-ax.set_title("Cost sensitivity - etfs (validation, signal+allocation+cost stage)")
+ax.set_title("Cost sensitivity - etfs (validation, baseline+allocation+cost stages)")
 ax.legend(loc="best", fontsize=8, frameon=False)
 fig.tight_layout()
-fig.show()
+show_with_alt(
+    fig,
+    "Sharpe against per-leg cost in basis points: the median across configurations as a line, the "
+    "best configuration dashed, the best-to-worst envelope shaded, a dashed line at zero, and "
+    "shaded bands for the most-liquid and typical ETF spread ranges.",
+)
 
 # %%
 # Breakeven cost: where the best-config Sharpe lower bound crosses zero.
@@ -1222,8 +1278,8 @@ print("See Chapter 18 for the transaction-cost framework.")
 # `backtest_paired_metrics`, never from subtracting one Sharpe from another.
 
 # %% [markdown]
-# The anchor is the holdout backtest that replays the selected configuration's **strategy**, not the
-# highest-Sharpe holdout backtest sharing its training hash. Matching on the strategy keeps the
+# The anchor is the holdout backtest that replays the selected configuration's **strategy**, not
+# the highest-Sharpe holdout backtest sharing its training hash. Matching on the strategy keeps the
 # anchor on the lineage that was actually selected, even where an experimental side-channel
 # allocator shares the holdout prediction set and posts a higher holdout Sharpe. The
 # `val_rank1_self` pair is written against the canonical lineage's holdout hash, so it is findable
@@ -1346,11 +1402,13 @@ else:
     )
     print()
     print(
-        "The validation and holdout windows are disjoint by design, so the populator "
-        "bootstraps each window separately over its whole length and takes the difference of "
-        "independent draws. Nothing is truncated and no two draws are paired. Read the interval "
-        "as a difference of two independently resampled Sharpes, not as a comparison over "
-        "overlapping calendar time."
+        "The validation and holdout windows share no observations, so there is no difference "
+        "series to pair on and the populator bootstraps each window separately over its whole "
+        "length. Nothing is truncated and no two draws are paired. That is the absence of a "
+        "pairing, not independence - the two Sharpes are the same strategy in adjacent periods "
+        "and stay dependent. Read the interval as the gap between these two windows, not as a "
+        "comparison over overlapping calendar time and not as a test of whether one edge "
+        "carried across both."
     )
 
 # %%
@@ -1409,6 +1467,13 @@ else:
 # *series*, and disjoint windows produce no such series. An interval read as though the two were
 # contemporaneous, or as though draws were matched to each other, would be read as something
 # stronger than it is.
+#
+# **Independent draws are not independent Sharpes.** Resampling inside a window conditions on that
+# window's returns, so the interval measures the gap between these two windows. What it cannot see
+# is a market regime that lands differently on the two of them, and that is the part which decides
+# whether one edge carried across both. The interval therefore runs narrow, not wide, for that
+# second reading - an unresolved decay here is weaker evidence of stability than the same interval
+# over a single window would be.
 #
 # **The holdout is short.** Whatever the point estimates, an interval computed over a window this
 # size is wide, and a decay that is not statistically resolved is the expected outcome rather than
@@ -1501,7 +1566,11 @@ _rolling = compute_rolling_exposures(
 fig_roll = plot_rolling_exposures(
     _rolling, title="ETFs Strategy: Rolling Factor Exposures (63-day)"
 )
-fig_roll.show()
+show_with_alt(
+    fig_roll,
+    "One panel per common factor plus annualized alpha, each tracing its 63-day rolling estimate "
+    "over time against a dashed line at zero.",
+)
 
 # %% [markdown]
 # **Placebo benchmark (random ETF portfolios):**
@@ -1577,7 +1646,11 @@ if _boot.get("n_boot", 0) > 0:
 
 # %%
 fig_attr = plot_attribution_waterfall(_reg, title="ETFs Strategy: Factor Attribution")
-fig_attr.show()
+show_with_alt(
+    fig_attr,
+    "One bar per common factor plus a residual bar, each sized by that term's contribution to "
+    "Sharpe, with a dashed line at the strategy's total Sharpe.",
+)
 
 # %% [markdown]
 # Layer-1 placebo-regression alpha and Layer-2 FF5+MOM attribution
@@ -1806,7 +1879,7 @@ assessment = {
     },
     "benchmark_relative": {
         "benchmark_name": "equal_weight_universe",
-        "benchmark_validation_sharpe": ew_val["sharpe"],
+        "benchmark_validation_sharpe": ew_val["sharpe"] if ew_val is not None else None,
         "benchmark_holdout_sharpe": ew_ho["sharpe"] if HO_VS_EW_AVAILABLE else None,
         "alpha_annualized_placebo": float(alpha_daily * PERIODS_PER_YEAR),
         "alpha_t_hac": float(alpha_t),

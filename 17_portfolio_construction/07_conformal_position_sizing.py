@@ -33,7 +33,7 @@
 #   allocations on the same prediction panel
 # - Identify when uncertainty-based sizing helps versus hurts
 #
-# **Book Reference**: Chapter 17, Section 17.4 (Defining Baseline Allocators)
+# **Book Reference**: Chapter 17, Section 17.4 (Defining baseline allocators)
 #
 # **Prerequisites**: `02_mean_variance_optimization`; conformal prediction from
 # Chapter 11 (`06_conformal_prediction`); registered GBM predictions for the
@@ -47,11 +47,13 @@ import sqlite3
 import matplotlib.pyplot as plt
 import numpy as np
 import polars as pl
+from ml4t.diagnostic.evaluation.portfolio_analysis import annual_return, max_drawdown
+from ml4t.diagnostic.metrics import sharpe_ratio, sortino_ratio
 from ml4t.diagnostic.metrics.ic_inference import compute_ic_hac_stats
 from ml4t.diagnostic.signal.signal_ic import extract_signal_ic_series
 
-from utils.paths import get_case_study_dir
-from utils.style import COLORS, FIGSIZE, add_message_title, ml4t_palette, zero_line
+from utils.paths import get_case_study_dir, registry_readonly_uri
+from utils.style import COLORS, FIGSIZE, add_message_title, ml4t_palette, show_with_alt, zero_line
 
 # %% tags=["parameters"]
 # Production defaults - Papermill overrides for CI testing
@@ -86,9 +88,18 @@ TRADING_DAYS_PER_YEAR = 252
 # %% [markdown]
 # ## 2. Load Registered Predictions
 #
-# We load the best-IC GBM validation prediction set for each case study from
-# its registry. During publication verification, `ML4T_OUTPUT_DIR` points to the
+# For each case study, the GBM validation prediction set with the highest recorded IC is loaded
+# from its registry. During publication verification, `ML4T_OUTPUT_DIR` points to the
 # immutable teaching-registry overlay; readers can omit it to use their local run logs.
+
+# %% [markdown]
+# Both panels name their entity column `symbol`. That is a property of the prediction artifact
+# rather than of the case study: CME futures call the entity `product` in their labels and
+# features, and the training step writes the same product roots (`ES`, `CL`, `6E`, and so on)
+# under `symbol` when it records a prediction set.
+#
+# Selection is on the validation IC recorded in the registry, so everything measured below is
+# conditioned on that selection and is not a holdout estimate.
 
 # %%
 REGISTRY_ROOTS = {
@@ -96,28 +107,22 @@ REGISTRY_ROOTS = {
     "cme_futures": get_case_study_dir("cme_futures", create=False) / "run_log",
 }
 
-# Prediction panels carry one entity column, `symbol`, in every case study. That
-# is a property of the prediction artifact, not of the case study: CME futures
-# name their entity `product` in labels and features, and the training step
-# writes the same product roots (`ES`, `CL`, `6E`, ...) under `symbol` when it
-# records a prediction set. Selection is explicitly on the validation IC recorded
-# in the registry, so the results below are selection-conditioned validation
-# evidence, not a final holdout estimate.
 BEST_GBM = {
     "etfs": {"label": "fwd_ret_21d", "id_col": "symbol"},
     "cme_futures": {"label": "fwd_ret_5d", "id_col": "symbol"},
 }
 
 # %% [markdown]
-# Registry reads are opened in SQLite read-only, immutable mode. The query excludes
-# prediction sets with a degenerate fold before ranking by the daily-pooled IC.
+# Registry reads are opened read-only, which is what stops this notebook writing to a
+# registry the case studies own. The query excludes prediction sets with a degenerate
+# fold before ranking by the daily-pooled IC.
 
 
 # %%
 def resolve_best_prediction(case_study: str, label: str) -> dict[str, str | float]:
     """Resolve the top validation GBM prediction set without writing to the registry."""
     registry = REGISTRY_ROOTS[case_study] / "registry.db"
-    connection = sqlite3.connect(f"file:{registry}?mode=ro&immutable=1", uri=True)
+    connection = sqlite3.connect(registry_readonly_uri(registry), uri=True)
     try:
         metric_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(prediction_metrics)")
@@ -358,11 +363,13 @@ ax.set_ylabel("Cumulative share of entity-fold widths")
 ax.legend(title="Validation panel")
 add_message_title(
     ax,
-    "CME residual widths vary more around their median",
+    "Conformal widths relative to each panel's own median",
     subtitle="Finite-sample Mondrian widths; strictly prior, horizon-embargoed calibration",
 )
-fig.tight_layout()
-fig.show()
+show_with_alt(
+    fig,
+    "Two step curves of the cumulative share of entity-fold conformal widths against width divided by the case study's own median, on a logarithmic horizontal axis, with a dashed line at the median. The CME curve is the flatter of the two.",
+)
 
 # %% [markdown]
 # ## 5. Allocation Rules
@@ -467,9 +474,12 @@ def compute_turnover(weights_long: pl.DataFrame, id_col: str, weight_col: str) -
 
 
 # %% [markdown]
-# Sharpe and Sortino scale by the number of non-overlapping horizon periods per
-# year. Annual return comes from the realized compounded path, not by compounding
-# the arithmetic mean return.
+# The four statistics come from `ml4t.diagnostic` rather than being written out here, and each
+# is passed the number of non-overlapping horizon periods in a year instead of the daily 252:
+# the return series has one observation per rebalance, not one per session, so annualizing it as
+# if it were daily would inflate every ratio. `annual_return` compounds the realized path rather
+# than the arithmetic mean return, which is what makes it consistent with the drawdown computed
+# from the same path.
 
 
 # %%
@@ -478,7 +488,6 @@ def metric_block(
 ) -> dict[str, dict[str, float]]:
     """Compute path-consistent validation metrics for the three allocators."""
     periods_per_year = TRADING_DAYS_PER_YEAR / horizon
-    ann_sqrt = np.sqrt(periods_per_year)
 
     out: dict[str, dict[str, float]] = {}
     for name, ret_col, w_col in [
@@ -487,28 +496,14 @@ def metric_block(
         ("score_weighted", "ret_score", "w_score"),
     ]:
         r = rets[ret_col].to_numpy()
-        mu = r.mean()
-        sd = r.std(ddof=1)
-        _downside_raw = float(np.sqrt(np.mean(np.minimum(r, 0.0) ** 2)))
-        downside = _downside_raw if _downside_raw > 0 else np.nan
-        cum = np.cumprod(1.0 + r)
-        peak = np.maximum.accumulate(cum)
-        max_dd = float((cum / peak - 1.0).min())
-        annual_return = (
-            float(cum[-1] ** (periods_per_year / r.size) - 1.0)
-            if r.size > 0 and np.all(1.0 + r > 0)
-            else float("nan")
-        )
         out[name] = {
-            "sharpe": float(mu / sd * ann_sqrt) if sd > 0 else float("nan"),
-            "sortino": float(mu / downside * ann_sqrt)
-            if downside == downside and downside > 0
-            else float("nan"),
-            "max_drawdown": max_dd,
+            "sharpe": sharpe_ratio(r, periods_per_year=periods_per_year),
+            "sortino": sortino_ratio(r, periods_per_year=periods_per_year),
+            "max_drawdown": float(max_drawdown(r)),
             "win_rate": float((r > 0).mean()),
             "avg_turnover": compute_turnover(weights, id_col, w_col),
             "n_obs": int(r.shape[0]),
-            "ann_return": annual_return,
+            "ann_return": annual_return(r, periods_per_year=periods_per_year),
         }
     return out
 
@@ -519,10 +514,36 @@ def metric_block(
 # would inflate Sharpe and break drawdown accounting, one global schedule keeps
 # every `HORIZON`th trading date without restarting at fold boundaries. The
 # Sharpe is annualized by $\sqrt{252/h}$ - for ETFs with $h=21$ this is
-# $\sqrt{12}$; for CME with $h=5$ this is $\sqrt{50.4}$. The realized portfolio
+# $\sqrt{252/21}$; for CME with $h=5$ it is $\sqrt{252/5}$. The realized portfolio
 # return at each rebalance date $t$ is $\sum_i w_{i,t}\,y_{i,t}$, where $y_{i,t}$
 # is the $h$-day forward return and the cohort is held to maturity (no
 # intra-period rebalancing).
+
+# %% [markdown]
+# One table shape for both case studies, so the two sections are read the same way.
+
+
+# %%
+def allocator_table(metrics: dict[str, dict[str, float]]) -> pl.DataFrame:
+    """One row per sizing rule, carrying the four measures section 8 draws."""
+    labels = {
+        "baseline_equal_weight": "Equal weight",
+        "conformal_weighted": "Conformal weighted",
+        "score_weighted": "Score weighted",
+    }
+    return pl.DataFrame(
+        [
+            {
+                "sizing rule": label,
+                "annualized Sharpe": metrics[key]["sharpe"],
+                "annualized return": metrics[key]["ann_return"],
+                "maximum drawdown": metrics[key]["max_drawdown"],
+                "mean one-way turnover": metrics[key]["avg_turnover"],
+            }
+            for key, label in labels.items()
+        ]
+    )
+
 
 # %% [markdown]
 # ## 6. ETFs (`fwd_ret_21d`)
@@ -540,16 +561,7 @@ etf_metrics = metric_block(etf_rets, etf_weights, "symbol", HORIZON_ETF)
 print(f"ETFs: {etf_rets.height} non-overlapping validation rebalances")
 
 # %%
-for label, key in [
-    ("Equal Weight", "baseline_equal_weight"),
-    ("Conformal Weighted", "conformal_weighted"),
-    ("Score Weighted", "score_weighted"),
-]:
-    m = etf_metrics[key]
-    print(
-        f"{label}: Sharpe {m['sharpe']:.3f}, annual return {m['ann_return']:.1%}, "
-        f"max drawdown {m['max_drawdown']:.1%}, one-way turnover {m['avg_turnover']:.3f}"
-    )
+allocator_table(etf_metrics)
 
 # %% [markdown]
 # ## 7. CME Futures (`fwd_ret_5d`)
@@ -567,16 +579,7 @@ cme_metrics = metric_block(cme_rets, cme_weights, "symbol", HORIZON_CME)
 print(f"CME futures: {cme_rets.height} non-overlapping validation rebalances")
 
 # %%
-for label, key in [
-    ("Equal Weight", "baseline_equal_weight"),
-    ("Conformal Weighted", "conformal_weighted"),
-    ("Score Weighted", "score_weighted"),
-]:
-    m = cme_metrics[key]
-    print(
-        f"{label}: Sharpe {m['sharpe']:.3f}, annual return {m['ann_return']:.1%}, "
-        f"max drawdown {m['max_drawdown']:.1%}, one-way turnover {m['avg_turnover']:.3f}"
-    )
+allocator_table(cme_metrics)
 
 # %% [markdown]
 # ## 8. Allocation Trade-offs on Validation
@@ -617,10 +620,26 @@ for panel_index, (ax, (metric, label)) in enumerate(zip(axes.flat, metric_specs,
     if metric in {"ann_return", "max_drawdown"}:
         ax.yaxis.set_major_formatter(lambda value, _: f"{value:.0%}")
 
-fig.suptitle("Conformal sizing leads validation Sharpe in both panels")
-fig.legend(legend_handles, method_labels, loc="lower center", ncol=3)
-fig.tight_layout(rect=(0, 0.06, 1, 0.96))
-fig.show()
+fig.suptitle("Four measures of the same three sizing rules, on two panels")
+fig.legend(legend_handles, method_labels, loc="outside lower center", ncol=3)
+show_with_alt(
+    fig,
+    "Four panels comparing equal-weight, conformal and score-weighted sizing on the ETF and CME panels: annualized Sharpe, annualized return, maximum drawdown and mean one-way turnover, three grouped bars per case study in each panel.",
+)
+
+# %% [markdown] tags=["results"]
+# ### What this run produced
+#
+# Two panels, three sizing rules, four measures each - tabulated in sections 6 and 7 and drawn
+# together in the four-panel figure. The three rules share one selection at every rebalance, so
+# any difference between them comes from the weights alone.
+#
+# Read the Sharpe panel against the turnover panel rather than on its own. A sizing rule that
+# improves Sharpe while turning over more has not been shown to be worth using: this comparison
+# is gross of the cost of that turnover, and Chapter 18 measures what it would take out. The two
+# case studies also differ in how strong the underlying signal is, which section 3 reports as a
+# HAC t-statistic on the mean IC - a sizing rule applied to a signal that does not rank returns
+# is rescaling noise, whatever its Sharpe ratio comes out at.
 
 # %% [markdown]
 # ## Key Takeaways
@@ -631,22 +650,24 @@ fig.show()
 #    labels are available before the next fold; the uncalibrated first fold is
 #    excluded rather than filled from the future.
 #
-# 2. **Conformal sizing leads equal weight on this selected validation panel.**
-#    Sharpe rises from 0.538 to 0.586 for ETFs and from 0.481 to 0.580 for CME
-#    futures. Maximum drawdown also improves by about three percentage points in
-#    each panel, although one-way turnover increases.
+# 2. **Inverse-width sizing is a bet on the residual dispersion being stable.** It puts more
+#    capital where the model's past residuals were narrow. That helps only if an entity whose
+#    residuals were narrow in the calibration window stays that way in the evaluation window;
+#    nothing in conformal prediction guarantees it, and the printed comparison is what says
+#    whether it held here.
 #
-# 3. **Width dispersion is necessary but not sufficient.** CME residual widths
-#    are more dispersed relative to their median, yet that variation does not
-#    translate into higher validation Sharpe. Uncertainty changes position size;
-#    it cannot manufacture predictive direction.
+# 3. **Width dispersion is necessary but not sufficient.** Inverse-width weights depart from
+#    equal weight only in proportion to how much the widths differ across entities, so a panel
+#    with tight dispersion cannot produce a materially different portfolio. Dispersion is what
+#    makes the rule able to act; it is not what makes the action pay. Uncertainty changes
+#    position size and cannot manufacture predictive direction.
 #
 # 4. **Treat these results as validation diagnostics.** The GBM was selected by
-#    validation IC from the same registry panel. A sealed holdout is required
-#    before interpreting any allocator ranking as final out-of-sample evidence.
+#    validation IC from the same registry panel. A holdout that no selection step has seen is
+#    required before any allocator ranking counts as out-of-sample evidence.
 #
-# **Next**: see [`09_allocator_comparison`](09_allocator_comparison.ipynb) for a
-# full controlled allocator comparison on the ETF universe.
+# **Next**: [`08_library_comparison`](08_library_comparison.ipynb) puts four allocation
+# libraries on the same problem and compares what each one produces.
 #
 # **Book**: Section 17.4 lists conformal-weighted allocation alongside the
 # inverse-volatility, score-weighted, and equal-weight baselines.

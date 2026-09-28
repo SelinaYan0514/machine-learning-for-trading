@@ -67,6 +67,8 @@ overrides.yaml schema (per-notebook, all optional):
 """
 
 import ast
+import functools
+import importlib.util
 import json
 import os
 import re
@@ -82,6 +84,48 @@ import yaml
 
 REPO_ROOT = Path(__file__).parent.parent
 OVERRIDES_PATH = REPO_ROOT / "tests" / "overrides.yaml"
+
+# Every key an entry in that file may carry, each with a reader named beside it. The file
+# is plain YAML, so a key nothing reads is accepted in silence: `env:` was, and it reached
+# nothing, because `test_chapter_notebook` calls `run_notebook` without `extra_env`. A
+# reduction that arrives nowhere does not present as a broken reduction, it presents as an
+# expensive notebook - `12_gradient_boosting/08_shap_analysis` declared `MAX_SYMBOLS: 10`
+# against a 300 s per-cell timeout and trained on the full universe, and the cost read as
+# the notebook being slow.
+#
+# Adding a key here is the act of saying what reads it. `tests/test_overrides_schema.py`
+# fails on any key in the file that is not listed, and separately on any entry whose
+# parameter names do not reach papermill, which catches a new key of this shape without
+# waiting for this list to be updated.
+KNOWN_OVERRIDE_KEYS = frozenset(
+    {
+        "docker_env",  # pm_helpers.check_kernel_routing
+        "gpu",  # pm_helpers.gpu_skip_reason
+        "invocations",  # pm_helpers.invocations_for
+        "kernel_launcher",  # pm_helpers.check_kernel_routing
+        "kernel_python",  # pm_helpers.check_kernel_routing
+        "long_running",  # tests/conftest.py, marker application
+        "parameters",  # pm_helpers.sole_invocation -> papermill
+        "record_mode",  # pm_helpers.get_record_mode
+        "requires_env",  # pm_helpers.missing_required_env
+        "requires_import",  # tests/test_chapter_notebooks.py
+        "requires_stage",  # tests/test_case_studies.py
+        "research_preview",  # pm_helpers.injected_parameters
+        "reruns",  # pm_helpers.get_reruns
+        "skip",  # tests/test_chapter_notebooks.py
+        "skip_blocker",  # tests/skip_blockers.py
+        "skip_reason",  # tests/test_chapter_notebooks.py
+        "tier",  # pm_helpers.get_tier
+        "timeout",  # tests/test_chapter_notebooks.py -> run_notebook
+        # Free VRAM in whole GB a canonical run of this notebook needs before it may
+        # start. Read by the launcher outside this repo (agents/scripts/nb-run.sh,
+        # `needs_vram`), which is why no test here consumes it: the key is declared
+        # beside the notebook because the measurement belongs to the notebook, and a
+        # scheduling gate that lived in the runner alone had to guess from the model
+        # name. Nothing in CI reads it - CI has no card.
+        "vram_gb",  # agents/scripts/nb-run.sh needs_vram
+    }
+)
 
 STAGE_RE = re.compile(r"^(\d{2})([a-z]?)_")
 
@@ -176,6 +220,117 @@ def missing_required_env(overrides: dict) -> list[str]:
         return []
     names = [declared] if isinstance(declared, str) else list(declared)
     return [name for name in names if not (os.environ.get(name) or "").strip()]
+
+
+GPU_CAPABILITIES = ("torch", "lightgbm_cuda")
+
+
+# The message LightGBM raises when the build itself lacks CUDA, as opposed to when a build that
+# has it cannot get the card right now. Only the first is a property of the installation, and
+# only the first is a reason to skip: a busy 3090 is a reason to wait or to fail loudly, never to
+# report a notebook as needing hardware it has.
+_NO_CUDA_BUILD = "was not enabled in this build"
+
+
+@functools.lru_cache(maxsize=1)
+def _cuda_lightgbm_probe() -> str | None:
+    """None if a CUDA LightGBM fit works here, else why it did not.
+
+    Asked by fitting one stump rather than by reading a version or a build flag, because
+    LightGBM exposes no build-configuration attribute and the failure it produces is a
+    runtime `LightGBMError` out of `fit()`. Costs about 9ms on twenty rows, and is cached
+    so a session pays it once however many notebooks declare the capability.
+
+    The C library writes its `[LightGBM] [Fatal]` line straight to file descriptor 2, which
+    no Python-level redirect reaches, so the descriptor itself is pointed at the null device
+    for the duration of the probe. Descriptor 2 by number, not `sys.stderr.fileno()`: under
+    pytest's `--capture=sys` that attribute raises `UnsupportedOperation`, and under the
+    default fd capture it names the capture file rather than the stream the C library writes
+    to. A failure here is the answer, not an error to report.
+    """
+    try:
+        import lightgbm as lgb
+        import numpy as np
+    except ImportError:
+        return "lightgbm is not installed"
+    try:
+        saved = os.dup(2)
+    except OSError:  # no descriptor 2 to borrow; the noise is not worth failing over
+        saved = None
+    try:
+        with open(os.devnull, "w") as devnull:
+            if saved is not None:
+                os.dup2(devnull.fileno(), 2)
+            try:
+                lgb.train(
+                    {
+                        "objective": "binary",
+                        "device_type": "cuda",
+                        "verbose": -1,
+                        "num_leaves": 2,
+                        "min_data_in_leaf": 1,
+                    },
+                    lgb.Dataset(np.zeros((20, 2)), label=np.arange(20) % 2),
+                    num_boost_round=1,
+                )
+            except Exception as exc:  # noqa: BLE001 - the message is the answer
+                if _NO_CUDA_BUILD in str(exc):
+                    return "the installed LightGBM has no CUDA build"
+                return f"the CUDA LightGBM probe failed for another reason: {exc}"
+    finally:
+        if saved is not None:
+            os.dup2(saved, 2)
+            os.close(saved)
+    return None
+
+
+def gpu_skip_reason(overrides: dict) -> str | None:
+    """Why this notebook cannot run on this machine, or None if it can.
+
+    `gpu:` names the capability the notebook needs, not the fact that it wants a card.
+    The two in use are different things and are checked differently:
+
+    - ``torch`` - a CUDA device torch can see, which is what a `.to("cuda")` model needs.
+    - ``lightgbm_cuda`` - a LightGBM built with ``-DUSE_CUDA=1``, which is what
+      ``device_type="cuda"`` needs. The PyPI wheel this repo's lockfile resolves is not
+      one, so on a machine with an NVIDIA card and this repo's own environment, torch
+      reports CUDA and LightGBM still raises "CUDA Tree Learner was not enabled in this
+      build" from `fit()`. Checking torch for a LightGBM notebook let those four Ch19
+      notebooks run and fail rather than skip - ml4t/agent-workspace#862.
+
+    ``gpu: true`` is read as ``torch``, which is what it has always meant. A notebook needing
+    both writes a list - ``19_risk_management/07_drift_detection`` fits a LightGBM at
+    ``device_type="cuda"`` and separately reads ``torch.cuda.get_device_name`` - and it runs
+    only where every capability it names is present.
+    """
+    declared = overrides.get("gpu")
+    if not declared:
+        return None
+    if declared is True:
+        names = ["torch"]
+    elif isinstance(declared, str):
+        names = [declared]
+    else:
+        names = [str(name) for name in declared]
+    unknown = [name for name in names if name not in GPU_CAPABILITIES]
+    if unknown:
+        raise ValueError(
+            f"Invalid gpu={declared!r} - {', '.join(unknown)} is not one of "
+            f"{', '.join(GPU_CAPABILITIES)} (or true, which means torch)"
+        )
+    for name in names:
+        if name == "torch":
+            try:
+                import torch
+            except ImportError:
+                return "declares gpu: torch, and torch is not installed"
+            if not torch.cuda.is_available():
+                return "declares gpu: torch, and torch reports no CUDA device"
+        else:
+            failure = _cuda_lightgbm_probe()
+            if failure is not None:
+                return f"declares gpu: lightgbm_cuda, and {failure}"
+    return None
 
 
 def get_reruns(overrides: dict) -> int:
@@ -622,7 +777,31 @@ def _papermill_visible(py_path: Path) -> set[str] | None:
         return None
 
 
-def unusable_parameters(py_path: Path, names: Iterable[str]) -> dict[str, str]:
+def parameters_cell_names(py_path: Path) -> set[str]:
+    """Every name a notebook's `parameters`-tagged cells bind at module level.
+
+    A notebook may carry more than one such cell - `15_model_analysis` has three - so this unions
+    them. `unusable_parameters` reads only the last, because papermill injects after the last and
+    that is the span its overwrite analysis is about; a caller asking what the notebook declares
+    wants all of them.
+    """
+    source = py_path.read_text()
+    tree = ast.parse(source, filename=str(py_path))
+    spans = [
+        (lo, hi)
+        for header, lo, hi in _percent_cell_bounds(source)
+        if PARAMETERS_CELL_MARKER in header
+    ]
+    return {
+        name
+        for name, line in _top_level_bindings(tree)
+        if any(lo <= line <= hi for lo, hi in spans)
+    }
+
+
+def unusable_parameters(
+    py_path: Path, names: Iterable[str], *, research_preview: bool = True
+) -> dict[str, str]:
     """Map each declared parameter name that cannot reach the notebook to why.
 
     An empty dict means every name is injectable. Everything turns on where
@@ -655,6 +834,13 @@ def unusable_parameters(py_path: Path, names: Iterable[str]) -> dict[str, str]:
     Args:
         py_path: the notebook's `.py` source
         names: the parameter names `overrides.yaml` declares for it
+        research_preview: which of the two callers this entry is being judged for.
+            `injected_parameters` folds the translated names into PREVIEW_REDUCTIONS
+            only under the preview tier; on the canonical path it passes them through
+            by name, so a notebook that declares the mapping and not the names does
+            not receive them. Defaulting to True keeps the smoke path's answer, and
+            the fixture generator's path is the one that has to be asked for
+            explicitly - see `test_every_declared_parameter_reaches_both_callers`.
 
     Returns:
         {name: reason} for the names that cannot take effect.
@@ -698,8 +884,17 @@ def unusable_parameters(py_path: Path, names: Iterable[str]) -> dict[str, str]:
         if tagged
         else set()
     )
+    # The translation is a property of the caller, not of the notebook. `injected_parameters`
+    # applies `_collect_preview_reductions` only under `research_preview=True`; on the canonical
+    # path it strips the `PREVIEW_`-prefixed names and passes everything else through by name.
+    # Exempting these unconditionally is what let `us_equities_panel` 06 and 07 declare
+    # MAX_FOLDS and MAX_SYMBOLS that `tests/generate_intermediates.py` - which passes
+    # `research_preview=False` - could never inject: papermill logged "Passed unknown parameter"
+    # for both and the fixture ran unreduced.
     translated = (
-        set(PREVIEW_TRANSLATED_PARAMETERS) if TRANSLATION_TARGET in cell_declares else set()
+        set(PREVIEW_TRANSLATED_PARAMETERS)
+        if research_preview and TRANSLATION_TARGET in cell_declares
+        else set()
     )
 
     events: list[tuple[str, str, int]] = []
@@ -906,9 +1101,19 @@ def check_kernel_routing(overrides: dict) -> KernelRouting:
     )
 
     if not (Path(kernel_python).is_file() and os.access(kernel_python, os.X_OK)):
+        # Which filesystem was looked at decides who is at fault, and the two read alike
+        # otherwise: run this file from the host venv and a correct image is reported as
+        # needing a rebuild. /.dockerenv is written by the runtime, not by our images.
+        where = (
+            f"inside this container. {rebuild}"
+            if Path("/.dockerenv").exists()
+            else "on this host. That path lives inside the "
+            f"{image or 'notebook'} image, where this test is meant to execute, so nothing "
+            "here says the image is stale. Run it through the docker job instead."
+        )
         return KernelRouting(
             f"overrides.yaml routes this notebook to {kernel_python}, "
-            f"which is not an executable file here. {rebuild}"
+            f"which is not an executable file {where}"
         )
 
     launcher_path = REPO_ROOT / launcher if launcher else None
@@ -1047,11 +1252,42 @@ def resolved_registry_path(
 
 # The override names `_collect_preview_reductions` folds into PREVIEW_REDUCTIONS, mapped to the
 # reduction key each becomes. `unusable_parameters` reads the same table, so a name that reaches a
-# notebook by translation is not reported unreachable for not appearing in its source. Two places
-# stating this list separately is what let one of them go stale: measured on
-# agent/us-equities-panel-notebooks, `06_linear` and `07_gbm` declare PREVIEW_REDUCTIONS and were
-# reported unreachable on MAX_FOLDS and MAX_SYMBOLS, which do reach them.
+# notebook by translation is not reported unreachable for not appearing in its source.
+#
+# It reaches it **on the preview path only**. `injected_parameters` calls the fold under
+# `research_preview=True` and passes the names through untranslated otherwise, and
+# `tests/generate_intermediates.py:315` is the caller that passes False. An earlier version of
+# this note recorded that `06_linear` and `07_gbm` "do reach them", which was true of the smoke
+# path and false of the fixture path; both notebooks ran unreduced on 2026-09-06 with papermill
+# logging "Passed unknown parameter" for each, and `us_equities_panel/06_linear` then failed on
+# fold 0, whose 223-session training window is shorter than the 756-session burn-in
+# `model_based.regime` declares. So `unusable_parameters` takes the path as an argument.
 TRANSLATION_TARGET = "PREVIEW_REDUCTIONS"
+
+# The device override, and the population name that exists only to carry it. Neither takes the
+# `PREVIEW_` prefix, because a preview run reads them as the ordinary parameters they are.
+#
+# They are stripped together and only as a pair, keyed on `DEVICE`. A CPU fit of a population
+# declared on CUDA is a different computation - the device is inside the training identity - so
+# the notebooks refuse to publish the canonical population from one, and the entry answers that
+# by naming a population of its own. The name is downstream of the device override: drop the
+# device and the reason for the name goes with it.
+#
+# Keying on `DEVICE` is what keeps this off the entries that mean a population name canonically.
+# `fx_pairs` 13-16 declare `research_preview: false` and need `fx_pairs:preflight` on the run
+# `tests/test_case_studies.py` performs, and `us_equities_panel` 06 and 07 name one without a
+# device. None of those declares `DEVICE`, and no entry declares `DEVICE` beside
+# `research_preview: false` - `test_no_entry_pairs_a_device_with_a_canonical_ci_run` fails if one
+# ever does, because the strip would then reach a canonical run that CI performs rather than only
+# the fixture generator.
+#
+# Leaving the pair in does not fail loudly, which is why it is worth stripping. A canonical run
+# carrying both publishes a real population under the preview name and reports success:
+# `cme_futures/research_workflow.py` resolves `MODEL_POPULATION_NAMES` with
+# `OfficialPopulation.one`, which raises on a name nothing wrote, so
+# `generate_intermediates.py --through-stage 12 --no-skip-dl` would build a fixture whose own
+# `12_model_analysis` cannot read it.
+DEVICE_SCOPED_NAMES = ("DEVICE", "POPULATION_NAME")
 
 # The third element is every reduction name that states the same quantity. A translated default
 # is dropped when the notebook's own mapping already carries one of them, because two consumers
@@ -1091,6 +1327,93 @@ def _collect_preview_reductions(parameters: dict) -> dict:
     return resolved
 
 
+def _is_canonical_tier_test(node: ast.expr) -> bool:
+    """Is this the `EXECUTION_TIER == "canonical"` comparison itself?"""
+    return (
+        isinstance(node, ast.Compare)
+        and isinstance(node.left, ast.Name)
+        and node.left.id == "EXECUTION_TIER"
+        and len(node.ops) == 1
+        and isinstance(node.ops[0], ast.Eq)
+        and isinstance(node.comparators[0], ast.Constant)
+        and node.comparators[0].value == "canonical"
+    )
+
+
+def _refused_by_guard(test: ast.expr) -> frozenset[str]:
+    """Names a guard refuses, or nothing if the guard is a requirement rather than a refusal.
+
+    A refusal reads `if A or B or C: raise` - every operand a bare name, so the guard fires when
+    any of them is truthy, which is to say when the caller supplied one. A requirement reads
+    `if not X or len(X) != len(set(X)): raise`, and fires when the caller did NOT supply one.
+    They sit side by side in the same canonical branch (`16_backtest.py` has both), and reading
+    the second as a refusal would strip `PREDICTION_SET_NAMES` - a parameter the canonical run
+    needs. Any `not`, comparison or call in an operand marks the guard as the second kind.
+    """
+    operands = (
+        test.values if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.Or) else [test]
+    )
+    names: set[str] = set()
+    for operand in operands:
+        if not isinstance(operand, ast.Name):
+            return frozenset()
+        names.add(operand.id)
+    return frozenset(names)
+
+
+def canonically_refused_parameters(py_path: Path) -> frozenset[str]:
+    """Parameters this notebook's own canonical branch raises on, read from its source.
+
+    Preview-only-ness is a property of the notebook, not of the name. The `PREVIEW_` prefix
+    covers most of it by convention, but `MAX_SYMBOLS` carries no prefix and is a preview-only
+    reduction for `us_equities_panel` 16 through 19 while being a legitimate canonical parameter
+    elsewhere - so it can be neither stripped globally nor left in. The notebook already answers
+    the question in the only place that can: `if EXECUTION_TIER == "canonical": if ... raise`.
+    This reads that answer instead of restating it in a list here, which is the same reason the
+    prefix replaced the fourteen-name list it grew out of.
+
+    Both guard shapes in the fleet are handled - the nested `if EXECUTION_TIER == "canonical":`
+    with the refusal inside it, and the flattened `if EXECUTION_TIER == "canonical" and (...)`.
+    The result is intersected with what the parameters cell declares, so a local aggregate like
+    `preview_filters` drops out; the `PREVIEW_`-prefixed names behind it are stripped by prefix
+    anyway, and the aggregate is not a parameter anyone can pass.
+    """
+    source = py_path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(py_path))
+    cells = _percent_cell_bounds(source)
+    tagged = [cell for cell in cells if PARAMETERS_CELL_MARKER in cell[0]]
+    if not tagged:
+        return frozenset()
+    declared = {
+        name for name, line in _top_level_bindings(tree) if tagged[-1][1] <= line <= tagged[-1][2]
+    }
+
+    refused: set[str] = set()
+
+    def walk(node: ast.AST, in_canonical: bool) -> None:
+        if isinstance(node, ast.If):
+            here, inner = in_canonical, node.test
+            if isinstance(node.test, ast.BoolOp) and isinstance(node.test.op, ast.And):
+                rest = [v for v in node.test.values if not _is_canonical_tier_test(v)]
+                if len(rest) < len(node.test.values):
+                    here = True
+                inner = rest[0] if len(rest) == 1 else None
+            elif _is_canonical_tier_test(node.test):
+                here, inner = True, None
+            if here and inner is not None and any(isinstance(s, ast.Raise) for s in node.body):
+                refused.update(_refused_by_guard(inner))
+            for statement in node.body:
+                walk(statement, here)
+            for statement in node.orelse:
+                walk(statement, in_canonical)
+            return
+        for child in ast.iter_child_nodes(node):
+            walk(child, in_canonical)
+
+    walk(tree, False)
+    return frozenset(refused & declared)
+
+
 def injected_parameters(
     py_path: Path,
     parameters: dict | None,
@@ -1122,22 +1445,33 @@ def injected_parameters(
     ``generate_intermediates.py``'s default ``--through-stage 8``. A higher stage bound, or
     the same guard added to an earlier notebook, reaches it.
 
-    **The prefix narrows the gap; it does not close it.** Preview-only-ness is a property of
-    the notebook, not of the name. ``MAX_SYMBOLS`` carries no prefix and is a preview-only
-    reduction for ``us_equities_panel`` 16 through 19, whose canonical branch refuses it
-    (``16_backtest.py:99``) while ``tests/overrides.yaml`` declares it for all four - so a
-    canonical run of those still fails on its first cell. It cannot be added to the strip
-    either: elsewhere it is a legitimate canonical parameter, which
-    ``test_injected_parameters_keeps_everything_else_on_a_canonical_run`` pins. Deciding this
-    properly means reading which names a notebook's own canonical branch refuses, or marking
-    the entry in the override file; both are design changes that belong with whoever owns the
-    preview contract. What is here covers every ``PREVIEW_``-prefixed name and nothing else.
+    **The prefix narrows the gap and the notebook closes it.** Preview-only-ness is a property
+    of the notebook, not of the name. ``MAX_SYMBOLS`` carries no prefix and is a preview-only
+    reduction for ``us_equities_panel`` 16 through 19, whose canonical branch refuses it, while
+    being a legitimate canonical parameter for 57 other entries - which
+    ``test_injected_parameters_keeps_everything_else_on_a_canonical_run`` pins. So it can be
+    neither stripped by name nor left in, and no list here can decide it. Only the notebook can,
+    and it already does: ``canonically_refused_parameters`` reads the refusal out of the
+    notebook's own ``EXECUTION_TIER == "canonical"`` guard. Naming the four here instead would
+    have gone stale the same way the fourteen ``PREVIEW_`` names did.
+
+    What is here covers every ``PREVIEW_``-prefixed name, whatever the notebook's own guard
+    refuses, and ``DEVICE_SCOPED_NAMES`` - the last only for an entry that declares ``DEVICE``,
+    which is what confines them to the entries where the population name exists to carry the
+    device. The device pair stays separate rather than folding into the guard read: no notebook
+    refuses ``DEVICE`` or ``POPULATION_NAME``, because a canonical run of a CPU-fitted population
+    is wrong for a reason the notebook expresses by refusing to publish, not by raising.
     """
     if research_preview:
         return research_preview_parameters(py_path, parameters, output_dir)
     resolved = dict(parameters or {})
     for name in [key for key in resolved if key.startswith("PREVIEW_")]:
         resolved.pop(name)
+    for name in canonically_refused_parameters(py_path):
+        resolved.pop(name, None)
+    if "DEVICE" in resolved:
+        for name in DEVICE_SCOPED_NAMES:
+            resolved.pop(name, None)
     # Declining the preview tier must NOT decline the isolated workspace. They are two
     # decisions and this flag used to collapse them: false left WORKSPACE at the
     # notebook's declared "", `open_study` took the `workspace=None` branch
@@ -1155,6 +1489,33 @@ def injected_parameters(
     if output_dir is not None and _declares_tier_and_workspace(py_path):
         resolved["WORKSPACE"] = str(output_dir.resolve())
     return resolved or None
+
+
+def _progress_log_path(py_path: Path) -> Path:
+    """Where this run writes its cell-level progress.
+
+    Keyed on the notebook's path relative to the repo root, plus the pid. The stem
+    alone is not unique: `04_model_based_features`, `12_backtest` and `05_evaluation`
+    are shared by all nine case studies and by chapter notebooks, and the file is
+    opened with mode "w" - so one pane truncated another's. Observed on 2026-08-05
+    while `cs-sp500_options` was executing its own `04_model_based_features`: the log
+    held `params={'GARCH_MIN_OBS': 50, 'MAX_SYMBOLS': 5, ...}`, which is the etfs
+    entry from `tests/overrides.yaml`, written by a different pane.
+
+    That matters because `work/2026-08-05-ci-green/PROTOCOL.md` names this file as the
+    way to see which cell a hanging notebook is on, "which is faster than waiting for
+    the traceback". Reporting another job's notebook is worse than reporting nothing:
+    it is wrong and plausible at the same time.
+
+    The pid separates two panes running the same notebook, which the path alone does
+    not. `ML4T_OUTPUT_DIR` would separate them too, but it is not always set and the
+    pid always is.
+    """
+    try:
+        slug = py_path.resolve().relative_to(REPO_ROOT).with_suffix("").as_posix()
+    except ValueError:
+        slug = py_path.stem
+    return Path(f"/tmp/ml4t-pm-{slug.replace('/', '_')}.{os.getpid()}.log")
 
 
 def run_notebook(
@@ -1237,7 +1598,12 @@ def run_notebook(
     env_vars = {
         "MPLBACKEND": "Agg",
         "PLOTLY_RENDERER": "json",
-        "DISABLE_HPO": "1",
+        # Which notebook is running. Nothing papermill injects reaches the kernel, so a study
+        # opened without an explicit `entry_point` had no way to name the notebook that opened
+        # it and every training run it registered wrote the column NULL. The launcher is the
+        # one party that knows, so it says so; `research/workspace._resolve_entry_point` reads
+        # it and an explicit argument still wins.
+        "ML4T_ENTRY_POINT": nb_name,
         **KERNEL_THREAD_CAPS,
     }
     if output_dir:
@@ -1258,16 +1624,19 @@ def run_notebook(
     # Ensure torch's bundled CUDA libraries are found before system ones.
     # The system libcudart.so.12 may be outdated and missing symbols like
     # cudaGetDriverEntryPointByVersion that torch's bundled version provides.
+    # Located with find_spec rather than by importing torch: this process only needs
+    # the paths, and executing the package to read them costs 502 MB resident in every
+    # worker (#558). The resulting string is identical.
     try:
-        import torch
-
-        torch_lib = str(Path(torch.__file__).parent / "lib")
-        nvidia_libs = list((Path(torch.__file__).parent.parent / "nvidia").glob("*/lib"))
-        cuda_paths = [torch_lib] + [str(p) for p in nvidia_libs]
+        torch_spec = importlib.util.find_spec("torch")
+    except (ImportError, ValueError):
+        torch_spec = None
+    if torch_spec is not None and torch_spec.origin:
+        torch_root = Path(torch_spec.origin).parent
+        nvidia_libs = list((torch_root.parent / "nvidia").glob("*/lib"))
+        cuda_paths = [str(torch_root / "lib")] + [str(p) for p in nvidia_libs]
         existing_ld = os.environ.get("LD_LIBRARY_PATH", "")
         env_vars["LD_LIBRARY_PATH"] = ":".join(cuda_paths + [existing_ld])
-    except ImportError:
-        pass
 
     # A notebook whose dependencies live in a separate venv runs on its own
     # kernelspec, written to a temp JUPYTER_PATH so nothing global is touched.
@@ -1290,10 +1659,10 @@ def run_notebook(
     for key in remove_vars:
         saved_env[key] = os.environ.pop(key, None)
 
-    # Cell-level progress — always log to /tmp/ml4t-pm-{name}.log for visibility.
-    # Since request_save_on_cell_execute=True, the executed notebook is updated
-    # after each cell. Monitor it with: watch -n5 'python -c "import json; ..."'
-    progress_log = Path(f"/tmp/ml4t-pm-{nb_name}.log")
+    # Cell-level progress — always logged for visibility. Since
+    # request_save_on_cell_execute=True, the executed notebook is updated after each
+    # cell. Monitor it with: watch -n5 'python -c "import json; ..."'
+    progress_log = _progress_log_path(py_path)
     n_cells = 0
     try:
         with open(progress_log, "w") as pf:
@@ -1420,3 +1789,154 @@ def collect_chapter_notebooks(repo_root: Path, chapter_range: range) -> list[Pat
             notebooks.append(notebook)
 
     return notebooks
+
+
+# ---------------------------------------------------------------------------
+# One overrides entry, one or several parameterised runs
+# ---------------------------------------------------------------------------
+
+
+class Invocation(NamedTuple):
+    """One parameterised execution of one notebook.
+
+    ``id`` is ``None`` for an entry that declares a single unnamed run, which is
+    every entry that predates this grammar, and a short label otherwise. It ends up
+    in the pytest test id, so a failure names which run failed rather than only
+    which notebook.
+    """
+
+    id: str | None
+    parameters: dict
+
+
+def invocations_for(entry: dict, *, key: str = "<entry>") -> list[Invocation]:
+    """Every parameterised run an overrides entry asks for.
+
+    Two shapes. The common one is a single `parameters` mapping, which is one run and
+    the whole of what this file expressed before::
+
+        case_studies/etfs/06_linear:
+          parameters: {MAX_FOLDS: 2}
+
+    The other is `invocations`, a list naming several runs of one notebook::
+
+        case_studies/etfs/14_backtest:
+          invocations:
+            - id: fwd_ret_5d
+              parameters: {LABEL: fwd_ret_5d}
+            - id: fwd_ret_21d
+              parameters: {LABEL: fwd_ret_21d}
+
+    which exists because three case studies take their label as a parameter and
+    declare several - `etfs` two, `us_firm_characteristics` three,
+    `sp500_equity_option_analytics` five - while the runner could only execute a
+    notebook once. A chain that exercises one label of five asserts nothing about
+    the other four, and "every declared label carries rankable validation backtests"
+    is a condition those case studies have to meet.
+
+    **Raises rather than returning something plausible for a shape it does not
+    recognise.** The check this feeds used to filter on
+    `isinstance(entry.get("parameters"), dict)`, so an entry written in any other
+    shape was silently dropped from it - not failed, dropped - and a dropped entry is
+    indistinguishable from a passing one. Refusing loudly is the point of the
+    function existing rather than each caller reading the key itself.
+    """
+    if not isinstance(entry, dict):
+        raise TypeError(f"{key}: an overrides entry must be a mapping, got {type(entry).__name__}")
+
+    declared = entry.get("invocations")
+    parameters = entry.get("parameters")
+
+    if declared is None:
+        if parameters is None:
+            return [Invocation(None, {})]
+        if not isinstance(parameters, dict):
+            raise TypeError(
+                f"{key}: `parameters` must be a mapping of names to values, got "
+                f"{type(parameters).__name__}. Several runs of one notebook are declared "
+                f"under `invocations`, not by making this a list."
+            )
+        return [Invocation(None, parameters)]
+
+    if parameters is not None:
+        raise ValueError(
+            f"{key}: declares both `parameters` and `invocations`. Everything a run needs "
+            f"goes in its own entry under `invocations`, so that what each run was given is "
+            f"readable in one place."
+        )
+    if not isinstance(declared, list) or not declared:
+        raise TypeError(f"{key}: `invocations` must be a non-empty list, got {declared!r}")
+
+    seen: list[str] = []
+    out: list[Invocation] = []
+    for position, item in enumerate(declared):
+        where = f"{key}: invocations[{position}]"
+        if not isinstance(item, dict):
+            raise TypeError(f"{where}: must be a mapping with `id` and `parameters`")
+        unknown = set(item) - {"id", "parameters"}
+        if unknown:
+            raise ValueError(
+                f"{where}: unknown key(s) {sorted(unknown)}. An invocation carries only its "
+                f"`id` and its `parameters`; anything that applies to every run of the "
+                f"notebook - timeout, skip, requires_stage - belongs on the entry."
+            )
+        run_id = item.get("id")
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise ValueError(f"{where}: needs a non-empty string `id`; it names the run in CI")
+        if run_id in seen:
+            raise ValueError(f"{where}: duplicate id {run_id!r}; ids identify a run in a failure")
+        run_parameters = item.get("parameters")
+        if run_parameters is None:
+            run_parameters = {}
+        if not isinstance(run_parameters, dict):
+            raise TypeError(f"{where}: `parameters` must be a mapping, got {run_parameters!r}")
+        seen.append(run_id)
+        out.append(Invocation(run_id, run_parameters))
+    return out
+
+
+def sole_invocation(entry: dict, *, key: str = "<entry>") -> Invocation:
+    """The one run this entry declares, for a caller that can only execute one.
+
+    Raises when the entry declares several rather than quietly running the first,
+    which would report a notebook as exercised on a parameter set nobody chose.
+    """
+    runs = invocations_for(entry, key=key)
+    if len(runs) > 1:
+        raise ValueError(
+            f"{key}: declares {len(runs)} invocations ({', '.join(r.id or '?' for r in runs)}), "
+            f"and this caller executes a notebook once. Teach it to iterate "
+            f"`invocations_for` rather than picking one."
+        )
+    return runs[0]
+
+
+def declares_parameters(entry: dict, *, key: str = "<entry>") -> bool:
+    """Whether any run of this notebook is given parameters at all."""
+    return any(run.parameters for run in invocations_for(entry, key=key))
+
+
+def unreachable_declared_parameters(
+    overrides: dict, *, research_preview: bool
+) -> dict[str, dict[str, str]]:
+    """Every declared parameter name papermill cannot inject, over every invocation.
+
+    Keyed by `<notebook>` for a single-run entry and `<notebook>[<id>]` for one run of
+    several, so the failure names the run rather than only the notebook. Entries whose
+    shape `invocations_for` does not recognise raise out of here rather than being
+    skipped: a sweep that silently omits an entry reports the same empty dict as one
+    that checked it and found nothing wrong.
+    """
+    unreachable: dict[str, dict[str, str]] = {}
+    for key, entry in overrides.items():
+        if not isinstance(entry, dict):
+            continue
+        for run in invocations_for(entry, key=key):
+            if not run.parameters:
+                continue
+            unusable = unusable_parameters(
+                REPO_ROOT / f"{key}.py", run.parameters, research_preview=research_preview
+            )
+            if unusable:
+                unreachable[key if run.id is None else f"{key}[{run.id}]"] = unusable
+    return unreachable

@@ -61,10 +61,14 @@ import warnings
 import plotly.graph_objects as go
 import polars as pl
 
-from case_studies.research import open_study, split_unpublished_members
+from case_studies.research import open_study, reuse_disclosure, split_unpublished_members
 from case_studies.utils.backtest_explorer import BacktestExplorer
 from case_studies.utils.backtest_loaders import get_backtest_config, load_backtest_prices_for
-from case_studies.utils.backtest_presets import build_backtest_spec, strategy_view
+from case_studies.utils.backtest_presets import (
+    build_backtest_spec,
+    strategy_view,
+    traded_universe_declaration,
+)
 from case_studies.utils.backtest_runner import run_backtest
 from case_studies.utils.registry import (
     load_existing_backtest_hashes,
@@ -90,7 +94,8 @@ MAX_SYMBOLS = 0
 # None means every live prediction set; an int caps the shortlist.
 TOP_N_PREDICTIONS = None
 # Both names stay bound here although nothing below reads them: that is what makes the harness
-# force preview and supply a workspace (`tests/pm_helpers.py:954`). Without them the canonical
+# force preview and supply a workspace - `_declares_tier_and_workspace` in `tests/pm_helpers.py`
+# looks for exactly this pair. Without them the canonical
 # branch regenerates in place, which needs symlinks a CI checkout does not have.
 EXECUTION_TIER = "canonical"
 WORKSPACE: str = ""
@@ -174,6 +179,32 @@ top_preds.select("source", "sharpe")
 
 # %%
 prices = load_backtest_prices_for(CASE_STUDY_ID, LABEL, split="validation", max_symbols=MAX_SYMBOLS)
+
+# `MAX_SYMBOLS` reduces the price panel, and until the run says so in its own specification
+# that reduction did not reach `backtest_hash`: a reduced run and the full run over the same
+# predictions hashed alike, so the second was served the first's result and the reduction
+# bought nothing (ml4t/agent-workspace#911). Declaring it here, before anything is hashed,
+# gives a reduced run an identity of its own; `run_backtest` checks the panel against the
+# declaration and narrows the predictions to it, so the sweep ranks the cross-section this
+# says it ranks and `n_assets` above describes that same set. A full run declares nothing and
+# is byte-identical to before.
+# A reduced run is a preview run. Refused on the canonical tier so a narrowed result can
+# never land in the registry the book's numbers come from, and so the two can never sit in
+# one registry to be ranked against each other: `resolve_best_predictions` takes MAX(sharpe)
+# over every backtest of a prediction, and a Sharpe earned over a handful of names would
+# advance a configuration ahead of one earned over the whole panel. `us_equities_panel` 16
+# through 19 already refuse the parameter this way, and `canonically_refused_parameters`
+# reads the refusal out of the source, so the canonical fixture path drops the name rather
+# than handing the notebook something its first cell raises on.
+if EXECUTION_TIER == "canonical" and MAX_SYMBOLS:
+    raise ValueError(
+        "MAX_SYMBOLS narrows the universe this run trades, which makes it a different "
+        "portfolio from the declared one and gives it its own backtest identity "
+        "(ml4t/agent-workspace#911). A canonical run trades the declared universe: set "
+        "MAX_SYMBOLS=0, or run under EXECUTION_TIER='preview' with a WORKSPACE."
+    )
+TRADED_UNIVERSE = traded_universe_declaration(prices) if MAX_SYMBOLS else None
+
 n_assets = prices["symbol"].n_unique()
 TOP_K_VALUES = get_top_k_values_for(CASE_STUDY_ID, LABEL, n_assets)
 ALLOC_CONFIGS = get_allocators(CASE_STUDY_ID)
@@ -230,6 +261,7 @@ for top_k in TOP_K_VALUES:
                 CASE_STUDY_ID,
                 bt_config,
                 prices=prices,
+                traded_universe=TRADED_UNIVERSE,
                 prediction_hash=pred_hash,
                 initial_cash=bt_config.initial_cash,
                 chapter="ch17",
@@ -287,8 +319,7 @@ for top_k in TOP_K_VALUES:
 
 print(
     f"\nSweep complete in {(time.monotonic() - sweep_start) / 60:.1f} minutes: "
-    f"{n_done - served - len(failures)} computed, {served} served from the registry, "
-    f"{len(failures)} failed"
+    f"{reuse_disclosure(n_done - served - len(failures), served, len(failures))}"
 )
 
 # What this sweep actually advanced, which is narrower than "every live prediction". The
@@ -365,14 +396,17 @@ fig.update_layout(
     title="Mean Sharpe by weighting scheme",
     height=380,
     width=800,
-    margin=dict(t=90),
+    # The left margin is explicit because the allocator names are the y tick labels and the
+    # longest of them ran off the canvas: the rendered PNG read "ormal_weighted" and
+    # "score_weighted". Plotly sizes the default margin before it lays the labels out.
+    margin=dict(t=90, l=150),
 )
 _span = ordered["avg_sharpe"]
 show_plotly_with_alt(
     fig,
-    "Horizontal bar chart of the mean Sharpe ratio of every allocation-stage backtest, one bar per "
-    f"weighting scheme, with a dashed line at zero. Counted from the frame: {ordered.height} "
-    f"allocators, mean Sharpe from {_span.min():+.3f} to {_span.max():+.3f}.",
+    "Horizontal bar chart of mean Sharpe by weighting scheme, one bar per allocator, over the "
+    "allocation backtests for the prediction sets this sweep advanced, ordered by that mean, "
+    "with a dashed line at zero.",
 )
 
 # %% [markdown]

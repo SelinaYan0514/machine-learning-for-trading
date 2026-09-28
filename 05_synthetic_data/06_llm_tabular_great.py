@@ -18,7 +18,7 @@
 # # Chapter 5: LLM-Based Tabular Data Generation (GReaT Framework)
 #
 # **Chapter 5: Synthetic Data Generation**
-# **Section Reference**: Section 5.6 (LLMs for Structured Financial Data)
+# **Section Reference**: Section 5.7 (LLMs for structured financial data)
 #
 # **Docker image**: `ml4t-gpu`
 #
@@ -44,7 +44,7 @@
 #
 # ## Cross-References
 #
-# - **Book**: Section 5.6 discusses GReaT and LLM-based tabular generation
+# - **Book**: Section 5.7 discusses GReaT and LLM-based tabular generation
 # - **Related**: [`02_tailgan_tail_risk`](02_tailgan_tail_risk.ipynb) (GAN for time series comparison)
 #
 # ---
@@ -86,6 +86,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import polars as pl
+import transformers
 from be_great import GReaT
 from plotly.subplots import make_subplots
 from scipy import stats
@@ -95,11 +96,16 @@ from sklearn.metrics import accuracy_score, roc_auc_score
 from data import load_etfs
 from utils.paths import get_output_dir
 from utils.reproducibility import set_global_seeds
-from utils.style import COLORS, plot_fidelity_comparison
+from utils.style import COLORS, plot_fidelity_comparison, show_plotly_with_alt, show_with_alt
 
 # Suppress transformers warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning, module="transformers")
+# be_great overwrites its own checkpoint directory on every re-run, which is what we want.
+warnings.filterwarnings("ignore", category=UserWarning, module="be_great")
+# transformers routes its notices through logging rather than warnings: the pad-token
+# alignment below is expected, since GPT-2 ships without a pad token and GReaT adds one.
+transformers.logging.set_verbosity_error()
 
 # %% tags=["parameters"]
 # GReaT framework parameters (Borisov et al. 2023)
@@ -107,6 +113,8 @@ N_SAMPLES = 2000  # Training samples from ETF data
 N_GENERATE = 500  # Synthetic samples to generate
 EPOCHS = 50  # Fine-tuning epochs
 BATCH_SIZE = 16  # Training batch size
+TRAIN_FRACTION = 0.7  # Earliest share of the sample used for training; the rest is held out
+TSTR_DRAWS = 5  # Synthetic draws the TSTR spread is measured over; the fine-tune is done once
 SEED = 42
 
 # %%
@@ -171,7 +179,13 @@ def load_etf_tabular_data(
     # Create tabular features per observation
     records = []
 
-    for symbol in df["symbol"].unique().to_list():
+    # `Series.unique` defines no order, so the symbols came back in a different order in
+    # each process. That order reaches the row set: the timestamp sort below ties on every
+    # trading day, `head(n_samples)` cuts inside the last tied day, and the 70/30 split cuts
+    # inside another - so which symbols land in the test split changed between executions.
+    # Measured 2026-09-19 on one unchanged source parquet: the test split's positive rate
+    # came back 0.0467 in one process and 0.0533 in the next.
+    for symbol in sorted(df["symbol"].unique().to_list()):
         symbol_df = df.filter(pl.col("symbol") == symbol).sort(date_col)
 
         if len(symbol_df) < 30:
@@ -225,8 +239,11 @@ def load_etf_tabular_data(
 
     result_df = pd.DataFrame(records)
 
-    # Sort by date for proper temporal split (critical for financial data)
-    result_df = result_df.sort_values("timestamp").reset_index(drop=True)
+    # Sort by date for proper temporal split (critical for financial data). Tie on the
+    # symbol and sort stably: a hundred symbols share every timestamp, and pandas'
+    # default quicksort is not stable, so "sorted by timestamp" leaves the within-day
+    # order to the input and the two cuts below land wherever that order put things.
+    result_df = result_df.sort_values(["timestamp", "symbol"], kind="stable").reset_index(drop=True)
 
     # Compute extreme move target: |fwd_ret| > 90th percentile
     # This exploits volatility clustering which has real predictive signal
@@ -305,13 +322,15 @@ else:
 # %% [markdown]
 # ## 3. Generate Synthetic Data
 
+# %% [markdown]
+# Guided sampling enforces the column schema row by row. It matters most when
+# fine-tuning has been short, because the unguided sampler tends to drop columns on an
+# undertrained model - which surfaces later as unparseable rows. On a well-trained
+# checkpoint `guided_sampling=False` is faster and produces equivalent quality.
+
 # %%
 print(f"\nGenerating {CONFIG['n_generate']} synthetic samples...")
 
-# Generate synthetic data: guided sampling enforces the column schema row by
-# row and is essential when fine-tuning is short (the unguided sampler tends
-# to drop columns on undertrained models). With well-trained checkpoints,
-# guided_sampling=False is faster and produces equivalent quality.
 synthetic_df = great.sample(
     n_samples=CONFIG["n_generate"],
     max_length=500,
@@ -322,19 +341,41 @@ print(f"Generated {len(synthetic_df)} samples")
 print("\nSample synthetic rows:")
 print(synthetic_df.head())
 
-# Check for parsing errors (NaN values)
+# Check for parsing errors. A value the model wrote as prose is not null - it is a
+# string the row parser left in place - so counting nulls misses the failure this cell
+# is named for. Count how many values in each numeric column convert to a number, and
+# which schema columns the sampler did not return at all. Every section below reads
+# synthetic_df, so both counts are taken once here.
+numerical_cols = ["ret_1d", "ret_5d", "ret_20d", "volatility", "volume_ratio", "fwd_ret_5d"]
+absent_cols = [c for c in numerical_cols if c not in synthetic_df.columns]
+parsed_counts = {
+    c: int(pd.to_numeric(synthetic_df[c], errors="coerce").notna().sum())
+    for c in numerical_cols
+    if c in synthetic_df.columns
+}
+
 nan_counts = synthetic_df.isna().sum()
 if nan_counts.sum() > 0:
-    print(f"\nParsing issues (NaN counts):\n{nan_counts[nan_counts > 0]}")
+    print(f"\nNull values after parsing:\n{nan_counts[nan_counts > 0]}")
+if absent_cols:
+    print(f"\nSchema columns the sampler did not return: {absent_cols}")
+if parsed_counts:
+    print(f"\nParseable numeric values per column, of {len(synthetic_df)} generated rows:")
+    for col, count in parsed_counts.items():
+        print(f"  {col:<14} {count}")
 
 # %% [markdown]
 # **Observation**: The generated rows should contain plausible feature values -- returns
 # near zero with occasional larger moves, volatility in realistic ranges, and valid
-# categorical labels. NaN counts above zero indicate parsing failures where the LLM
-# produced text that could not be mapped back to the original schema. This is a known
-# limitation of autoregressive generation: the model can "hallucinate" tokens that
-# break column parsing, especially with short fine-tuning. Increasing epochs and using
-# larger base models (GPT-2 medium/large) reduces parsing errors significantly.
+# categorical labels. Read the per-column parse counts above as the measure of that: a
+# count below the number of generated rows means the model wrote something that does not
+# convert to a number in that column. Counting nulls alone understates it, because a cell
+# holding the words "not the case" is a string the row parser left in place, not a null.
+# This is a known limitation of autoregressive generation: the model can "hallucinate"
+# tokens that break column parsing, especially with short fine-tuning. Increasing epochs
+# and using larger base models (GPT-2 medium/large) reduces parsing errors significantly,
+# and a count of zero everywhere is what leaves the comparisons below with nothing to
+# compare.
 
 # %% [markdown]
 # ## 4. Fidelity: Visual Comparison with PCA and t-SNE
@@ -358,15 +399,30 @@ if len(synth_data) >= 50:  # Need enough samples for meaningful visualization
         title="GReaT: Real vs Synthetic Distribution",
         n_samples=min(500, len(synth_data)),
     )
-    plt.show()
+    show_with_alt(
+        fig,
+        "Two scatter panels comparing real and synthetic rows. In the PCA projection "
+        "the synthetic points concentrate to the left of centre, including a dense "
+        "knot, while the real points spread further right. In the t-SNE projection the "
+        "two sets occupy visibly different areas, synthetic toward the left and real "
+        "toward the right, overlapping only in places rather than throughout.",
+    )
 else:
     print(f"Insufficient valid synthetic samples ({len(synth_data)}) for fidelity visualization")
 
 # %% [markdown]
-# **Interpretation**: Overlapping point clouds confirm that GReaT-generated tabular
-# data occupies similar regions of feature space as real data. LLM-based generation
-# can capture complex feature dependencies via autoregressive modeling. Gaps may
-# indicate parsing errors or LLM hallucination on certain feature combinations.
+# **Interpretation**: the two clouds do not sit on top of each other. In the PCA panel
+# the synthetic rows concentrate to one side, including a dense knot, while the real
+# rows spread further across the plane; in the t-SNE panel each set occupies a different
+# part of the area, overlapping in places rather than throughout. On this budget - a
+# short fine-tune of a small backbone - GReaT is not covering the region the real rows
+# occupy.
+#
+# Read that as a statement about this run rather than about the method. The two levers
+# it does not exercise are the ones the approach depends on: backbone size and
+# fine-tuning length. What the marginal comparisons below add is *where* the coverage
+# fails, which the projections cannot say, since a projection mixes every feature
+# together.
 
 # %% [markdown]
 # ## 5. Compare Real vs Synthetic Distributions
@@ -390,7 +446,24 @@ for col in numerical_cols:
                     "synth_std": synth_vals.std(),
                 }
             )
-numerical_comparison = pd.DataFrame(numerical_rows).set_index("feature").round(3)
+if numerical_rows:
+    numerical_comparison = pd.DataFrame(numerical_rows).set_index("feature").round(3)
+else:
+    # An empty list is not a missing column. It means no numeric column survived
+    # parsing, which is a foreseeable outcome of sampling from a short fine-tune and
+    # is what the counts printed after generation describe. Setting "feature" as the
+    # index of an empty frame raises a KeyError naming the column the cell was about
+    # to write, which says nothing about the condition that produced it.
+    print(
+        f"No numerical comparison: no parseable value in any of {numerical_cols} "
+        f"across the {len(synthetic_df)} generated rows."
+    )
+    if absent_cols:
+        print(f"  Absent from the generated frame entirely: {absent_cols}")
+    print("  Raise EPOCHS or N_GENERATE - a short fine-tune emits rows the parser cannot map back.")
+    numerical_comparison = pd.DataFrame(
+        columns=["real_mean", "synth_mean", "real_std", "synth_std"]
+    ).rename_axis("feature")
 numerical_comparison
 
 # %%
@@ -409,6 +482,12 @@ for col in categorical_cols:
                 }
             )
 categorical_comparison = pd.DataFrame(categorical_rows).round(1)
+if categorical_comparison.empty:
+    # This one renders as a blank table rather than raising, and says nothing either way.
+    print(
+        f"No categorical comparison: none of {categorical_cols} is present in the "
+        f"{len(synthetic_df)} generated rows."
+    )
 categorical_comparison
 
 # %% [markdown]
@@ -468,29 +547,39 @@ for idx, (col, (row, col_num)) in enumerate(zip(plot_cols, positions, strict=Fal
 fig.update_yaxes(title_text="Probability density")
 fig.update_xaxes(title_text="Feature value")
 fig.update_layout(
-    title="Synthetic returns collapse toward zero; scale features match real data",
+    title="Real and synthetic marginal distributions by feature",
     height=500,
     showlegend=True,
     barmode="overlay",
     template="ml4t",
 )
-fig.show()
+show_plotly_with_alt(
+    fig,
+    "Six overlaid histogram panels, one per feature, each showing the real and "
+    "synthetic distributions together. In the four return panels the synthetic "
+    "distribution is a tall narrow spike at zero against a much wider real "
+    "distribution. In the volatility panel the synthetic mass peaks at a lower value "
+    "than the real one rather than on top of it, and in the volume ratio panel it is "
+    "concentrated in a single narrow spike near the left edge.",
+)
 
 # %% [markdown]
 # ## 7. TSTR Evaluation: Train Synthetic, Test Real
 #
 # The key test: Can a model trained on GReaT synthetic data predict real outcomes?
 #
-# **Task**: Extreme move classification (|fwd_ret_5d| > 90th percentile)
-# - Exploits volatility clustering which has real predictive signal (~0.78 AUC)
-# - Unlike direction prediction (~0.50 AUC), this provides meaningful comparisons
+# **Task**: extreme-move classification, whether the absolute five-day forward return
+# clears a high percentile of its own distribution. The task leans on volatility
+# clustering, which carries real predictive signal, so a classifier can do meaningfully
+# better than chance on it. Direction prediction cannot, which is why it makes a poor
+# yardstick: two models both near chance are hard to tell apart.
 
 # %% [markdown]
 # ### Prepare Features and Temporal Split
 #
-# We use a temporal split (first 70% train, last 30% test) rather than random
-# splitting. This avoids data leakage from future observations contaminating
-# the training set -- a critical requirement for financial time series.
+# We split temporally rather than at random, training on the earlier part of the sample
+# and testing on the later part (`TRAIN_FRACTION`). This avoids data leakage from future
+# observations contaminating the training set, a requirement for financial time series.
 
 # %%
 print("\n" + "=" * 70)
@@ -509,20 +598,33 @@ X_real = df[feature_cols].values
 y_real = df[target_col].values
 
 # Temporal split: avoid mixing future and past observations in train/test
-n_train = int(len(X_real) * 0.7)
+n_train = int(len(X_real) * TRAIN_FRACTION)
 X_train_real, X_test = X_real[:n_train], X_real[n_train:]
 y_train_real, y_test = y_real[:n_train], y_real[n_train:]
 
-# Synthetic data - need to handle potential parsing issues
-synth_features = synthetic_df[feature_cols].apply(pd.to_numeric, errors="coerce")
-synth_target = pd.to_numeric(synthetic_df[target_col], errors="coerce")
 
-# Drop rows with NaN and convert target to binary
-valid_mask = ~(synth_features.isna().any(axis=1) | synth_target.isna())
-X_synth = synth_features[valid_mask].values
-y_synth_raw = synth_target[valid_mask].values
-# Convert to binary: round and clip to 0/1
-y_synth = np.clip(np.round(y_synth_raw), 0, 1).astype(int)
+# Synthetic data - need to handle potential parsing issues. reindex rather than []: a
+# column the sampler did not return then arrives as all-null and reaches the guarded
+# branch below, instead of raising a missing-column error at this line.
+def synthetic_training_set(frame):
+    """The (X, y) a TSTR classifier trains on, from one raw sample of the generator.
+
+    One function because the spread below has to be measured over exactly the pipeline
+    the single draw above uses; a second copy of the parsing rules would make the two
+    incomparable without saying so.
+    """
+    synth_frame = frame.reindex(columns=[*feature_cols, target_col])
+    synth_features = synth_frame[feature_cols].apply(pd.to_numeric, errors="coerce")
+    synth_target = pd.to_numeric(synth_frame[target_col], errors="coerce")
+    # Drop rows with NaN and convert target to binary
+    valid_mask = ~(synth_features.isna().any(axis=1) | synth_target.isna())
+    return (
+        synth_features[valid_mask].values,
+        np.clip(np.round(synth_target[valid_mask].values), 0, 1).astype(int),
+    )
+
+
+X_synth, y_synth = synthetic_training_set(synthetic_df)
 
 print(f"\nReal training samples: {len(X_train_real)}")
 print(f"Synthetic training samples: {len(X_synth)}")
@@ -532,8 +634,76 @@ print(f"Test samples: {len(X_test)}")
 # ### Train and Compare Models
 #
 # We train two identical gradient boosting classifiers -- one on real data (TRTR
-# baseline) and one on synthetic data (TSTR). The TSTR accuracy ratio measures
-# how much predictive utility the synthetic data preserves.
+# baseline) and one on synthetic data (TSTR), and compare how well each ranks the
+# real test rows. The label is "extreme move", `|fwd_ret_5d|` above its 90th
+# percentile **of the full sample**, so the minority class is small but the test
+# split has its own prevalence and it is not 10% - the run below measures 5%.
+# Answering "no" for every row therefore scores `1 - base_rate` accuracy, 0.95 here,
+# while ranking nothing at all. The positive base rate is printed beside the
+# accuracies for that reason, and the verdict divides AUC, which has no
+# majority-class floor whatever the prevalence turns out to be.
+
+
+# %%
+def tstr_utility_verdict(auc_trtr: float, auc_tstr: float) -> str:
+    """Score synthetic-data utility on ranking ability rather than on accuracy.
+
+    Two accuracies on a small minority class divide to something near 1.0 most reliably
+    when the synthetic-trained model has collapsed onto the majority class, which is the
+    failure the verdict exists to catch. AUC measures the ranking the strategy would
+    actually use, and 0.5 is chance whatever the prevalence.
+
+    The refusal is at or below 0.5, not below it. A model that emits one constant
+    probability for every row scores exactly 0.5 - that is the collapse itself, not a
+    borderline case - and against a baseline barely above chance it would otherwise
+    divide to a "HIGH utility" verdict.
+    """
+    level = tstr_utility_level(auc_trtr, auc_tstr)
+    if level == "NONE":
+        return (
+            f"TSTR AUC {auc_tstr:.3f} is at or below chance: a classifier trained on the "
+            "synthetic data ranks real test rows no better than a coin flip, so the synthetic "
+            "data carries NO usable signal for model training."
+        )
+    if level == "NO BASELINE":
+        return (
+            f"TRTR AUC {auc_trtr:.3f} is at or below chance, so the real-data baseline ranks "
+            "nothing and there is no utility for the synthetic data to preserve."
+        )
+    return (
+        f"TSTR AUC ratio: {auc_tstr / auc_trtr:.1%} - GReaT synthetic data has {level} utility "
+        "for model training."
+    )
+
+
+def tstr_utility_level(auc_trtr: float, auc_tstr: float) -> str:
+    """The verdict word alone, so one draw's verdict can be compared against another's.
+
+    Split out of the sentence because the spread below has to show that the *verdict*
+    moves between draws and not only the number under it. A reader given one sentence
+    per draw would have to re-derive the thresholds to see that.
+    """
+    if auc_tstr <= 0.5:
+        return "NONE"
+    if auc_trtr <= 0.5:
+        return "NO BASELINE"
+    ratio = auc_tstr / auc_trtr
+    if ratio > 0.95:
+        return "HIGH"
+    if ratio > 0.85:
+        return "MODERATE"
+    return "LIMITED"
+
+
+def tstr_level_tally(levels: list[str]) -> str:
+    """Count each verdict word once, in the order the draws first earned it.
+
+    Deduplicated with ``dict.fromkeys`` rather than ``set``: a set defines no order, and
+    the point of the line is that the reader can see the verdict move from draw to draw.
+    Ordering it by count would hide a single outlying draw behind the majority word.
+    """
+    return ", ".join(f"{level} x{levels.count(level)}" for level in dict.fromkeys(levels))
+
 
 # %%
 # Check we have enough samples AND both classes in synthetic data
@@ -542,6 +712,10 @@ has_both_classes = len(synth_classes) >= 2
 print(f"Synthetic classes present: {synth_classes}, both classes: {has_both_classes}")
 
 # %%
+# Bound before the branch so the spread cell below can say the baseline is missing
+# rather than raise on a name that a skipped branch never created.
+auc_trtr = None
+
 if len(X_synth) > 10 and has_both_classes:
     # TRTR: Train Real, Test Real (baseline)
     model_real = GradientBoostingClassifier(n_estimators=50, max_depth=3, random_state=42)
@@ -563,20 +737,17 @@ if len(X_synth) > 10 and has_both_classes:
     acc_tstr = accuracy_score(y_test, y_pred_tstr)
     print(f"{'Accuracy':<20} {acc_trtr:<15.3f} {acc_tstr:<15.3f}")
 
+    # The share of the test set that is positive, printed so the accuracies above can be
+    # read against what answering "no" everywhere would score.
+    base_rate = float(np.mean(y_test))
+    print(f"{'(positive base rate)':<20} {base_rate:<15.3f} {base_rate:<15.3f}")
+
     try:
         auc_trtr = roc_auc_score(y_test, y_prob_trtr)
         auc_tstr = roc_auc_score(y_test, y_prob_tstr)
         print(f"{'AUC-ROC':<20} {auc_trtr:<15.3f} {auc_tstr:<15.3f}")
 
-        utility_ratio = acc_tstr / acc_trtr
-        print(f"\nTSTR Ratio: {utility_ratio:.1%}")
-
-        if utility_ratio > 0.95:
-            print("GReaT synthetic data has HIGH utility for model training.")
-        elif utility_ratio > 0.85:
-            print("GReaT synthetic data has MODERATE utility for model training.")
-        else:
-            print("GReaT synthetic data has LIMITED utility - may need more training.")
+        print(f"\n{tstr_utility_verdict(auc_trtr, auc_tstr)}")
     except ValueError as e:
         print(f"AUC calculation error: {e}")
 else:
@@ -586,6 +757,116 @@ else:
         print("Need both classes (0 and 1) for classification - increase n_generate.")
     else:
         print("This can happen with very short training - increase epochs.")
+
+# %% [markdown]
+# ### The single AUC above is a draw, not a measurement
+#
+# `great.sample()` draws with temperature, so one 500-row sample is not the generator and
+# an AUC earned on it is not the method's. Earlier executions of this notebook at this
+# seed returned TSTR AUCs of 0.70, 0.30 and 0.78 - a spread wide enough to contain
+# "synthetic training data preserves downstream utility" and its negation.
+#
+# Those three executions were not reproducible, and the reason was not the temperature.
+# The loader iterated `Series.unique`, which defines no order, and sorted on a timestamp
+# a hundred ETFs share, so each execution was built on a different real sample. With the
+# sample determined, `set_global_seeds(SEED)` is enough: two consecutive executions of
+# this notebook on one machine now return the same five draws to the digit, and differ
+# only in the wall-clock strings the progress bars print. The variability below is a
+# property of the generator that a reader can reproduce, not an accident of the run.
+#
+# The cell below separates them. It holds the real sample fixed, holds the fine-tune
+# fixed, and repeats only the generator's draw `TSTR_DRAWS` times, so the spread it
+# reports is the sampling variance alone. Sampling is what it costs, not the fit: whenever
+# `RETRAIN` is False and a checkpoint is already on disk the fit cell takes under two
+# seconds and the draws are most of the notebook's runtime. On a cold checkpoint the fit
+# dominates instead and the draws are the cheap part. Cost the run by which of the two it
+# is - and by what else the machine is doing, because three executions of this notebook on
+# 2026-09-19, all warm and all producing byte-identical output, took 1,603 s, 1,658 s and
+# 3,481 s. The last ran beside several case-study notebooks. A per-pass figure quoted from
+# a quiet machine is a floor rather than a price.
+#
+# `be_great` exposes no seed or generator argument on `sample()`, so the draws cannot be
+# pinned one by one; what pins them is the global torch seed set above, and only once
+# everything upstream of it is determined too. Five draws are reported rather than one
+# because a single number, reproducible or not, says nothing about how much of it is the
+# method and how much is one sample from it.
+
+
+# %%
+def tstr_auc_for_draw(frame):
+    """AUC on the real test split for a classifier trained on one synthetic draw.
+
+    ``None`` where the draw does not survive parsing or carries one class only. That is
+    a property of the draw and is reported as such below, not skipped: a generator that
+    returns an unusable sample two runs in five is part of the answer.
+    """
+    X_draw, y_draw = synthetic_training_set(frame)
+    if len(X_draw) <= 10 or len(np.unique(y_draw)) < 2:
+        return None
+    model = GradientBoostingClassifier(n_estimators=50, max_depth=3, random_state=42)
+    model.fit(X_draw, y_draw)
+    try:
+        return float(roc_auc_score(y_test, model.predict_proba(X_test)[:, 1]))
+    except ValueError:
+        # The single-draw cell above guards the identical call on the same `y_test`, so a
+        # one-class test split prints "AUC calculation error" there and must not abort the
+        # notebook here. Reachable by shrinking N_SAMPLES while N_GENERATE still clears the
+        # gate above.
+        return None
+
+
+# The first draw is the sample already generated above, so only the rest are new.
+draw_frames = [synthetic_df]
+for _ in range(max(TSTR_DRAWS - 1, 0)):
+    draw_frames.append(
+        great.sample(n_samples=CONFIG["n_generate"], max_length=500, guided_sampling=True)
+    )
+draw_aucs = [tstr_auc_for_draw(frame) for frame in draw_frames]
+
+print("\n" + "=" * 70)
+print(f"TSTR AUC ACROSS {len(draw_frames)} SYNTHETIC DRAWS (one fine-tune, one test split)")
+print("=" * 70)
+for index, auc in enumerate(draw_aucs, start=1):
+    if auc is None:
+        print(f"  draw {index}: unusable sample")
+    elif auc_trtr is None:
+        print(f"  draw {index}: {auc:.3f}")
+    else:
+        print(f"  draw {index}: {auc:.3f}  ({tstr_utility_level(auc_trtr, auc)})")
+
+usable = [auc for auc in draw_aucs if auc is not None]
+if usable:
+    print(
+        f"\nmedian {float(np.median(usable)):.3f}, "
+        f"range {min(usable):.3f} to {max(usable):.3f}, "
+        f"{len(usable)} of {len(draw_aucs)} draws usable"
+    )
+    if auc_trtr is None:
+        print("\nNo TRTR baseline was computed above, so no ratio verdict is available.")
+    else:
+        levels = [tstr_utility_level(auc_trtr, auc) for auc in usable]
+        print(f"TRTR baseline on the same test split: {auc_trtr:.3f}")
+        print(
+            f"\nVerdicts earned across the {len(usable)} usable draws: " + tstr_level_tally(levels)
+        )
+        print(
+            "The verdict is a draw too. Reporting the one the median earns would publish "
+            "a reading the other draws contradict, so the notebook reports the spread and "
+            "the book's sentence has to be read against it."
+        )
+else:
+    print("\nNo draw produced a usable training set, so the spread cannot be measured.")
+
+# %% [markdown]
+# **Observation**: read the spread, not the median. What the repeat measures is how much
+# of the TSTR result belongs to the method and how much to one sample from it. A range
+# that straddles one-half means the notebook cannot claim the synthetic data preserves
+# downstream utility on this task, however favourable the draw printed above happened to
+# be; a range that sits clear of one-half means it can. The range here does straddle it,
+# and the draws are reproducible, so that is a finding about the generator rather than
+# about this execution. Two things would narrow it: a
+# longer fine-tune, and generating more than 500 rows per draw so each downstream
+# classifier sees a larger training set.
 
 # %% [markdown]
 # ## 8. Statistical Tests
@@ -611,18 +892,33 @@ for col in numerical_cols:
             print(f"  Mean difference: {mean_diff:.4f}")
 
 # %% [markdown]
-# **Interpretation**: The KS test measures the maximum distance between the real
-# and synthetic cumulative distributions. Return features show high KS values
-# (`ret_1d` 0.51, `ret_5d` 0.59, `ret_20d` 0.58), indicating that the LLM does
-# not match the continuous return distributions well: synthetic returns are
-# compressed toward zero with lower variance. Volatility (KS 0.32) and volume
-# ratio (KS 0.10) are matched more closely. The categorical distributions also
-# diverge: synthetic labels 94.8% of rows "down" while only 45.1% of real rows
-# are "down" (real is 55.0% up / 45.1% down, so synthetic inverts the balance),
-# and under-generates "strong" momentum (9.8% vs 27.8%). The TSTR accuracy
-# ratio (92.7%) and AUC drop (0.759 to 0.697) show that the downstream classifier
-# trained on synthetic data is close to but not at parity with the real-trained
-# baseline; the marginal-distribution failures above are the larger gap.
+# **Interpretation**: the KS statistic is the largest gap between the real and
+# synthetic cumulative distributions, so a larger value means a worse marginal fit.
+# Read the printed table by feature group rather than by individual number.
+#
+# The three return features score worst, and the histograms show why: the synthetic
+# returns pile up in a narrow spike at zero instead of spreading out, so the model has
+# learned roughly where returns sit and not how far they travel. The scale features do
+# better on KS, though the histograms show they are not simply matched either - the
+# synthetic volatility peaks below the real one rather than on top of it.
+#
+# The categorical columns diverge in a way the KS numbers do not cover: the direction
+# label is close to one-sided in the synthetic sample while the real one is nearly
+# balanced, and the strongest momentum bucket is under-generated. Both are printed
+# above.
+#
+# The downstream scores do not show that. This draw's TSTR AUC is 0.764 against a TRTR
+# baseline of 0.736, a ratio of 103.8%, so the synthetic-trained classifier ranks the
+# real test set slightly *better* than the real-trained one does. Read that as one draw
+# rather than as a result: the spread cell above repeats the draw five times from the
+# same fine-tune and the same test split and gets 0.764, 0.720, 0.495, 0.681 and 0.750,
+# earning HIGH three times, MODERATE once and NONE once. The draw printed here is the
+# best of the five.
+#
+# That is the point worth carrying, and it is the opposite of the reassuring one: a
+# downstream score can stay respectable, or beat the baseline outright, while the
+# distributions underneath it are wrong and while the next draw from the same model
+# falls to chance.
 
 # %% [markdown]
 # ## Key Takeaways
@@ -641,9 +937,10 @@ for col in numerical_cols:
 # 4. **Parsing failures are the main failure mode**: The autoregressive generator
 #    can produce tokens that break column parsing, especially with short
 #    fine-tuning. This is visible as NaN values in the generated output.
-# 5. **Marginal fidelity is mixed**: The LLM captures scale features (volatility,
-#    volume) better than return distributions (KS 0.5+). TSTR evaluation is needed to
-#    verify that inter-feature dependencies transfer to downstream tasks.
+# 5. **Marginal fidelity is mixed**: the LLM scores better on the scale features than
+#    on the return distributions, which it compresses toward zero. A TSTR evaluation is
+#    what shows whether the inter-feature dependencies survive into a downstream task,
+#    and it can look acceptable while the marginals do not.
 #
 # | Generator | Strength | Weakness |
 # |-----------|----------|----------|
@@ -655,7 +952,7 @@ for col in numerical_cols:
 # **Next**: See [`07_dp_gan`](07_dp_gan.ipynb) for adding differential privacy guarantees to
 # synthetic generation -- critical when training data contains sensitive records.
 #
-# **Book**: Section 5.6 discusses the serialization insight in depth, including
+# **Book**: Section 5.7 discusses the serialization insight in depth, including
 # how feature-name semantics from pre-training improve generation quality and
 # how GReaT compares to GAN-based tabular generators (CTGAN, TVAE).
 

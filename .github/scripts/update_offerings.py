@@ -34,7 +34,7 @@ import re
 import sys
 import urllib.error
 import urllib.request
-from datetime import UTC, datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -51,8 +51,10 @@ NEXT_DATA_RE = re.compile(
     r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', re.S
 )
 
-# One-line positioning per offering, keyed by Maven course slug. The profile's
-# own course_description is marketing-page prose, too long for a table row.
+# One-line positioning per offering, keyed by Maven course slug, for the courses
+# whose own course_description is marketing-page prose too long for a table row.
+# A course absent here falls back to its course_description, so a newly launched
+# cohort never renders an empty cell on the front page; see blurb_for().
 BLURBS = {
     "research-to-production": "Take one research idea from a question to a costed, "
     "monitored strategy, with the evidence trail that makes the result checkable.",
@@ -60,6 +62,8 @@ BLURBS = {
     "auditable end to end.",
     "loop-engineering": "Get reliable work out of coding agents: harness design, "
     "verification, and recovery from a bad run.",
+    "ml4t-foundations": "Build the ML for Trading pipeline yourself, end to end, and "
+    "the evidence to say what it does and does not establish.",
 }
 
 
@@ -94,8 +98,16 @@ def span(start: datetime, end: datetime | None) -> str:
     return f"{first.strftime('%b %-d')} – {end.astimezone(EASTERN).strftime('%b %-d, %Y')}"
 
 
-def collect(props: dict, now: datetime) -> tuple[list[dict], list[dict]]:
-    """Return (upcoming free lessons, upcoming paid cohorts), soonest first."""
+def collect(props: dict, now: datetime) -> tuple[list[dict], list[dict], list[dict]]:
+    """Return (upcoming free lessons, upcoming live cohorts, standing offerings).
+
+    The first two are dated and sort soonest first. The third is what a reader can
+    buy today that carries no date, and it exists because a table keyed on a start
+    date shows nothing for an offering that has none: `ml4t-foundations` sells a
+    self-paced seat and was absent from the README entirely, and
+    `research-to-production` disappears from it between cohorts, which on
+    2026-09-24 was both full courses missing from the page at once.
+    """
     lessons = []
     for item in props.get("free_items", {}).get("items", []):
         start = parse_instant(item.get("start_datetime"))
@@ -110,9 +122,28 @@ def collect(props: dict, now: datetime) -> tuple[list[dict], list[dict]]:
             }
         )
 
+    # Every scheduled cohort, from `course_cohorts`, not one per course from
+    # `next_live_cohort`. That field holds a single cohort, so a course with two
+    # dates on the calendar advertised only the nearer one: `agent-engineering`
+    # was listed on Maven for Oct 3 and Nov 21, 2026 and the README showed Oct 3
+    # alone. It is also None while a cohort is running with no successor
+    # scheduled, which dropped `research-to-production` out of the table entirely.
+    # `course_cohorts` is keyed by `course_id`, so the course record supplies the
+    # name, slug and description and the cohort supplies the dates.
+    courses_by_id = {
+        course.get("course_id") or course.get("id"): course
+        for course in props.get("courses", []) + props.get("paid_workshop_courses", [])
+    }
+
     cohorts = []
-    for course in props.get("courses", []) + props.get("paid_workshop_courses", []):
-        cohort = course.get("next_live_cohort") or {}
+    for cohort in props.get("course_cohorts", []):
+        # A self-paced entry has no start date and belongs in no schedule; an
+        # unlisted one is not on sale. Neither is a date a reader can act on.
+        if cohort.get("visibility") != "listed" or cohort.get("type") != "live":
+            continue
+        course = courses_by_id.get(cohort.get("course_id"))
+        if course is None:
+            continue
         start = parse_instant(cohort.get("start_date"))
         if start is None or start <= now:
             continue
@@ -124,10 +155,67 @@ def collect(props: dict, now: datetime) -> tuple[list[dict], list[dict]]:
                 "start": start,
                 "end": parse_instant(cohort.get("end_date")),
                 "format": course.get("course_format"),
+                "description": (course.get("course_description") or "").strip(),
             }
         )
 
-    return sorted(lessons, key=lambda x: x["start"]), sorted(cohorts, key=lambda x: x["start"])
+    # What a reader can act on with no date attached. A listed self-paced cohort is
+    # one: the seat is on sale and the start is whenever the reader starts. A full
+    # course with nothing scheduled is the other, because the course page keeps
+    # selling and collecting a waitlist while a cohort runs. A workshop is not: it
+    # is a single event, so with no date there is nothing to point anyone at.
+    scheduled = {c["slug"] for c in cohorts}
+    standing = []
+    for course in courses_by_id.values():
+        slug = course.get("course_slug")
+        self_paced = any(
+            cohort.get("course_id") == (course.get("course_id") or course.get("id"))
+            and cohort.get("type") == "self_paced"
+            and cohort.get("visibility") == "listed"
+            for cohort in props.get("course_cohorts", [])
+        )
+        if self_paced:
+            mode = "Self-paced, start any time"
+        elif slug not in scheduled and course.get("course_format") == "full_course":
+            mode = "Next cohort not yet scheduled"
+        else:
+            continue
+        standing.append(
+            {
+                "title": course["course_name"],
+                "slug": slug,
+                "url": f"https://maven.com/stefan-jansen/{slug}",
+                "mode": mode,
+                "description": (course.get("course_description") or "").strip(),
+            }
+        )
+
+    return (
+        sorted(lessons, key=lambda x: x["start"]),
+        sorted(cohorts, key=lambda x: x["start"]),
+        sorted(standing, key=lambda x: x["title"]),
+    )
+
+
+def blurb_for(cohort: dict) -> str:
+    """The `What you leave with` cell, never empty.
+
+    A hand-written BLURBS entry wins. Absent one - which is every newly launched
+    cohort, since the table is edited by hand and the schedule is not - fall back
+    to the profile's own course_description, first sentence only. PR #887 shipped
+    an empty cell for `ml4t-ai-agents` this way, on the front page of the repo.
+    """
+    written = BLURBS.get(cohort["slug"])
+    if written:
+        return written
+    description = cohort.get("description", "")
+    if not description:
+        raise SystemExit(
+            f"{cohort['slug']}: no BLURBS entry and no course_description on the Maven "
+            "profile, so the offerings table would ship an empty cell. Add a BLURBS entry."
+        )
+    first, _, _ = description.partition(". ")
+    return first.rstrip(".") + "."
 
 
 def render_next(lessons: list[dict]) -> str:
@@ -148,7 +236,7 @@ def render_next(lessons: list[dict]) -> str:
     )
 
 
-def render_all(lessons: list[dict], cohorts: list[dict]) -> str:
+def render_all(lessons: list[dict], cohorts: list[dict], standing: list[dict]) -> str:
     out: list[str] = []
 
     if cohorts:
@@ -160,8 +248,20 @@ def render_all(lessons: list[dict], cohorts: list[dict]) -> str:
             "|--------|----------|---------------------|",
         ]
         for c in cohorts:
-            blurb = BLURBS.get(c["slug"], "")
+            blurb = blurb_for(c)
             out.append(f"| {span(c['start'], c['end'])} | [{c['title']}]({c['url']}) | {blurb} |")
+        out.append("")
+
+    if standing:
+        out += [
+            "**Courses with no date on the calendar.** Either self-paced and on sale "
+            "now, or between cohorts with a waitlist on the course page.",
+            "",
+            "| Offering | How it runs | What you leave with |",
+            "|----------|-------------|---------------------|",
+        ]
+        for c in standing:
+            out.append(f"| [{c['title']}]({c['url']}) | {c['mode']} | {blurb_for(c)} |")
         out.append("")
 
     if lessons:
@@ -176,7 +276,7 @@ def render_all(lessons: list[dict], cohorts: list[dict]) -> str:
             out.append(f"| {when(lesson['start'])} | [{lesson['title']}]({lesson['url']}) |")
         out.append("")
 
-    if not cohorts and not lessons:
+    if not cohorts and not lessons and not standing:
         out.append(
             f"Nothing is on the calendar right now. [Courses and workshops]({COURSES_URL}) "
             "lists new dates as they are scheduled."
@@ -211,8 +311,8 @@ def main() -> int:
         return 2
 
     now = datetime.now(UTC)
-    lessons, cohorts = collect(props, now)
-    nxt, allblock = render_next(lessons), render_all(lessons, cohorts)
+    lessons, cohorts, standing = collect(props, now)
+    nxt, allblock = render_next(lessons), render_all(lessons, cohorts, standing)
 
     if args.show:
         print(nxt, "", allblock, sep="\n")
@@ -231,7 +331,10 @@ def main() -> int:
         return 1
 
     README.write_text(updated)
-    print(f"README updated: {len(cohorts)} cohorts, {len(lessons)} free lessons")
+    print(
+        f"README updated: {len(cohorts)} cohorts, {len(standing)} without a date, "
+        f"{len(lessons)} free lessons"
+    )
     return 0
 
 

@@ -32,6 +32,8 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / ".github" / "scripts"))
 
+pytestmark = pytest.mark.usefixtures("tmp_repo")
+
 import notebook_provenance  # noqa: E402
 from notebook_provenance import (  # noqa: E402
     check_all,
@@ -85,6 +87,31 @@ def test_an_identity_bearing_override_is_production() -> None:
     """
     assert production_parameters({"SUPERSEDES_POPULATION": "342446006141"})
     assert production_parameters({"SUPERSEDES_POPULATION": "342446006141", "FORCE_RETRAIN": True})
+
+
+def test_a_candidate_set_declaration_is_production() -> None:
+    """The same shape as ``SUPERSEDES_POPULATION``, and it has to be launchable.
+
+    The supersedes gate tells a reader to declare an undeclared candidate-set generation
+    before the run that moves its members. Every freezing notebook that has already run is
+    stamped, so declaring it in source returns STALE and owes a full re-render - 44.15 h
+    across the five ``us_equities_panel`` notebooks that freeze the twelve live generations
+    (ml4t/agent-workspace#1175). Passing it at launch is the route that costs nothing, and
+    it only exists if such a run is still production: otherwise it takes the scratch-copy
+    path and the reader-facing notebook keeps showing the run this one replaced.
+
+    The value goes unchecked here because ``candidate_set_supersedes`` withholds anything
+    that does not resolve to the tip and ``CandidateSet.create`` refuses what it did not
+    require, which is the same division of labour as the population declaration above.
+    """
+    assert production_parameters({"SUPERSEDES_SETS": {"us-equities-fwd-ret-1d-pca-v1": "live"}})
+    assert production_parameters(
+        {"SUPERSEDES_SETS": {"a-v1": "live", "a-diagnostics-v1": "live"}, "FORCE_RETRAIN": True}
+    )
+    # It declares; it cannot reduce. Beside anything that removes work the run is not
+    # production, which is what stops this admitting a reduced run through the new name.
+    assert not production_parameters({"SUPERSEDES_SETS": {"a-v1": "live"}, "MAX_SYMBOLS": 8})
+    assert not production_parameters({"SUPERSEDES_SETS": {"a-v1": "live"}, "USE_CACHE": True})
 
 
 def test_waiving_the_value_check_does_not_admit_a_reduced_run() -> None:
@@ -260,7 +287,13 @@ def test_stamp_records_declared_overrides_as_test_mode(tmp_path, monkeypatch) ->
 
 
 def test_stamped_notebooks_are_current_and_production() -> None:
-    stale, testmode, contradicted, _unverified, _alt_only, hollow = check_all(strict=False)
+    result = check_all(strict=False)
+    stale, testmode, contradicted, hollow = (
+        result.stale,
+        result.testmode,
+        result.contradicted,
+        result.hollow,
+    )
     assert not stale and not testmode and not contradicted and not hollow, (
         "Committed notebooks are out of sync with their source .py:\n"
         + (
@@ -536,23 +569,91 @@ def test_prose_edit_beside_a_computed_alt_is_not_stale(tmp_path, monkeypatch) ->
     assert _drift(tmp_path, monkeypatch, old, new, _notebook([cell]))
 
 
-def test_editing_the_literal_part_of_a_computed_alt_is_stale(tmp_path, monkeypatch) -> None:
-    """A computed alt is not blanked, so its literal parts stay in the compared AST dump."""
-    old = '# %%\nfig = build()\nshow_plotly_with_alt(fig, f"the leader is {leader}")\n'
-    new = '# %%\nfig = build()\nshow_plotly_with_alt(fig, f"the winner is {leader}")\n'
-    cell = {
+def _computed_alt_cell(source_alt: str, carried: str) -> dict:
+    return {
         "cell_type": "code",
         "metadata": {},
-        "source": 'fig = build()\nshow_plotly_with_alt(fig, f"the winner is {leader}")\n',
+        "source": f"fig = build()\nshow_plotly_with_alt(fig, {source_alt})\n",
         "outputs": [
             {
                 "output_type": "display_data",
                 "data": {"image/png": "iVBORw0KGgo="},
-                "metadata": {"image/png": {"alt": "the winner is ridge"}},
+                "metadata": {"image/png": {"alt": carried}},
             }
         ],
     }
+
+
+def test_rewording_a_computed_alt_the_output_carries_is_allowed(tmp_path, monkeypatch) -> None:
+    """The case #867 was filed for.
+
+    Writing alt text against computed values is what stops a description drifting from
+    its figure, and it used to cost a full re-execution to reword: the f-string was left
+    whole in the compared dump, so any edit read as stale. The same reword to a plain
+    literal next door was accepted as a diff.
+
+    The bargain is the same as the literal branch's: accepted only because the output
+    metadata carries the reworded text too.
+    """
+    old = '# %%\nfig = build()\nshow_plotly_with_alt(fig, f"the leader is {leader}")\n'
+    new = '# %%\nfig = build()\nshow_plotly_with_alt(fig, f"the winner is {leader}")\n'
+    cell = _computed_alt_cell('f"the winner is {leader}"', "the winner is ridge")
+
+    assert _drift(tmp_path, monkeypatch, old, new, _notebook([cell]))
+
+
+def test_rewording_a_computed_alt_the_output_does_not_carry_is_stale(tmp_path, monkeypatch) -> None:
+    """Editing the .py and leaving the executed alt saying the old thing is stale.
+
+    Without this the loosening would forgive a notebook whose figure description and
+    whose source disagree, which is the state the whole gate exists to refuse.
+    """
+    old = '# %%\nfig = build()\nshow_plotly_with_alt(fig, f"the leader is {leader}")\n'
+    new = '# %%\nfig = build()\nshow_plotly_with_alt(fig, f"the winner is {leader}")\n'
+    cell = _computed_alt_cell('f"the winner is {leader}"', "the leader is ridge")
+
     assert not _drift(tmp_path, monkeypatch, old, new, _notebook([cell]))
+
+
+def test_changing_what_a_computed_alt_reads_is_stale(tmp_path, monkeypatch) -> None:
+    """Only the prose is forgiven; the interpolated expressions are not.
+
+    `{leader}` to `{runner_up}` changes what the alt asserts about the data, so it has
+    to force the re-run - and it does, because the expression parts stay in the dump.
+    """
+    old = '# %%\nfig = build()\nshow_plotly_with_alt(fig, f"the winner is {leader}")\n'
+    new = '# %%\nfig = build()\nshow_plotly_with_alt(fig, f"the winner is {runner_up}")\n'
+    cell = _computed_alt_cell('f"the winner is {runner_up}"', "the winner is ridge")
+
+    assert not _drift(tmp_path, monkeypatch, old, new, _notebook([cell]))
+
+
+def test_an_implicit_concatenation_of_a_literal_and_an_f_string_is_handled(
+    tmp_path, monkeypatch
+) -> None:
+    """The shape that broke the first attempt at this.
+
+    `"Boosting curve, " f"{n} below zero"` is one JoinedStr whose first constant is a
+    whole quoted literal and whose last is bare prose between the braces. Blanking them
+    textually needs a different placeholder for each, and guessing wrong writes source
+    that does not parse - which does not fail loudly, it makes the exception
+    unavailable for the notebook and reports it as stale. Eight notebooks in the tree
+    have this shape.
+    """
+    old = (
+        "# %%\nfig = build()\nshow_plotly_with_alt(\n    fig,\n"
+        '    "Boosting curve, "\n    f"{n} lines below zero.",\n)\n'
+    )
+    new = (
+        "# %%\nfig = build()\nshow_plotly_with_alt(\n    fig,\n"
+        '    "Boosting curves, "\n    f"{n} lines below zero.",\n)\n'
+    )
+    cell = _computed_alt_cell(
+        '"Boosting curves, " f"{n} lines below zero."',
+        "Boosting curves, 3 lines below zero.",
+    )
+
+    assert _drift(tmp_path, monkeypatch, old, new, _notebook([cell]))
 
 
 def test_a_computed_alt_the_output_does_not_carry_is_stale(tmp_path, monkeypatch) -> None:
@@ -610,6 +711,92 @@ def test_the_paired_py_selects_its_notebook() -> None:
 def test_an_empty_restriction_still_scans_everything() -> None:
     """`only=None` is the whole tree, which is what CI calls and must not change."""
     assert check_all(only=None) == check_all()
+
+
+def test_check_reports_and_fails_a_stamp_over_an_empty_output_set(tmp_path, monkeypatch) -> None:
+    """The corpus assertion above passes vacuously if the detection is broken.
+
+    `test_every_committed_notebook_is_its_current_py` asserts `not result.hollow` over the
+    real tree, which is exactly as green when nothing is hollow as when nothing can be
+    seen. ml4t/agent-workspace#301 is the failure that motivates it: two notebooks carried
+    `production: True` over zero outputs and `check` reported clean, because the gate that
+    exists to catch a render claiming a run it never made was not looking at the outputs.
+
+    So this builds that render deliberately and asserts both halves - the category names
+    it, and the CLI exits non-zero on it.
+    """
+    import subprocess
+
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    monkeypatch.setattr(notebook_provenance, "REPO_ROOT", tmp_path)
+    py = tmp_path / "nb.py"
+    py.write_text("# %%\nprint(1)\n", encoding="utf-8")
+    nb = tmp_path / "nb.ipynb"
+    nb.write_text(
+        json.dumps(
+            _notebook(
+                [_code("print(1)")],
+                metadata={
+                    notebook_provenance.STAMP_KEY: {
+                        "production": True,
+                        "parameters": {},
+                        "source_py_blob": notebook_provenance.git_blob(py),
+                        "outputs_digest": notebook_provenance.outputs_digest(
+                            _notebook([_code("print(1)")])
+                        ),
+                        "library_digest": notebook_provenance.library_digest(py),
+                    }
+                },
+            )
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(notebook_provenance, "iter_notebooks", lambda: [nb])
+
+    result = check_all()
+    assert result.hollow == ["nb.ipynb"], result
+    assert not result.stale and not result.testmode, result
+
+    args = __import__("argparse").Namespace(paths=[], strict=False, since=None, no_merge_base=False)
+    assert notebook_provenance._cmd_check(args) == 1
+
+
+def test_check_passes_the_same_notebook_once_it_has_an_output(tmp_path, monkeypatch) -> None:
+    """The control for the test above: only the empty output set makes it fail.
+
+    Without it, a `hollow` that fired on every stamped notebook would still turn that
+    test green while blocking the whole corpus.
+    """
+    import subprocess
+
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    monkeypatch.setattr(notebook_provenance, "REPO_ROOT", tmp_path)
+    py = tmp_path / "nb.py"
+    py.write_text("# %%\nprint(1)\n", encoding="utf-8")
+    executed = _notebook([_code("print(1)", [_stdout("1")])])
+    nb = tmp_path / "nb.ipynb"
+    nb.write_text(
+        json.dumps(
+            _notebook(
+                [_code("print(1)", [_stdout("1")])],
+                metadata={
+                    notebook_provenance.STAMP_KEY: {
+                        "production": True,
+                        "parameters": {},
+                        "source_py_blob": notebook_provenance.git_blob(py),
+                        "outputs_digest": notebook_provenance.outputs_digest(executed),
+                        "library_digest": notebook_provenance.library_digest(py),
+                    }
+                },
+            )
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(notebook_provenance, "iter_notebooks", lambda: [nb])
+
+    result = check_all()
+    assert not result.hollow, result
+    assert not result.stale and not result.outputs_changed, result
 
 
 # -----------------------------------------------------------------------------

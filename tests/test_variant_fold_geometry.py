@@ -1,14 +1,19 @@
 """A variant label's fold must validate after the primary's fold stops training.
 
-A stage-04 artifact carries one fold set, built on the primary label's geometry.
-A model trained on a variant label reads that artifact by ``fold`` id, so the values
-it gets for fold F were fit on data through the *primary* label's ``train_end``. The
-variant's validation window has to open after that.
+A *fold-scoped* stage-04 artifact carries one fold set, built on the primary label's
+geometry. A model trained on a variant label reads that artifact by ``fold`` id, so the
+values it gets for fold F were fit on data through the *primary* label's ``train_end``.
+The variant's validation window has to open after that.
 
 Measured across the eight stage-04 case studies on 2026-08-09: 20 variant labels,
 zero violations. Nothing in the code would have noticed if there had been one - five
 of the eight assert nothing, and fx_pairs' assertion compares the outer span, which
 never reads ``val_start``.
+
+A case study whose stage 04 has been converted to a refit schedule writes no fold column
+at all, and this whole question stops existing for it: one value per (entity, timestamp)
+serves every label, so there are no two fold sets to line up. The corpus test below skips
+such an artifact rather than asserting on a column it does not have.
 """
 
 from __future__ import annotations
@@ -465,6 +470,13 @@ def test_corpus_temporal_fold_geometry_covers_resolved_validation_windows(
     import polars as pl
 
     artifact = _available_corpus_artifact(case_study)
+    if "fold" not in pl.read_parquet_schema(artifact):
+        # A converted case study bounds a fitted feature by its declared refit schedule
+        # rather than by a fold, so it writes one row per (entity, timestamp) and there is
+        # no fold geometry for this test to check. That is the property
+        # ``04_model_based_features`` asserts at its own write, which is where it belongs -
+        # here the artifact simply has nothing to say.
+        pytest.skip(f"{case_study} writes a fold-free model-based artifact")
     primary_label = cv_window.configured_labels(case_study)[0]
     resolved = cv_window.temporal_artifact_fold_boundaries(
         case_study,
@@ -522,17 +534,31 @@ def test_sp500_options_corpus_uses_financial_timeline_geometry() -> None:
         outcome_horizon=resolve_label_horizon(case_study, primary_label, setup),
         date_col="timestamp",
     )
+    # The claim in this test's name, and it needs no `fold` column: the boundaries the corpus
+    # resolves against come from the financial timeline, not from the label one. Measured
+    # 2026-09-11 on the canonical artifact - resolved train_starts 2017-02-02 and 2018-01-05
+    # against 2017-01-05 and 2018-01-04 derived from the labels.
+    assert any(
+        _comparable_timestamp(actual["train_start"])
+        != _comparable_timestamp(from_label["train_start"])
+        for actual, from_label in zip(resolved, label_derived, strict=True)
+    )
+
+    # The second half needs one, and sp500_options writes a fold-free artifact now - one row
+    # per (symbol, timestamp), bounded by the refit schedule its sidecar records rather than by
+    # a fold. There is no per-fold start to compare, and the artifact's own first session
+    # (2018-01-04) is not a resolved train_start, so there is no fold-free restatement of this
+    # assertion either. What replaces it is asserted where the values are written:
+    # `case_studies/sp500_options/04_model_based_features.py:411` and `:1470` require every
+    # block's `fit_end` to precede the session it speaks for.
+    if "fold" not in pl.read_parquet_schema(artifact):
+        return
+
     observed_starts = (
         pl.scan_parquet(artifact)
         .group_by("fold")
         .agg(pl.col("timestamp").min().alias("timestamp"))
         .collect()
-    )
-
-    assert any(
-        _comparable_timestamp(actual["train_start"])
-        != _comparable_timestamp(from_label["train_start"])
-        for actual, from_label in zip(resolved, label_derived, strict=True)
     )
     for split in resolved:
         observed_start = observed_starts.filter(pl.col("fold") == split["fold"]).item(

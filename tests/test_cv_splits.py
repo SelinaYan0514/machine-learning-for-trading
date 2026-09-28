@@ -19,6 +19,7 @@ flag it before a sweep wastes GPU time.
 
 from __future__ import annotations
 
+from datetime import date
 from pathlib import Path
 
 import pandas as pd
@@ -27,7 +28,7 @@ import pytest
 import yaml
 
 from utils.cv_splits import (
-    _assert_newest_first,
+    _assert_chronological,
     _map_calendar_id,
     _normalize_duration,
     earliest_train_start,
@@ -37,6 +38,7 @@ from utils.cv_splits import (
     make_wf_config,
     most_recent_split,
     normalize_label_buffer,
+    select_folds,
 )
 from utils.modeling import validate_temporal_fold_coverage, validate_temporal_split_geometry
 
@@ -180,9 +182,9 @@ def test_generate_cv_splits_etfs_intra_fold_chronology(etfs_splits) -> None:
 
 
 def test_generate_cv_splits_etfs_backward_walk_forward(etfs_splits) -> None:
-    """fold_direction=backward → fold 0 is the most recent, folds step back."""
+    """fold_direction=backward builds from the holdout boundary and emits forward."""
     for i in range(len(etfs_splits) - 1):
-        assert etfs_splits[i]["val_start"] > etfs_splits[i + 1]["val_start"]
+        assert etfs_splits[i]["val_start"] < etfs_splits[i + 1]["val_start"]
 
 
 def test_generate_cv_splits_etfs_embargo_respects_label_buffer(etfs_splits) -> None:
@@ -260,8 +262,11 @@ def test_generate_cv_splits_crypto_purges_variant_endpoint_at_holdout() -> None:
         label_buffer="24H",
     )
 
-    assert splits[0]["val_end"] == pd.Timestamp("2023-12-30 16:00")
-    assert splits[0]["val_end"] + pd.Timedelta(hours=24) < pd.Timestamp("2024-01-01")
+    # The purge is at the holdout boundary, so it is the latest fold that carries
+    # it - read by boundary, not by position.
+    latest = most_recent_split(splits)
+    assert latest["val_end"] == pd.Timestamp("2023-12-30 16:00")
+    assert latest["val_end"] + pd.Timedelta(hours=24) < pd.Timestamp("2024-01-01")
 
 
 # -----------------------------------------------------------------------------
@@ -518,12 +523,22 @@ def test_temporal_interior_gap_is_not_excused(warmup_temporal_fixture) -> None:
         validate_temporal_fold_coverage(dataset, _temporal_from(keep), splits, date_col="timestamp")
 
 
-def test_sp500_options_temporal_producer_uses_canonical_split_ids() -> None:
+def test_sp500_options_temporal_producer_takes_its_windows_from_generate_cv_splits() -> None:
+    """The notebook reads fold windows from the splitter, and writes no fold column.
+
+    It used to fit one parameter set per fold and stamp the fold id on every row, and this
+    test held it to using the splitter's ids rather than deriving them from a calendar year.
+    It now fits on a refit schedule instead, so there is one value per symbol and session and
+    no fold column at all - but section F still scores over the folds' validation windows, so
+    those windows still have to come from `generate_cv_splits` and not from a year.
+    """
     source = Path("case_studies/sp500_options/04_model_based_features.py").read_text()
 
     assert "generate_cv_splits(" in source
-    assert 'fold_idx = fold["fold"]' in source
+    assert '_fold["val_start"]' in source and '_fold["val_end"]' in source
     assert "first_test_year" not in source
+    # The artifact is fold-free. A `fold` key on the write is the per-fold design returning.
+    assert 'keys=["timestamp", "symbol"],' in source
 
 
 # -----------------------------------------------------------------------------
@@ -573,66 +588,127 @@ def test_make_wf_config_is_alias_of_make_walk_forward_config() -> None:
 # -----------------------------------------------------------------------------
 
 
-def test_generate_cv_splits_returns_folds_newest_first(etfs_splits) -> None:
-    """Fold 0 validates most recently. Roughly forty call sites read it that way."""
+def test_generate_cv_splits_returns_folds_oldest_first(etfs_splits) -> None:
+    """Fold 0 validates earliest, from ml4t-diagnostic 0.1.4 on."""
     val_starts = [s["val_start"] for s in etfs_splits]
-    assert val_starts == sorted(val_starts, reverse=True)
-    assert etfs_splits[0]["val_end"] > etfs_splits[-1]["val_end"]
+    assert val_starts == sorted(val_starts)
+    assert etfs_splits[0]["val_end"] < etfs_splits[-1]["val_end"]
 
 
-def test_fold_0_carries_the_latest_train_start_not_the_earliest(etfs_splits) -> None:
-    """The shape behind the measured defect: indexing for "everything available"."""
-    assert etfs_splits[0]["train_start"] > etfs_splits[-1]["train_start"]
-    assert etfs_splits[0]["train_start"] != earliest_train_start(etfs_splits)
+def test_fold_0_carries_the_earliest_train_start(etfs_splits) -> None:
+    """The order changed, so the fold that indexing lands on changed with it."""
+    assert etfs_splits[0]["train_start"] < etfs_splits[-1]["train_start"]
+    assert etfs_splits[0]["train_start"] == earliest_train_start(etfs_splits)
 
 
-def test_an_ascending_fold_list_is_refused_rather_than_returned() -> None:
+def test_a_descending_fold_list_is_refused_rather_than_returned() -> None:
     """A library change to fold_direction must fail here, not at forty call sites."""
-    ascending = [
-        {"fold": 0, "val_start": pd.Timestamp("2020-01-01"), "val_end": pd.Timestamp("2020-12-31")},
-        {"fold": 1, "val_start": pd.Timestamp("2021-01-01"), "val_end": pd.Timestamp("2021-12-31")},
+    descending = [
+        {"fold": 0, "val_start": pd.Timestamp("2021-01-01"), "val_end": pd.Timestamp("2021-12-31")},
+        {"fold": 1, "val_start": pd.Timestamp("2020-01-01"), "val_end": pd.Timestamp("2020-12-31")},
     ]
-    with pytest.raises(RuntimeError, match="not ordered newest first"):
-        _assert_newest_first(ascending)
+    with pytest.raises(RuntimeError, match="not ordered oldest first"):
+        _assert_chronological(descending)
 
-    # Reversing the list alone leaves fold 0 on the oldest window. Every join is
+    # Reversing the list alone leaves fold 0 on the newest window. Every join is
     # by id, so the ids have to move with the positions.
     with pytest.raises(RuntimeError, match="fold ids"):
-        _assert_newest_first(list(reversed(ascending)))
+        _assert_chronological(list(reversed(descending)))
 
-    _assert_newest_first([{**split, "fold": i} for i, split in enumerate(reversed(ascending))])
+    _assert_chronological([{**split, "fold": i} for i, split in enumerate(reversed(descending))])
 
 
 def test_a_precomputed_split_set_is_held_to_the_same_order() -> None:
     """A caller cannot tell which path produced its list, so both owe the contract.
 
-    The two committed configs disagree with each other:
-    us_firm_characteristics/config/cv_config.json runs newest first, and
-    fx_pairs/config/cv_config.json runs oldest first - fold 0 validates from
-    2015-10-28 against fold 7 at 2022-12-15 - while fx_pairs/04_model_based_features
-    tags its artifact through generate_cv_splits. Fold 0 then means the earliest
-    window on one side of the join and the latest on the other.
+    Under 0.1.4 the generated path emits oldest first. This docstring named the two
+    committed configs the wrong way round until 2026-09-07:
+    us_firm_characteristics/config/cv_config.json is the one that already runs in
+    that order, renumbered by #791; fx_pairs/config/cv_config.json is the one still
+    running newest first and refused. The test below reads both files rather than
+    describing them.
     """
     df = pl.DataFrame({"timestamp": pd.date_range("2010-01-01", "2020-01-01", freq="B")})
-    ascending = {
+    descending = {
         "splits": [
-            {"fold": 0, "val_start": "2015-10-28", "val_end": "2016-10-28"},
-            {"fold": 1, "val_start": "2016-11-15", "val_end": "2017-11-15"},
+            {"fold": 0, "val_start": "2016-11-15", "val_end": "2017-11-15"},
+            {"fold": 1, "val_start": "2015-10-28", "val_end": "2016-10-28"},
         ]
     }
-    with pytest.raises(RuntimeError, match="not ordered newest first"):
-        generate_cv_splits(df, cv_config=ascending)
+    with pytest.raises(RuntimeError, match="not ordered oldest first"):
+        generate_cv_splits(df, cv_config=descending)
 
-    # Reversing the list is not the fix: fold 0 still names the oldest window and
+    # Reversing the list is not the fix: fold 0 still names the newest window and
     # every downstream join is by id.
-    reversed_only = {"splits": list(reversed(ascending["splits"]))}
+    reversed_only = {"splits": list(reversed(descending["splits"]))}
     with pytest.raises(RuntimeError, match="fold ids"):
         generate_cv_splits(df, cv_config=reversed_only)
 
     renumbered = {
-        "splits": [{**split, "fold": i} for i, split in enumerate(reversed(ascending["splits"]))]
+        "splits": [{**split, "fold": i} for i, split in enumerate(reversed(descending["splits"]))]
     }
     assert [s["fold"] for s in generate_cv_splits(df, cv_config=renumbered)] == [0, 1]
+
+
+# Committed configs still running newest first, each naming the issue that decides
+# what happens to it. Empty is the intended steady state: `us_firm_characteristics`
+# left it at #791 and `fx_pairs` at #1073, both by renumbering the file and re-running
+# rather than remapping the rows registered under the old numbering.
+CV_CONFIGS_PENDING_RENUMBER: dict[str, str] = {}
+
+
+def _committed_cv_configs() -> dict[str, dict]:
+    """Every committed `cv_config.json` that carries precomputed splits.
+
+    `us_equities_panel`'s carries walk-forward parameters and no `splits` list, so it
+    goes through the generated path and owes nothing here.
+    """
+    import json
+
+    from utils import CASE_STUDIES_DIR
+
+    found = {}
+    for path in sorted(CASE_STUDIES_DIR.glob("*/config/cv_config.json")):
+        config = json.loads(path.read_text())
+        if "splits" in config:
+            found[path.parents[1].name] = config
+    return found
+
+
+@pytest.mark.parametrize("case_study", sorted(_committed_cv_configs()))
+def test_a_committed_cv_config_is_ascending_or_is_a_declared_exception(case_study: str) -> None:
+    """The ordering contract, read off the committed files rather than described.
+
+    `_assert_chronological`'s docstring named these two the wrong way round from the
+    day it was written until 2026-09-07, and nothing failed, because the only test
+    that fed a committed config to the generator - `test_fx_materialized_folds_...`
+    below - skips wherever the production label artifact is absent, which is every
+    CI job. A guard that fires only in a `--case-study` worktree is not one CI has.
+
+    This runs anywhere: the precomputed path returns before it looks at a dataset,
+    so no artifact is needed. It fails in both directions. A config that becomes
+    ascending while still listed as an exception fails, so the renumbering cannot
+    land without the exception being removed; and a config that regresses to
+    descending fails, so the state cannot drift back silently.
+    """
+    config = _committed_cv_configs()[case_study]
+    frame = pl.DataFrame({"timestamp": []})
+
+    if case_study in CV_CONFIGS_PENDING_RENUMBER:
+        with pytest.raises(RuntimeError, match="not ordered oldest first"):
+            generate_cv_splits(frame, cv_config=config)
+        return
+
+    splits = generate_cv_splits(frame, cv_config=config)
+    val_starts = [str(split["val_start"]) for split in splits]
+    assert val_starts == sorted(val_starts), case_study
+    assert [split["fold"] for split in splits] == list(range(len(splits))), case_study
+
+
+def test_every_declared_exception_is_a_config_that_exists() -> None:
+    """An exception naming a file that is gone stops excluding anything and starts
+    hiding that nothing is excluded, which is how the docstring above went stale."""
+    assert set(CV_CONFIGS_PENDING_RENUMBER) <= set(_committed_cv_configs())
 
 
 def test_fx_materialized_folds_match_the_canonical_label_clock() -> None:
@@ -682,17 +758,17 @@ def test_fx_materialized_folds_match_the_canonical_label_clock() -> None:
 
 def test_the_order_check_reads_a_stored_config_spelling() -> None:
     """A legacy config writes test_start where the generated path writes val_start."""
-    _assert_newest_first(
+    _assert_chronological(
         [
-            {"fold": 0, "test_start": pd.Timestamp("2020-01-01")},
-            {"fold": 1, "test_start": pd.Timestamp("2019-01-01")},
+            {"fold": 0, "test_start": pd.Timestamp("2019-01-01")},
+            {"fold": 1, "test_start": pd.Timestamp("2020-01-01")},
         ]
     )
     with pytest.raises(RuntimeError):
-        _assert_newest_first(
+        _assert_chronological(
             [
-                {"fold": 0, "test_start": pd.Timestamp("2019-01-01")},
-                {"fold": 1, "test_start": pd.Timestamp("2020-01-01")},
+                {"fold": 0, "test_start": pd.Timestamp("2020-01-01")},
+                {"fold": 1, "test_start": pd.Timestamp("2019-01-01")},
             ]
         )
 
@@ -726,3 +802,187 @@ def test_the_accessors_refuse_an_empty_fold_set() -> None:
         most_recent_split([])
     with pytest.raises(ValueError, match="No splits"):
         earliest_train_start([])
+
+
+# ---------------------------------------------------------------------------
+# A reduction names the folds it keeps (#1076)
+# ---------------------------------------------------------------------------
+
+
+def _fold_set(ids: list[int]) -> list[dict]:
+    """Folds carrying *ids*, one year of validation each, oldest id validating first."""
+    return [
+        {
+            "fold": fold_id,
+            "train_start": pd.Timestamp(f"{2011 + fold_id}-01-03"),
+            "train_end": pd.Timestamp(f"{2015 + fold_id}-12-31"),
+            "val_start": pd.Timestamp(f"{2016 + fold_id}-01-04"),
+            "val_end": pd.Timestamp(f"{2017 + fold_id}-01-03"),
+        }
+        for fold_id in ids
+    ]
+
+
+def test_a_reduction_reads_the_fold_id_and_not_the_list_position() -> None:
+    """The same two folds come back whatever order the set is handed over in.
+
+    A head slice cannot do this: on the reversed set it returns the last two ids.
+    """
+    ascending = _fold_set([0, 1, 2, 3])
+    reversed_set = list(reversed(ascending))
+    for ordering in (ascending, reversed_set, [ascending[3], ascending[1], ascending[0]]):
+        assert {split["fold"] for split in select_folds(ordering, [0, 1])} == {0, 1}
+
+    # What the head slice this replaced would have returned from the same set.
+    assert {split["fold"] for split in reversed_set[:2]} == {3, 2}
+
+
+def test_a_reduction_keeps_the_order_the_fold_set_was_given_in() -> None:
+    """Selection filters; it does not reorder. Chronology is the caller's contract."""
+    ascending = _fold_set([0, 1, 2, 3])
+    assert [split["fold"] for split in select_folds(ascending, [2, 0])] == [0, 2]
+    assert [split["fold"] for split in select_folds(list(reversed(ascending)), [0, 2])] == [2, 0]
+
+
+def test_a_reduction_refuses_an_id_the_fold_set_does_not_carry() -> None:
+    """A partial set fails here rather than quietly reporting a smaller experiment.
+
+    This is where a count and a declaration part company: ``splits[:2]`` on a set
+    that starts at fold 2 returns two folds and calls them the first two.
+    """
+    partial = _fold_set([2, 3, 4])
+    with pytest.raises(ValueError, match=r"names \[0, 1\]"):
+        select_folds(partial, range(2))
+    assert [split["fold"] for split in partial[:2]] == [2, 3]
+
+
+def test_a_reduction_that_keeps_no_fold_is_refused() -> None:
+    with pytest.raises(ValueError, match="no fold ids"):
+        select_folds(_fold_set([0, 1]), [])
+
+
+def test_the_harness_count_and_the_selection_mean_the_same_folds() -> None:
+    """``MAX_FOLDS = n`` means folds 0..n-1 on both sides of the harness boundary.
+
+    ``tests/pm_helpers.py`` translates the count into ids for every notebook that
+    takes ``PREVIEW_REDUCTIONS``; the three notebooks that read ``MAX_FOLDS``
+    directly pass ``range(MAX_FOLDS)`` to :func:`select_folds`. If either side is
+    ever changed to mean the most recent n instead, one preview run would reduce
+    its model stages and its evaluation stages to opposite ends of the sample.
+    """
+    from tests.pm_helpers import PREVIEW_TRANSLATED_PARAMETERS
+
+    key, cast, _aliases = PREVIEW_TRANSLATED_PARAMETERS["MAX_FOLDS"]
+    assert key == "folds"
+    assert cast(3) == [0, 1, 2]
+
+    folds = _fold_set([0, 1, 2, 3])
+    assert select_folds(folds, cast(3)) == select_folds(folds, range(3))
+
+
+# --- the fleet, not just the helper -------------------------------------------------
+#
+# #845 replaced the five head slices a `splits[...]` search found and left two behind,
+# because `fx_pairs/04_model_based_features.py` and
+# `us_equities_panel/04_model_based_features.py` both call the list `folds`. The five
+# tests above establish what `select_folds` does and none of them would have noticed.
+
+_FOLD_SET_NAMES = frozenset({"splits", "folds", "raw_folds", "cv_splits", "fold_set"})
+
+# A slice of a fold list that is not a reduction. Each entry names the file, the source
+# line, and why the slice is reading structure rather than keeping a count of folds.
+_NOT_A_REDUCTION = {
+    # A pairwise walk over adjacent folds: `zip(folds, folds[1:])`. The slice is the
+    # offset half of a pair, so it keeps every fold but the first by construction and
+    # there is no count to declare.
+    ("case_studies/etfs/11a_pca.py", "folds[1:]"),
+}
+
+
+def _sliced_fold_sets(source: str) -> list[tuple[int, str]]:
+    """Every `<fold set>[<slice>]` expression in *source*, as (lineno, text)."""
+    import ast
+
+    hits: list[tuple[int, str]] = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Subscript) or not isinstance(node.slice, ast.Slice):
+            continue
+        target = node.value
+        name = (
+            target.id
+            if isinstance(target, ast.Name)
+            else target.attr
+            if isinstance(target, ast.Attribute)
+            else None
+        )
+        if name in _FOLD_SET_NAMES:
+            hits.append((node.lineno, ast.unparse(node)))
+    return hits
+
+
+def test_no_case_study_reduces_a_fold_set_by_slicing_it() -> None:
+    """A reduction names the fold ids it keeps; a head slice names only how many.
+
+    The two readings - the earliest windows or the most recent ones - are different
+    experiments, and the slice records neither, so the same expression changed meaning
+    at ml4t-diagnostic 0.1.4 without its code changing (#1076). `select_folds` is the
+    replacement; this is the check that finds a new one under any variable name.
+    """
+    repo_root = Path(__file__).resolve().parents[1]
+    offenders: list[str] = []
+    for directory in ("case_studies", "utils"):
+        for path in sorted((repo_root / directory).rglob("*.py")):
+            rel = path.relative_to(repo_root).as_posix()
+            for lineno, text in _sliced_fold_sets(path.read_text(encoding="utf-8")):
+                if (rel, text) in _NOT_A_REDUCTION:
+                    continue
+                offenders.append(f"{rel}:{lineno}  {text}")
+
+    assert not offenders, (
+        "these reduce a fold set by slicing an ordered list:\n  "
+        + "\n  ".join(offenders)
+        + "\n\nUse `select_folds(splits, fold_ids)`, which names the folds it keeps and "
+        "refuses an id the set does not carry. A slice that is reading structure rather "
+        "than reducing belongs in `_NOT_A_REDUCTION` with the reason."
+    )
+
+
+def test_a_reduction_reads_the_fold_id_whichever_way_a_window_is_spelled() -> None:
+    """The two notebooks #845 missed build differently-shaped fold dicts.
+
+    `fx_pairs/04_model_based_features` names its window `val_start`/`val_end` and adds
+    session counts; `us_equities_panel/04_model_based_features` names the same window
+    `test_start`/`test_end`. Neither is exercised by `tests/overrides.yaml`, which sets
+    `MAX_FOLDS` for no notebook, so the reduction each one now calls is checked here.
+    """
+    fx_pairs_shaped = [
+        {
+            "fold": i,
+            "train_start": date(2016 + i, 1, 1),
+            "train_end": date(2018 + i, 1, 1),
+            "val_start": date(2018 + i, 1, 2),
+            "val_end": date(2019 + i, 1, 1),
+            "n_train": 500,
+            "n_val": 250,
+        }
+        for i in range(4)
+    ]
+    uep_shaped = [
+        {
+            "fold": i,
+            "train_start": date(2016 + i, 1, 1),
+            "train_end": date(2018 + i, 1, 1),
+            "test_start": date(2018 + i, 1, 2),
+            "test_end": date(2019 + i, 1, 1),
+        }
+        for i in range(4)
+    ]
+
+    for folds in (fx_pairs_shaped, uep_shaped):
+        kept = select_folds(folds, range(2))
+        assert [f["fold"] for f in kept] == [0, 1]
+        # The earliest windows, which is what both notebooks say MAX_FOLDS keeps.
+        assert kept[0]["train_start"] == date(2016, 1, 1)
+        # And an id the set does not carry is refused rather than silently dropped.
+        with pytest.raises(ValueError, match="does not carry"):
+            select_folds(folds, range(9))

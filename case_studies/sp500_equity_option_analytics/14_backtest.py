@@ -42,14 +42,10 @@
 # %%
 """Ch16 backtest and signal evaluation for S&P 500 equity and option features."""
 
-import sqlite3
 import time
-import warnings
 
 import matplotlib.pyplot as plt
 import polars as pl
-
-warnings.filterwarnings("ignore")
 
 from case_studies.research import (
     OfficialPopulation,
@@ -59,11 +55,17 @@ from case_studies.research import (
     open_sweep_attempt,
     population_supersedes,
     predictions_identity,
+    published_population_names_at,
+    reuse_disclosure,
     sweep_plan_name,
 )
 from case_studies.utils.backtest_explorer import BacktestExplorer
 from case_studies.utils.backtest_loaders import get_backtest_config, load_backtest_prices_for
-from case_studies.utils.backtest_presets import build_backtest_spec, serializable_backtest_spec
+from case_studies.utils.backtest_presets import (
+    build_backtest_spec,
+    serializable_backtest_spec,
+    traded_universe_declaration,
+)
 from case_studies.utils.backtest_runner import (
     normalize_prediction_columns,
     run_backtest,
@@ -86,10 +88,12 @@ from case_studies.utils.sweep_config import (
 )
 from utils.paths import get_case_study_dir
 from utils.reproducibility import set_global_seeds
-from utils.style import COLORS, FIGSIZE, add_message_title, zero_line
+from utils.style import COLORS, FIGSIZE, add_message_title, show_with_alt, zero_line
 
 # %% tags=["parameters"]
 CASE_STUDY_ID = "sp500_equity_option_analytics"
+EXECUTION_TIER = "canonical"
+WORKSPACE: str = ""
 LABEL = ""
 SPLIT = "validation"
 # Zero means the smallest top_k from setup.yaml backtest.sweep.top_k_grid.
@@ -120,6 +124,29 @@ set_global_seeds(SEED)
 # injected parameter wins, otherwise the case study's own declaration.
 
 # %%
+# A run given a workspace reads and registers there rather than in the released case
+# directory, and `open_study` is what activates that root. Activation rewrites
+# `ML4T_OUTPUT_DIR` for the rest of the process, so it has to happen before the first
+# `get_case_study_dir` rather than beside the registry read further down: `CASE_DIR` has to
+# already answer for the workspace.
+#
+# `WORKSPACE` is read at both tiers. It used to be read on the preview branch only, so a
+# canonical run that passed one was answered with `Study.regenerate` and registered its
+# backtests in the published store while its caller read from the workspace it asked for -
+# no exception, no warning, and an exit status that said the run had refused (#1100). A
+# canonical run with a workspace is the same full-fidelity sweep writing to that root, which
+# is what a rehearsal against a private registry needs. A preview still requires one, because
+# a preview with no workspace has nowhere of its own to write.
+_workspace_study = None
+if EXECUTION_TIER == "preview" and not WORKSPACE:
+    raise ValueError("preview execution requires WORKSPACE")
+if WORKSPACE or EXECUTION_TIER == "preview":
+    _workspace_study = open_study(
+        CASE_STUDY_ID,
+        execution_tier=EXECUTION_TIER,
+        workspace=WORKSPACE or None,
+        entry_point="14_backtest",
+    )
 CASE_DIR = get_case_study_dir(CASE_STUDY_ID)
 bt_config = get_backtest_config(CASE_STUDY_ID)
 TOP_N = (
@@ -145,16 +172,40 @@ prices = load_backtest_prices_for(
     CASE_STUDY_ID, BACKTEST_LABEL, split="validation", max_symbols=MAX_SYMBOLS
 )
 n_assets = prices["symbol"].n_unique()
-if TOP_K:
-    PLUMBING_TOP_K = TOP_K
-else:
-    _feasible_top_k = get_top_k_values_for(CASE_STUDY_ID, BACKTEST_LABEL, n_assets)
-    if not _feasible_top_k:
-        raise ValueError(
-            f"top_k_grid for {BACKTEST_LABEL!r} in {CASE_STUDY_ID} has no value < "
-            f"n_assets={n_assets}; declare a feasible k in setup.yaml"
-        )
-    PLUMBING_TOP_K = _feasible_top_k[0]
+
+# `MAX_SYMBOLS` reduces the price panel, and until the run says so in its own specification
+# that reduction did not reach `backtest_hash`: a reduced run and the full run over the same
+# predictions hashed alike, so the second was served the first's result and the reduction
+# bought nothing (ml4t/agent-workspace#911). Declaring it here, before anything is hashed,
+# gives a reduced run an identity of its own; `run_backtest` checks the panel against the
+# declaration and narrows the predictions to it, so the sweep ranks the cross-section this
+# says it ranks and `n_assets` above describes that same set. A full run declares nothing and
+# is byte-identical to before.
+# A reduced run is a preview run. Refused on the canonical tier so a narrowed result can
+# never land in the registry the book's numbers come from, and so the two can never sit in
+# one registry to be ranked against each other: `resolve_best_predictions` takes MAX(sharpe)
+# over every backtest of a prediction, and a Sharpe earned over a handful of names would
+# advance a configuration ahead of one earned over the whole panel. `us_equities_panel` 16
+# through 19 already refuse the parameter this way, and `canonically_refused_parameters`
+# reads the refusal out of the source, so the canonical fixture path drops the name rather
+# than handing the notebook something its first cell raises on.
+if EXECUTION_TIER == "canonical" and MAX_SYMBOLS:
+    raise ValueError(
+        "MAX_SYMBOLS narrows the universe this run trades, which makes it a different "
+        "portfolio from the declared one and gives it its own backtest identity "
+        "(ml4t/agent-workspace#911). A canonical run trades the declared universe: set "
+        "MAX_SYMBOLS=0, or run under EXECUTION_TIER='preview' with a WORKSPACE."
+    )
+TRADED_UNIVERSE = traded_universe_declaration(prices) if MAX_SYMBOLS else None
+
+# Called unconditionally, because the call is the feasibility check: it raises when no
+# declared k fits `n_assets`. It used to sit in the `else` of `if TOP_K:`, so a papermill
+# TOP_K skipped the check as well as the default it was there to supply. At MAX_SYMBOLS: 3
+# with TOP_K: 1 that is what let this notebook run a `6 predictions x 0 schemes` sweep,
+# register nothing, and report an analysis of rows the fixture already held
+# (ml4t/agent-workspace#1084).
+_feasible_top_k = get_top_k_values_for(CASE_STUDY_ID, BACKTEST_LABEL, n_assets)
+PLUMBING_TOP_K = TOP_K if TOP_K else _feasible_top_k[0]
 print(
     f"Price support: {len(prices):,} rows across {n_assets} historical symbols; "
     f"plumbing-test top-K={PLUMBING_TOP_K}"
@@ -165,6 +216,7 @@ strategy_spec = build_backtest_spec(
     CASE_STUDY_ID,
     bt_config,
     prices=prices,
+    traded_universe=TRADED_UNIVERSE,
     prediction_hash="plumbing_test",
     initial_cash=bt_config.initial_cash,
     chapter="ch16",
@@ -235,16 +287,26 @@ except ValueError as e:
 # %%
 # `Study.at` is the read-only form: one root, no activation. These notebooks only read the
 # populations - their backtests reach the registry by their own paths - and every other way in
-# ends in `activate()`, which rewrites `ML4T_OUTPUT_DIR` process-wide. `open_study` with the
-# canonical tier routes to `Study.regenerate`, which refuses unless `features`, `labels` and
-# `run_log` are symlinks: true in a maintainer worktree, false in every clean clone and CI run.
-# `CASE_DIR` is already the directory this notebook resolved, including under a preview, so
+# ends in `activate()`, which rewrites `ML4T_OUTPUT_DIR` process-wide. `open_study` at the
+# canonical tier with no workspace routes to `Study.regenerate`, which refuses unless
+# `features`, `labels` and `run_log` are symlinks: true in a maintainer worktree, false in
+# every clean clone and CI run. Given a workspace it routes to `Study.open` instead, which is
+# why the branch above opens one whenever `WORKSPACE` is set rather than only for a preview.
+# `CASE_DIR` is already the directory this notebook resolved, including under a workspace, so
 # asking it directly answers for the registry the rest of the notebook reads.
-_study = Study.at(CASE_DIR, case_study=CASE_STUDY_ID, entry_point="14_backtest")
-_members, _population_notes = prediction_members_in_force(_study)
+_study = (
+    _workspace_study
+    if _workspace_study is not None
+    else Study.at(CASE_DIR, case_study=CASE_STUDY_ID, entry_point="14_backtest")
+)
+_members, _population_notes = prediction_members_in_force(_study, CASE_DIR)
 for _note in _population_notes:
     print(_note)
 CURRENT_MEMBERS = _members
+# Kept for the refusal below, which has to name what scoped the read. `_population_notes`
+# reports gaps in coverage, not which populations are in force, and by the time the
+# baseline read comes back empty the only thing that explains it is the names.
+CURRENT_POPULATIONS = sorted(published_population_names_at(_study.root))
 if CURRENT_MEMBERS is not None:
     print(f"{len(CURRENT_MEMBERS):,} prediction sets in the populations in force")
 
@@ -253,6 +315,11 @@ pred_index = load_prediction_index(
     CASE_STUDY_ID,
     label=BACKTEST_LABEL,
     split=SPLIT,
+    # Without this the index resolves the case directory itself, which is the canonical one even
+    # when everything else in this notebook is reading a preview workspace: the query took no
+    # part in the activation that `open_study` performed. A preview then reports "No predictions
+    # found" while its own registry holds them - 247 of them on 2026-09-06.
+    case_dir=CASE_DIR,
 )
 if CURRENT_MEMBERS is not None:
     pred_index = pred_index.filter(pl.col("prediction_hash").is_in(CURRENT_MEMBERS))
@@ -323,6 +390,7 @@ def _planned_backtests(pred_row):
             CASE_STUDY_ID,
             bt_config,
             prices=prices,
+            traded_universe=TRADED_UNIVERSE,
             prediction_hash=pred_hash,
             initial_cash=bt_config.initial_cash,
             chapter="ch16",
@@ -404,34 +472,55 @@ SUPERSEDES_BASELINE_POPULATIONS: dict[str, str] = {}
 
 _plan = None
 try:
-    _writable = open_study(CASE_STUDY_ID, entry_point="14_backtest")
+    _writable = (
+        _workspace_study
+        if _workspace_study is not None
+        else open_study(CASE_STUDY_ID, entry_point="14_backtest")
+    )
 except PermissionError as exc:
     print(f"Not recording the baseline plan here: {exc}")
 else:
-    if _writable.root != CASE_DIR:
+    # `storage_root` is the registry this run writes, which is not always `root`: a preview's
+    # `root` stays the case directory while its writes go to `<workspace>/.preview/<case>`. A
+    # canonical run, with or without a workspace, writes its own root. Either way the guard
+    # compares it against the directory the sweep above read, so a run that reads one registry
+    # and records its plan in another is refused rather than recorded.
+    if _writable.storage_root(EXECUTION_TIER) != CASE_DIR:
         raise RuntimeError(
-            f"14 ran its sweep against {CASE_DIR} but opened a study rooted at {_writable.root}. "
+            f"14 ran its sweep against {CASE_DIR} but opened a study writing to {_writable.storage_root(EXECUTION_TIER)}. "
             "Recording the plan there would describe a registry this run did not write."
         )
-    _plan = OfficialPopulation.create(
-        _writable,
-        name=BASELINE_POPULATION,
-        member_kind="backtest",
-        members=[row["backtest_hash"] for row in planned],
-        supersedes=population_supersedes(
+    if EXECUTION_TIER != "canonical":
+        # `OfficialPopulation.create` calls `_refuse_preview_activation`, and rightly: a
+        # population is a durable claim about what this case study publishes, and a preview is
+        # discarded with its workspace. The sweep below still executes and still registers its
+        # backtests - what is skipped is the published name over them. `_plan` stays None, which
+        # the attestation below already tests for, because the same state arises when the study
+        # is not writable at all.
+        print(
+            f"{EXECUTION_TIER} tier: the sweep executes and registers, and publishes no "
+            f"official population under {BASELINE_POPULATION}."
+        )
+    else:
+        _plan = OfficialPopulation.create(
             _writable,
             name=BASELINE_POPULATION,
-            declared=SUPERSEDES_BASELINE_POPULATIONS.get(BASELINE_POPULATION),
-        ),
-    )
-    # Opened here, before a single member executes, so a run that dies part-way leaves an
-    # attempt with no attestation behind it and the freeze declines. See
-    # `sweep_attestation_name` for why the record is per attempt rather than per plan.
-    _attempt = open_sweep_attempt(_writable, _plan)
-    print(
-        f"Baseline plan {BASELINE_POPULATION}: {_plan.hash}, {len(planned)} planned, "
-        f"attempt {_attempt}"
-    )
+            member_kind="backtest",
+            members=[row["backtest_hash"] for row in planned],
+            supersedes=population_supersedes(
+                _writable,
+                name=BASELINE_POPULATION,
+                declared=SUPERSEDES_BASELINE_POPULATIONS.get(BASELINE_POPULATION),
+            ),
+        )
+        # Opened here, before a single member executes, so a run that dies part-way leaves an
+        # attempt with no attestation behind it and the freeze declines. See
+        # `sweep_attestation_name` for why the record is per attempt rather than per plan.
+        _attempt = open_sweep_attempt(_writable, _plan)
+        print(
+            f"Baseline plan {BASELINE_POPULATION}: {_plan.hash}, {len(planned)} planned, "
+            f"attempt {_attempt}"
+        )
 
 # %%
 t0 = time.time()
@@ -464,10 +553,7 @@ for pred_hash, group in planned_by_prediction:
             print(f"  [{processed}/{total_backtests}] {rate:.1f} bt/s | failed: {failed}")
 
 elapsed = time.time() - t0
-print(
-    f"\nSweep complete: {completed} run in {elapsed:.0f}s "
-    f"({failed} failed, {skipped} already complete)"
-)
+print(f"\nSweep complete in {elapsed:.0f}s: {reuse_disclosure(completed, skipped, failed)}")
 
 # A failure here stops the notebook rather than being counted and printed. `require_complete`
 # below cannot be relied on to catch one: a member that failed because its registered artifact
@@ -531,6 +617,26 @@ all_baselines = explorer.best(
     top_n=9999,
     prediction_hashes=sorted(CURRENT_MEMBERS) if CURRENT_MEMBERS is not None else None,
 )
+
+# An empty read here is a statement about the registry, not a result to summarise. The
+# division below is the first thing to touch it, so without this the failure arrives as
+# `ZeroDivisionError: division by zero` and reads like a defect in the analysis - which is
+# how ml4t/agent-workspace#1086 presented. The population is in force and its members are
+# registered; what none of them has is a backtest, and only the counts say so.
+if CURRENT_MEMBERS is not None and all_baselines.is_empty():
+    _signal_rows = explorer.specs("signal").height
+    raise RuntimeError(
+        f"The populations in force publish {len(CURRENT_MEMBERS):,} prediction sets and not "
+        f"one of them carries a signal backtest, so there is no baseline to rank. "
+        f"Populations: {', '.join(CURRENT_POPULATIONS) or '(none named)'}. "
+        f"The registry holds {_signal_rows:,} signal backtest(s), all against prediction "
+        f"sets outside the populations, so this is a population and a set of backtests "
+        f"describing different generations rather than an empty registry. A fixture "
+        f"generated through a stage earlier than the backtest stage produces exactly this: "
+        f"the model notebooks declare the population and nothing goes on to backtest its "
+        f"members (ml4t/agent-workspace#1086)."
+    )
+
 search_context = {
     "total": len(all_baselines),
     "median_sharpe": all_baselines["sharpe"].median(),
@@ -642,7 +748,11 @@ add_message_title(
     "Family medians sit close together; the maxima do not",
     "Median bars and maximum diamonds; eligible equal-weight baselines",
 )
-fig.show()
+show_with_alt(
+    fig,
+    "Horizontal bars of each model family's median validation Sharpe, with a marker for that "
+    "family's best single run.",
+)
 
 # %% [markdown]
 # The same evaluation surface shows why prediction and portfolio diagnostics
@@ -677,7 +787,11 @@ add_message_title(
     "IC explains only part of Sharpe dispersion",
     f"Spearman rho = {ic_sharpe_rho:.3f}; {len(all_baselines):,} eligible baselines",
 )
-fig.show()
+show_with_alt(
+    fig,
+    "Scatter of validation Sharpe against daily-pooled Spearman IC, one faint point per eligible "
+    "baseline, with the leading configuration drawn larger and labelled.",
+)
 
 # %% [markdown]
 # ### Selection-Adjusted Uncertainty
@@ -760,7 +874,11 @@ add_message_title(
     "Which family leaders clear zero on their own return path",
     "Best eligible equal-weight baseline per model family across five labels",
 )
-fig.show()
+show_with_alt(
+    fig,
+    "One row per family leader, each an annualized validation Sharpe point with its 95% "
+    "block-bootstrap interval drawn as a horizontal whisker.",
+)
 
 # %% [markdown]
 # ### Downstream Preview

@@ -16,6 +16,8 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Iterable
+from contextlib import closing
+from dataclasses import dataclass
 from pathlib import Path
 
 import polars as pl
@@ -136,6 +138,27 @@ def registry_path(case_study: str) -> Path:
     return _cs_dir(case_study) / case_study / "run_log" / "registry.db"
 
 
+# The columns :func:`load_model_ic` documents, carried by its empty result too. A query that
+# matches no rows is an ordinary state - a fresh preview workspace, a case study whose model
+# stages have not run - and a caller cannot tell it from a broken one by the shape it gets back.
+# What it can do is keep working: `frame["prediction_hash"]` and `frame.filter(...)` behave on a
+# schema-carrying empty frame and raise on a `pl.DataFrame()`, which has no columns at all. The
+# emptiness still reaches the caller; only the shape is fixed.
+MODEL_IC_SCHEMA: dict[str, pl.DataType] = {
+    "family": pl.String,
+    "config_name": pl.String,
+    "label": pl.String,
+    "split": pl.String,
+    "checkpoint_value": pl.Int64,
+    "prediction_hash": pl.String,
+    "ic_mean": pl.Float64,
+    "ic_std": pl.Float64,
+    "ic_n_days": pl.Float64,
+    "case_study": pl.String,
+    "coverage_enforced": pl.Boolean,
+}
+
+
 def _has_column(db_path: Path, table: str, column: str) -> bool:
     """Whether ``table`` in this registry carries ``column``.
 
@@ -143,8 +166,11 @@ def _has_column(db_path: Path, table: str, column: str) -> bool:
     depends on when it was last written and which task types it holds. Naming an absent column
     in a SELECT is a hard error, not a null.
     """
+    # `closing`, not a bare `with`: sqlite3.Connection's context manager commits or rolls back
+    # the transaction and leaves the connection open, so each call here leaked one and the
+    # interpreter reported "ResourceWarning: unclosed database" into the render.
     try:
-        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as db:
+        with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)) as db:
             return any(row[1] == column for row in db.execute(f"PRAGMA table_info({table})"))
     except sqlite3.Error:
         return False
@@ -252,7 +278,7 @@ def load_model_ic(
 
         # Registries predating the daily-uncertainty backfill have no
         # ``ic_mean_daily`` column at all, so probe before referencing it.
-        with sqlite3.connect(str(db_path)) as probe_con:
+        with closing(sqlite3.connect(str(db_path))) as probe_con:
             pm_cols = {row[1] for row in probe_con.execute("PRAGMA table_info(prediction_metrics)")}
         ic_expr = (
             "COALESCE(pm.ic_mean_daily, pm.ic_mean)" if "ic_mean_daily" in pm_cols else "pm.ic_mean"
@@ -267,7 +293,7 @@ def load_model_ic(
         # ran.
         coverage_usable = False
         if "ic_n_days" in pm_cols:
-            with sqlite3.connect(str(db_path)) as probe_con:
+            with closing(sqlite3.connect(str(db_path))) as probe_con:
                 coverage_usable = (
                     probe_con.execute(
                         "SELECT 1 FROM prediction_metrics WHERE ic_n_days IS NOT NULL LIMIT 1"
@@ -343,7 +369,7 @@ def load_model_ic(
             )
 
     if not frames:
-        return pl.DataFrame()
+        return pl.DataFrame(schema=MODEL_IC_SCHEMA)
     return pl.concat(frames, how="diagonal")
 
 
@@ -669,13 +695,25 @@ def extract_allocator(spec_json: str) -> str:
     return allocation.get("method", "unknown")
 
 
-# nasdaq100_microstructure deploys the cost-feasible *ensemble* carrier
-# (developed in 20.4). resolve_canonical_rank1_lineage returns the
-# non-deployed full-universe val-max gbm instead, so the ensemble's training
-# hash and validation backtest are pinned here. See agents
-# UNCERTAINTY_ARCHITECTURE / Ch20 audit.
-_NASDAQ_ENSEMBLE_TRAINING_HASH = "a9f04b886b9a"
-_NASDAQ_ENSEMBLE_VAL_HASH = "4e939dee0a5f"
+def is_unallocated(spec_json: str) -> bool:
+    """Whether a backtest did no allocation work, so its weights are the signal's own.
+
+    This is the equal-weight baseline, and it is recorded at the signal stage rather than as
+    an allocator. ``equal_weight`` left every case study's allocator menu on the ruling that
+    equal weight IS the baseline and listing it as an alternative re-runs the baseline as its
+    own competitor (``reference/CASE_STUDY_PIPELINE.md`` section 4), so a filter for an
+    ``equal_weight`` allocator matches nothing: measured 2026-09-18, all nine registries hold
+    zero such rows at ``stage='allocation'``.
+
+    Two spellings mean the same thing and both count. Signal-stage rows written today carry
+    ``signal.method = 'equal_weight_top_k'`` and no allocation block at all, and
+    ``extract_allocator`` reports those as ``"unknown"`` because it cannot tell an absent
+    block from an unrecognized one. Older rows - 30 of them in
+    ``nasdaq100_microstructure`` - spell the same strategy out as
+    ``allocation.method = 'equal_weight'``.
+    """
+    allocation = strategy_view(parse_backtest_spec(spec_json)).get("allocation") or {}
+    return allocation.get("method") in (None, "equal_weight")
 
 
 def _strategy_signature(spec_json: str) -> str:
@@ -691,22 +729,76 @@ def _strategy_signature(spec_json: str) -> str:
     return json.dumps([sv.get("signal"), sv.get("allocation")], sort_keys=True)
 
 
-def load_carrier_cost_curves(case_studies: list[str] | None = None) -> pl.DataFrame:
+@dataclass(frozen=True)
+class CarrierCostCurves:
+    """The cost curves a cross-study chart can draw, and why the rest are absent.
+
+    ``curves`` holds one tidy row per (case study, cost level). ``exclusions``
+    holds one row per case study that produced no curve, with the check that
+    dropped it in ``reason`` and the counts behind that check in ``detail``.
+
+    They are returned together because a cross-study chart that silently omits a
+    case study cannot be read: three case studies were absent from
+    ``20_strategy_synthesis/06_cost_survival`` for three different reasons, and
+    establishing which reason applied to which took a hand-written registry query
+    per case study. The loader already knows; it used to discard the answer.
+    """
+
+    curves: pl.DataFrame
+    exclusions: pl.DataFrame
+
+    def exclusion_lines(self) -> list[str]:
+        """One line per case study that drew no curve, ready to print or to raise with.
+
+        A caller that has no curves at all still has these, and they are the diagnosis: a
+        clean clone with no registries excludes every case study, and reporting only that
+        nothing was found hands the reader back the question the loader already answered.
+        """
+        return [
+            f"  no curve for {row['display_name']}: {row['reason']} - {row['detail']}"
+            for row in self.exclusions.iter_rows(named=True)
+        ]
+
+
+_EXCLUSION_SCHEMA = {
+    "case_study": pl.Utf8,
+    "display_name": pl.Utf8,
+    "reason": pl.Utf8,
+    "detail": pl.Utf8,
+}
+
+
+def load_carrier_cost_curves(case_studies: list[str] | None = None) -> CarrierCostCurves:
     """Cost-sensitivity curves for each case study's *deployed carrier*.
 
     The carrier is the highest-validation-Sharpe configuration across the
     signal, allocation, and risk-overlay stages, resolved via
-    ``resolve_canonical_rank1_lineage``. The cost sweep (Ch18) holds that
-    carrier's signal and allocation fixed while varying commission +
-    slippage, so the breakeven implied here is the carrier's own cost
-    survival — not that of whichever allocator happened to be best at zero
-    cost (which need not be the deployed strategy). Rows are matched to the
-    carrier's exact strategy signature, so a sibling series sharing the
-    training hash (e.g. a signal-only eq-weight run) is excluded.
+    ``resolve_canonical_rank1_lineage`` - for every case study, with no
+    exceptions. The cost sweep (Ch18) holds that carrier's signal and
+    allocation fixed while varying commission + slippage, so the breakeven
+    implied here is the carrier's own cost survival - not that of whichever
+    allocator happened to be best at zero cost (which need not be the deployed
+    strategy). Rows are matched to the carrier's exact strategy signature, so a
+    sibling series sharing the training hash (e.g. a signal-only eq-weight run)
+    is excluded.
 
-    Returns tidy rows ``[case_study, display_name, cadence, label,
-    allocator, cost_bps, sharpe, total_return, max_drawdown]`` on the
-    validation split, sorted by ``cost_bps`` within each case study.
+    ``nasdaq100_microstructure`` used to be special-cased onto two pasted
+    hashes, on the reading that its deployed carrier was a screened 12-gbm
+    mean-forecast ensemble the resolver could not name. Both halves lapsed. The
+    2026-09-05 registry reset replaced the lineage, leaving the training hash
+    matching zero rows; and the ``family == "ensemble"`` clause left this case
+    study's rung pin on 2026-09-14 (``paired_metrics.RUNG_PINS``), so the
+    carrier it ships is the one the resolver returns - ``gbm/default_multiclass``
+    on ``fwd_dir_15m``, which is what
+    ``nasdaq100_microstructure/20_strategy_analysis`` publishes and what the
+    single holdout was spent on. A pasted hash names a lineage rather than a
+    rule, so it dies at the next rebuild; the resolver is re-read every time.
+
+    Returns a :class:`CarrierCostCurves`. Its ``curves`` frame carries
+    ``[case_study, display_name, cadence, label, allocator, cost_bps, sharpe,
+    total_return, max_drawdown]`` on the validation split, sorted by
+    ``cost_bps`` within each case study; its ``exclusions`` frame says which
+    check dropped each case study that is not in it.
     """
     # Lazy import avoids a module-load cycle (strategy_analysis is heavier).
     from case_studies.utils.strategy_analysis import resolve_canonical_rank1_lineage
@@ -723,37 +815,56 @@ def load_carrier_cost_curves(case_studies: list[str] | None = None) -> pl.DataFr
     """
 
     frames = []
+    excluded: list[dict[str, str]] = []
+
+    def drop(cs_id: str, reason: str, detail: str) -> None:
+        excluded.append(
+            {
+                "case_study": cs_id,
+                "display_name": SHORT_NAMES.get(cs_id, cs_id),
+                "reason": reason,
+                "detail": detail,
+            }
+        )
+
     for cs_id in cs_list:
         db_path = registry_path(cs_id)
         if not db_path.exists():
+            drop(cs_id, "no registry", f"{db_path} does not exist")
             continue
 
         # Resolve the deployed carrier's training hash and its strategy spec.
-        if cs_id == "nasdaq100_microstructure":
-            training_hash = _NASDAQ_ENSEMBLE_TRAINING_HASH
-            spec_df = _query(
-                db_path,
-                "SELECT spec_json FROM backtest_runs WHERE backtest_hash LIKE ?",
-                (_NASDAQ_ENSEMBLE_VAL_HASH + "%",),
-            )
-        else:
-            try:
-                lin = resolve_canonical_rank1_lineage(cs_id)
-            except Exception:
-                continue
-            training_hash = lin.get("training_hash")
-            spec_df = _query(
-                db_path,
-                "SELECT spec_json FROM backtest_runs WHERE backtest_hash = ?",
-                (lin.get("val_backtest_hash"),),
-            )
+        try:
+            lin = resolve_canonical_rank1_lineage(cs_id)
+        except Exception as exc:
+            drop(cs_id, "carrier does not resolve", f"{type(exc).__name__}: {exc}")
+            continue
+        training_hash = lin.get("training_hash")
+        spec_df = _query(
+            db_path,
+            "SELECT spec_json FROM backtest_runs WHERE backtest_hash = ?",
+            (lin.get("val_backtest_hash"),),
+        )
         if not training_hash or spec_df.is_empty():
+            drop(
+                cs_id,
+                "carrier has no validation backtest row",
+                f"resolved val_backtest_hash={lin.get('val_backtest_hash')!r}, "
+                f"training_hash={training_hash!r}",
+            )
             continue
         carrier_sig = _strategy_signature(spec_df["spec_json"][0])
 
         df = _query(db_path, cost_sql, (training_hash,))
         if df.is_empty():
+            drop(
+                cs_id,
+                "no cost sweep on the carrier's lineage",
+                f"0 validation cost_sensitivity backtests on training_hash={training_hash}, "
+                f"carrier {lin.get('family')}/{lin.get('config_name')} on {lin.get('label')}",
+            )
             continue
+        swept = df.height
         df = df.with_columns(
             cost_bps=pl.col("spec_json").map_elements(extract_cost_bps, return_dtype=pl.Float64),
             allocator=pl.col("spec_json").map_elements(extract_allocator, return_dtype=pl.Utf8),
@@ -761,6 +872,13 @@ def load_carrier_cost_curves(case_studies: list[str] | None = None) -> pl.DataFr
             case_study=pl.lit(cs_id),
         ).filter(pl.col("signature") == carrier_sig)
         if df.is_empty():
+            drop(
+                cs_id,
+                "cost sweep is on a different strategy",
+                f"{swept} cost_sensitivity backtests on training_hash={training_hash}, "
+                f"none matching the carrier's strategy signature "
+                f"({_signature_method(carrier_sig)})",
+            )
             continue
         frames.append(
             df.select(
@@ -774,8 +892,9 @@ def load_carrier_cost_curves(case_studies: list[str] | None = None) -> pl.DataFr
             )
         )
 
+    exclusions = pl.DataFrame(excluded, schema=_EXCLUSION_SCHEMA)
     if not frames:
-        return pl.DataFrame()
+        return CarrierCostCurves(pl.DataFrame(), exclusions)
 
     result = pl.concat(frames, how="diagonal_relaxed")
     # A signature-matched carrier should be one row per cost level, but guard
@@ -784,11 +903,20 @@ def load_carrier_cost_curves(case_studies: list[str] | None = None) -> pl.DataFr
         subset=["case_study", "cost_bps"], keep="last", maintain_order=True
     )
     name_df = pl.DataFrame([{"case_study": k, "display_name": v} for k, v in SHORT_NAMES.items()])
-    return (
+    curves = (
         result.join(name_df, on="case_study", how="left")
         .with_columns(cadence=pl.col("case_study").replace(CADENCE_MAP))
         .sort("case_study", "cost_bps")
     )
+    return CarrierCostCurves(curves, exclusions)
+
+
+def _signature_method(signature: str) -> str:
+    """The trading scheme a strategy signature names, for a one-line drop reason."""
+    signal, allocation = json.loads(signature)
+    method = (signal or {}).get("method") or "unknown"
+    allocator = (allocation or {}).get("method")
+    return f"{method} + {allocator}" if allocator else method
 
 
 # Deprecated private aliases. Thirty notebook cells import these names with their leading

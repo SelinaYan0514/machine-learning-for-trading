@@ -44,11 +44,10 @@ def rekey_holdout_spec(
 
     The hook was necessary and not sufficient. Underneath it the deriver and the producer
     disagreed about the holdout's training interval - ``build_holdout_cv`` asked for
-    2017-01-05..2020-12-16 while stage 04's fold 2 begins 2019-01-02, leaving 495 of 977 training
-    dates covered - and this refused rather than fit on half-null features.
+    2017-01-05..2020-12-16 while the stage-04 fold covering it begins 2019-01-02, leaving 495
+    of 977 training dates covered - and this refused rather than fit on half-null features.
     :func:`holdout_training_floor` below resolves that by bounding the derived window at the
-    artifact's own start, so the refusal now fires only for a real gap. ml4t/agent-workspace#977
-    has the measurement.
+    artifact's own start, so the refusal now fires only for a real gap.
 
     ``validation_spec`` is unused here. The linear hook needs it to replay a data-derived penalty
     against a recorded fold before trusting the preset; latent-factor models resolve no parameter
@@ -108,6 +107,7 @@ def _require_holdout_temporal_features(case: Any, split: dict[str, Any]) -> None
         split,
         case.temporal_by_fold,
         source_timeline=case.dataset.get_column(case.date_col),
+        declared_folds=case.temporal_artifact_splits,
         date_col=case.date_col,
     )
 

@@ -33,7 +33,6 @@ import json
 import logging
 import sqlite3
 import time
-from collections.abc import Iterable
 from pathlib import Path
 
 import numpy as np
@@ -48,6 +47,8 @@ from case_studies.utils.registry.store import _case_dir, _utc_now
 from case_studies.utils.uncertainty import (
     STAGE_BASELINE,
     STAGE_SEQUENCE,
+    EntireRegistry,
+    PredictionScope,
     compute_cohort_metrics,
     load_daily_returns_with_timestamp,
     periods_per_year_from_setup,
@@ -241,8 +242,8 @@ def _list_label_cohorts(
 ) -> list[tuple[str, list[str]]]:
     # Exclude cost_sensitivity: those rows are perturbation analyses on a
     # fixed strategy spec, not alternative strategies. They must not inflate
-    # the selection-bias K — see 20_strategy_synthesis/holdout.py
-    # ``HOLDOUT_SELECTION_STAGES`` for the matching rank-1 rule.
+    # the selection-bias K - see ``strategy_analysis.SELECTION_STAGES`` for the
+    # matching rank-1 rule.
     # Restricted to validation split per ``_list_family_cohorts``.
     extra = f" AND {_UNIVERSE_FILTER_CLAUSE}" if universe_filter else ""
     params = (universe_filter,) if universe_filter else ()
@@ -359,7 +360,7 @@ def compute_and_register(
     universe_filter: str | None = None,
     verbose: bool = True,
     case_dir: Path | None = None,
-    prediction_hashes: Iterable[str] | None = None,
+    prediction_hashes: PredictionScope,
 ) -> dict[str, int]:
     """Compute all cohorts for ``cs`` and persist them to ``cohort_metrics``.
 
@@ -373,14 +374,20 @@ def compute_and_register(
     "dangling_pruned": 0}``.
 
     ``prediction_hashes`` restricts every cohort to that population, so a caller reporting
-    a live population gets corrections computed over it rather than over the whole registry.
+    a live population gets corrections computed over it rather than over the whole registry;
+    ``ENTIRE_REGISTRY`` asks for the whole-registry read.
+
+    It carries no default. K is the trial count the deflated Sharpe below it is adjusted
+    for, so this argument decides what a published number covers, and a default of the
+    widest reading meant omitting it type-checked, ran and produced a plausible K over
+    generations the caller does not report. See ``uncertainty.ENTIRE_REGISTRY``.
     """
     db_path = (case_dir / "run_log" / "registry.db") if case_dir else _registry_db(cs)
     if not db_path.exists():
         logger.warning("no registry for %s", cs)
         return {"family": 0, "stagelabel": 0, "label": 0, "errors": 0, "dangling_pruned": 0}
 
-    live = list(prediction_hashes) if prediction_hashes is not None else None
+    live = None if isinstance(prediction_hashes, EntireRegistry) else list(prediction_hashes)
     counts = {"family": 0, "stagelabel": 0, "label": 0, "errors": 0}
     ppy = periods_per_year_from_setup(cs)
     cohort_rows: list[dict] = []

@@ -17,22 +17,85 @@ and asserting the results are identical.
 
 from __future__ import annotations
 
+import os
+from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, NamedTuple
+
 import numpy as np
+import polars as pl
 from hmmlearn.hmm import GaussianHMM
+from scipy.signal import lfilter
 from sklearn.cluster import KMeans
 from threadpoolctl import threadpool_limits
 
+from case_studies.utils.artifact_digest import write_artifact
+
 __all__ = [
+    "HmmFit",
+    "LiftedStream",
+    "arima_one_step_forecast",
+    "chain_worker_pool",
     "filtered_state_probs",
     "fit_hmm_kmeans_init",
+    "fit_hmm_restarts",
+    "fit_wasserstein_kmeans",
+    "fold_feature_geometry",
+    "garch11_conditional_volatility",
+    "lift_stream",
+    "refit_boundaries",
     "relabel_states",
     "sort_states_by_mean",
     "sort_states_by_variance",
+    "walk_forward_feature",
+    "wasserstein_barycenter_1d",
+    "wasserstein_distance_1d",
+    "write_model_based",
 ]
 
 # Guards the log of a zero transition or start probability. Small enough not to move a
 # fitted probability, large enough that log() stays finite.
 _LOG_FLOOR = 1e-300
+
+
+@contextmanager
+def chain_worker_pool(n_threads: int):
+    """Size the BLAS and OpenMP pools of sampler chain workers, leaving this process alone.
+
+    ``pm.sample(cores=...)`` runs each chain in its own process, started through
+    multiprocessing's forkserver. Those children are fresh interpreters: they import numpy
+    and scipy themselves, so they size their pools from these variables at import. Setting
+    the variables is the only thing that reaches them - ``threadpoolctl`` reconfigures pools
+    already loaded in the calling interpreter, and the workers are not in it. Measured on an
+    sp500_options SV fit, peak threads across the process tree: 113 with nothing set, 115
+    with ``threadpool_limits`` around the sampler, 41 with this.
+
+    The forkserver starts at the first parallel sample, which is why the variables have to be
+    set before it and why restoring them afterwards is safe: by then it exists, and later
+    samples reuse it. This process's own pools are untouched, so whatever else the notebook
+    fits keeps the threading it had.
+
+    The pool size does not change the draws. Same data and seed at 2,000 draws, 2,000 tune
+    and 4 chains, every variant above returns a ``sigma_eta`` array equal bit for bit, so this
+    is a runtime setting and stays out of any identity. Contrast ``DML_THREAD_LIMIT`` in
+    ``case_studies/utils/causal.py``, which is recorded in the resolved specification because
+    there the reduction order does move the estimate.
+    """
+    if n_threads < 1:
+        raise ValueError("chain_worker_pool needs at least one thread per worker")
+    names = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS")
+    previous = {name: os.environ.get(name) for name in names}
+    os.environ.update(dict.fromkeys(names, str(n_threads)))
+    try:
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 def filtered_state_probs(model: GaussianHMM, X: np.ndarray) -> np.ndarray:
@@ -89,6 +152,189 @@ def filtered_state_probs(model: GaussianHMM, X: np.ndarray) -> np.ndarray:
     return np.exp(fwdlattice - log_normalizer)
 
 
+def garch11_conditional_volatility(
+    returns: np.ndarray,
+    *,
+    mu: float,
+    omega: float,
+    alpha: float,
+    beta: float,
+    backcast: float,
+    gamma: float = 0.0,
+    bounds: tuple[float, float] | None = None,
+) -> np.ndarray:
+    r"""GARCH(1,1) or GJR-GARCH(1,1,1) conditional standard deviation, computed so a value
+    cannot move later.
+
+    :math:`\sigma^2_t = \omega + (\alpha + \gamma \mathbb{1}[\epsilon_{t-1} < 0])
+    \epsilon_{t-1}^2 + \beta \sigma^2_{t-1}`, with :math:`\epsilon_t = r_t - \mu`. One value
+    per input observation, in the units of *returns*. ``gamma=0`` is the symmetric model; the
+    asymmetry term is what ``arch`` fits under ``o=1``, and three of the four case studies that
+    fit a volatility model here fit it.
+
+    **Why this exists rather than ``arch_model(...).fix(params)``.** Under a walk-forward refit
+    schedule the recursion is run over a prefix of the series that ends at the end of the block
+    being emitted, and only the block's own rows are kept. That is causal only if a value at
+    :math:`t` is a function of observations up to :math:`t` and of nothing else in the array it
+    was handed. ``arch``'s result object is not, and the reason is one line of ``ARCHModel.fix``:
+
+    .. code-block:: python
+
+        resids = self.resids(self.starting_values())   # NOT the parameters you fixed
+        backcast = v.backcast(resids)
+        var_bounds = v.variance_bounds(resids)
+
+    The seed and the bounds are derived from residuals taken at the **estimated** mean of
+    whatever array was handed in, so under ``mean="Constant"`` extending the sample moves that
+    mean, moves the backcast, and moves every value the seed still reaches. Read against
+    ``arch==8.0.0``; measured here on 2,000 observations with a variance break, one fixed
+    parameter vector, prefix of 1,500 against the full sample:
+
+    ================================  ==========================================================
+    ``mean="Constant"``               sample mean 0.03496 -> 0.03007, backcast 0.57714 ->
+                                      0.57637. **128 of the 1,500 shared rows move**, by up to
+                                      0.064%, largest at the start and decaying to zero.
+    ``mean="Zero"``                   nothing is estimated, so the residuals are the returns and
+                                      the seed does not move: **bit-identical**.
+    ================================  ==========================================================
+
+    ``mean="Zero"`` is not therefore safe. ``variance_bounds`` clamps every row with two
+    whole-sample quantities - ``np.var(resids) / 1e8`` below and ``1e7 * (1 + max(resids**2))``
+    above - and those move whatever the mean specification is. They are six orders of magnitude
+    apart, so they change an emitted value only when the variance actually reaches one, which is
+    what a degenerate fit does. With :math:`\omega=10^{-8}, \alpha=0.02, \gamma=-0.30,
+    \beta=0.90` - a shape ``arch`` returns without complaint, where a down day *reduces* the
+    variance - the recursion sits on the lower clamp and **1,498 of the 1,500 shared rows move,
+    by up to 64%**, because a shock 500 observations later raised ``np.var(resids)`` and with it
+    the clamp under every earlier row.
+
+    So the dependence on the future is unconditional under an estimated mean, and under a zero
+    mean it opens exactly on the fits that were also being silently clipped. This function takes
+    the seed and the bounds from the caller instead, and raises on the degenerate case rather
+    than emitting a clipped number for it.
+
+    **Every argument must come from before the block.** *backcast* seeds the recursion as
+    :math:`\omega + (\alpha + \gamma/2 + \beta) \cdot \mathrm{backcast}`, where the halved
+    :math:`\gamma` is the asymmetry's contribution under symmetric shocks; pass the mean squared
+    residual of the estimation window, or ``arch``'s own
+    ``result.model.volatility.backcast(training_residuals)``. *bounds*, when given, clips
+    :math:`\sigma^2` at every step as ``arch`` does internally; derive it from
+    ``result.model.volatility.variance_bounds`` over the training residuals. Neither is checked
+    here, because the array handed in reaches the end of the block and nothing computed from it
+    could tell a legitimate seed from one that read the block's own rows.
+
+    **Why there is no parameter-implied seed.** :math:`\omega/(1-\alpha-\gamma/2-\beta)` is
+    the long-run variance the coefficients imply, is a function of no observation at all, and was
+    the seed here until it was measured. Fitting GJR-GARCH on 25 sampled
+    ``sp500_equity_option_analytics`` securities broke it twice, in ways a single guard does not
+    cover. Two fits came out integrated at persistence 1.0000, where the ratio is infinite, any
+    clamp makes it :math:`\omega \times 10^6`, and :math:`\beta=1` means the seed's influence
+    never decays - 56x errors at emitted rows. A third was numerically stationary at persistence
+    0.9953 but had :math:`\omega = 1.6 \times 10^{-8}`, so the implied seed was
+    :math:`3.4 \times 10^{-6}` against a data-supported 2.283, and the recursion reached negative
+    variance 495 observations in. The second case is invisible to any threshold on persistence.
+    A seed bounded by the estimation window cannot do either, whatever the optimizer returns.
+
+    Without *bounds* the recurrence is linear in :math:`\sigma^2` and is evaluated with
+    ``scipy.signal.lfilter`` rather than a Python loop: this runs once per block per entity, tens
+    of thousands of times per notebook, over series of thousands of observations. Clipping makes
+    it nonlinear, so *bounds* costs a Python loop.
+
+    :raises ValueError: if the recursion leaves the positive reals. ``arch`` will return
+        :math:`\alpha + \gamma < 0`, a negative shock coefficient on down days, without
+        complaint; the variance then falls through zero and ``sqrt`` yields ``nan``. A ``nan`` is
+        not a feature value and must not reach an artifact. Passing *bounds* prevents it.
+    """
+    resid = np.asarray(returns, dtype=float) - mu
+    if resid.size == 0:
+        return np.empty(0, dtype=float)
+
+    persistence = alpha + 0.5 * gamma + beta
+    driver = np.empty(resid.size, dtype=float)
+    driver[0] = omega + persistence * float(backcast)
+    driver[1:] = omega + (alpha + gamma * (resid[:-1] < 0.0)) * resid[:-1] ** 2
+
+    if bounds is None:
+        # y[0] = driver[0]; y[t] = driver[t] + beta * y[t-1] - the recursion above, in C. The
+        # sign indicator is already in the driver, so the recursion in sigma^2 is still linear
+        # with constant coefficients.
+        variance = lfilter([1.0], [1.0, -beta], driver)
+        if not np.all(np.isfinite(variance)) or np.any(variance <= 0.0):
+            first = int(np.argmax(~(np.isfinite(variance) & (variance > 0.0))))
+            raise ValueError(
+                f"the variance recursion left the positive reals at observation {first} of "
+                f"{variance.size}: alpha + gamma is {alpha + gamma:.6g}, so a negative return "
+                "reduces the variance rather than raising it. Pass bounds= to clip, or reject "
+                "the fit."
+            )
+    else:
+        low, high = float(bounds[0]), float(bounds[1])
+        variance = np.empty(resid.size, dtype=float)
+        variance[0] = min(max(driver[0], low), high)
+        for t in range(1, resid.size):
+            variance[t] = min(max(driver[t] + beta * variance[t - 1], low), high)
+
+    return np.sqrt(variance)
+
+
+def arima_one_step_forecast(fitted: Any, y_prefix: np.ndarray) -> np.ndarray:
+    """One-step-ahead forecasts across *y_prefix*, under parameters fitted on an earlier block.
+
+    The ARIMA counterpart of :func:`garch11_conditional_volatility`, and it exists for the
+    opposite reason. ``arch`` offers no way to filter a series under fixed parameters without
+    re-deriving its backcast and its variance bounds from whatever array it is handed, so that
+    recursion had to be written out above. ``statsmodels`` does offer one:
+    ``ARIMAResults.apply(endog, refit=False)`` re-runs the Kalman filter over new data with the
+    coefficients left where the fit put them. What is shared here is therefore the correct call
+    and the check that it stayed correct, not a reimplementation of the filter.
+
+    Two neighbouring calls are wrong in ways that no assertion over the output frame can see.
+    ``apply(endog, refit=True)`` re-estimates on the array it is given, which in a walk-forward
+    feature means every emitted value was fitted on the block it is emitted over. ``forecast(h)``
+    continues past the end of the data instead of filtering across it, so it returns *h* values
+    for an *n*-row prefix and lines up with nothing. In the locked ``statsmodels`` 0.14.6 the
+    default is ``refit=False``, which is the safe one - this paragraph previously said the
+    opposite, and the reason it matters is the next one, not the default.
+
+    The parameter comparison is not decoration. ``refit=False`` is a keyword whose name is the
+    only thing asserting the behaviour, and a default that changed upstream would otherwise
+    surface as a feature that quietly began reading its own emission window. Comparing the two
+    vectors element by element costs nothing next to the fit and fails loudly instead.
+
+    Parameters
+    ----------
+    fitted
+        A fitted ``ARIMAResults``, estimated on training rows only - inside the closure
+        :func:`walk_forward_feature` calls, it sees exactly those.
+    y_prefix
+        The series to filter across, shape ``(n,)`` or ``(n, 1)``, in time order and beginning
+        where the fitted series began.
+
+    Returns ``(n,)`` one-step-ahead predictions, one per row of *y_prefix*.
+
+    :raises ValueError: if *y_prefix* carries more than one column, or if the parameters moved.
+    """
+    y = np.asarray(y_prefix, dtype=float)
+    if y.ndim == 2:
+        if y.shape[1] != 1:
+            raise ValueError(
+                f"y_prefix carries {y.shape[1]} columns; an ARIMA filter reads one series. "
+                "Select the column before calling."
+            )
+        y = y[:, 0]
+    elif y.ndim != 1:
+        raise ValueError(f"y_prefix must be one- or two-dimensional, got shape {y.shape}")
+
+    extended = fitted.apply(y, refit=False)
+    drift = float(np.abs(np.asarray(fitted.params) - np.asarray(extended.params)).max())
+    if drift != 0.0:
+        raise ValueError(
+            f"apply(refit=False) re-estimated the model: parameters moved by {drift:.3e}. "
+            "Every value this emits would be fitted on the block it is emitted over."
+        )
+    return np.asarray(extended.predict(start=0, end=len(y) - 1), dtype=float)
+
+
 def sort_states_by_variance(model: GaussianHMM) -> np.ndarray:
     """State indices ordered by fitted variance, ascending, so state 0 is the calm one.
 
@@ -139,6 +385,7 @@ def fit_hmm_kmeans_init(
     n_states: int = 2,
     random_state: int = 42,
     n_iter: int = 200,
+    tol: float = 1e-2,
 ) -> GaussianHMM:
     """Fit a ``GaussianHMM`` whose emissions start from a k-means partition of *X*.
 
@@ -176,6 +423,12 @@ def fit_hmm_kmeans_init(
         Seed passed to both ``KMeans`` and the ``GaussianHMM``.
     n_iter
         EM iteration cap.
+    tol
+        Convergence threshold on the per-sample log-likelihood gain. The default is
+        ``hmmlearn``'s own, kept so that callers predating this parameter are unaffected;
+        ``crypto_perps_funding`` and ``fx_pairs`` declare ``1e-4`` in their own configs.
+        Whether the looser default under-converges the case studies that take it is
+        measured separately - it is a property of the data, not of this function.
     """
     with threadpool_limits(1):
         kmeans = KMeans(n_clusters=n_states, random_state=random_state, n_init=10)
@@ -187,6 +440,7 @@ def fit_hmm_kmeans_init(
             n_iter=n_iter,
             random_state=random_state,
             init_params="st",
+            tol=tol,
         )
         model.means_ = kmeans.cluster_centers_
         ridge = np.eye(X.shape[1]) * 1e-6
@@ -196,6 +450,96 @@ def fit_hmm_kmeans_init(
         )
         model.fit(X)
     return model
+
+
+class HmmFit(NamedTuple):
+    """The chosen fit and what the search around it cost.
+
+    ``n_rejected`` and ``n_failed`` are separate because they mean different things: a
+    rejected restart converged and was discarded for going downhill on its last step, a
+    failed one raised. A block where every restart failed and a block where every restart
+    was rejected both leave nothing to emit, and a diagnostics table that reports one
+    number cannot say which happened.
+    """
+
+    model: GaussianHMM
+    log_likelihood: float
+    n_rejected: int
+    n_failed: int
+
+
+def fit_hmm_restarts(
+    X: np.ndarray,
+    *,
+    n_states: int = 2,
+    random_state: int = 42,
+    n_iter: int = 200,
+    tol: float = 1e-2,
+    n_restarts: int = 1,
+    reject_unstable_rel_tol: float | None = None,
+) -> HmmFit:
+    """Fit :func:`fit_hmm_kmeans_init` from several starts and keep the best.
+
+    EM converges to a local optimum, so which one it reaches depends on where it began.
+    Three of the four case studies fitting an HMM answered that by looping over seeds and
+    keeping the highest training likelihood, and each wrote the loop again: ``etfs`` around
+    this module's own primitive, ``crypto_perps_funding`` and ``fx_pairs`` around a
+    ``GaussianHMM`` of their own. This is that loop, once.
+
+    Restart *i* fits at ``random_state + i``, and the seed moves the k-means partition as
+    well as the model. Varying only the model's seed would leave every restart starting
+    from the same partition, which is most of what the starting point is - the restarts
+    would cost N times as much and explore almost nothing.
+
+    ``n_restarts=1`` is a single fit at ``random_state``, which is what the primitive does
+    on its own, so a caller that has not asked for restarts gets exactly the fit it got
+    before this function existed.
+
+    ``reject_unstable_rel_tol`` discards a restart whose final EM step *lowered* the
+    likelihood, comparing the last step against ``-tol * max(|previous|, 1)``. The
+    threshold is relative because these log-likelihoods run to five figures, where an
+    absolute threshold in nats rejects ordinary floating-point chatter at the optimum and
+    so discards every restart. It is ``None`` by default: a downhill final step is a failed
+    fit and rejecting it is the better rule, but turning it on changes what ``etfs`` and
+    ``cme_futures`` select, and that is a change to measure on its own rather than one to
+    deliver underneath a restart parameter.
+
+    :raises RuntimeError: when no restart survives, naming how many failed and how many
+        were rejected, because those call for different fixes.
+    """
+    if n_restarts < 1:
+        raise ValueError(f"n_restarts must be at least 1, got {n_restarts}")
+    best: GaussianHMM | None = None
+    best_ll = -np.inf
+    n_rejected = n_failed = 0
+    for offset in range(n_restarts):
+        try:
+            candidate = fit_hmm_kmeans_init(
+                X,
+                n_states=n_states,
+                random_state=random_state + offset,
+                n_iter=n_iter,
+                tol=tol,
+            )
+            score = float(candidate.score(X))
+        except Exception:
+            n_failed += 1
+            continue
+        if reject_unstable_rel_tol is not None:
+            history = list(candidate.monitor_.history)
+            if len(history) >= 2:
+                scale = max(abs(history[-2]), 1.0)
+                if history[-1] - history[-2] < -reject_unstable_rel_tol * scale:
+                    n_rejected += 1
+                    continue
+        if np.isfinite(score) and score > best_ll:
+            best, best_ll = candidate, score
+    if best is None:
+        raise RuntimeError(
+            f"no starting point survived on {len(X):,} observations: "
+            f"{n_failed} raised, {n_rejected} went downhill on their final step"
+        )
+    return HmmFit(best, best_ll, n_rejected, n_failed)
 
 
 def _cluster_covariance(cluster: np.ndarray, pooled: np.ndarray) -> np.ndarray:
@@ -210,3 +554,543 @@ def _cluster_covariance(cluster: np.ndarray, pooled: np.ndarray) -> np.ndarray:
     if cluster.shape[0] < 2:
         return pooled.copy()
     return np.atleast_2d(np.cov(cluster.T))
+
+
+@dataclass(frozen=True)
+class LiftedStream:
+    """Overlapping windows of a return series, each held both raw and sorted.
+
+    A distribution-based regime estimator does not read a return series point by point; it
+    reads a window of it as an empirical measure. Lifting is that reshaping, done once:
+    ``segments`` holds the windows in time order and ``sorted_segments`` holds each window's
+    values ascending, which is the form every 1D optimal-transport quantity below takes.
+    Sorting once here rather than inside the distance is most of what makes the k-means
+    affordable, since each window is re-scored against every centroid on every iteration.
+    """
+
+    segments: np.ndarray  # (n_segments, window_len)
+    sorted_segments: np.ndarray  # Each row of `segments`, ascending
+    starts: np.ndarray  # Index into the input series where each window opens
+    window_len: int
+    step: int
+
+
+def lift_stream(returns: np.ndarray, window_len: int, overlap: int) -> LiftedStream:
+    """Lift a 1D return stream into overlapping windows of ``window_len``.
+
+    Consecutive windows advance by ``window_len - overlap``, so ``overlap`` is how many
+    sessions two neighbouring windows share. A trailing partial window is dropped rather
+    than padded: a short window is a different measure, not a shorter view of the same one.
+    """
+    step = window_len - overlap
+    windows_view = np.lib.stride_tricks.sliding_window_view(returns, window_shape=window_len)
+    windows_view = windows_view[::step]
+    segments = np.ascontiguousarray(windows_view, dtype=np.float64)
+    sorted_segments = np.sort(segments, axis=1)
+    starts = np.arange(0, segments.shape[0] * step, step, dtype=np.int64)
+
+    return LiftedStream(
+        segments=segments,
+        sorted_segments=sorted_segments,
+        starts=starts,
+        window_len=window_len,
+        step=step,
+    )
+
+
+def wasserstein_distance_1d(
+    sorted_a: np.ndarray, sorted_b: np.ndarray, p: float = 1.0
+) -> np.ndarray:
+    """1D p-Wasserstein distance between equal-weight empirical measures.
+
+    Two equal-sized samples in one dimension are matched by rank - the smallest of one to
+    the smallest of the other, and so on up - so the transport cost is a mean over the
+    sorted arrays and needs no optimizer. Both arguments must already be sorted ascending;
+    that is what :class:`LiftedStream` stores.
+
+    Reduces over the last axis and broadcasts over the rest, so a stack of sorted windows
+    against one sorted centroid returns one distance per window.
+    """
+    return (np.abs(sorted_a - sorted_b) ** p).mean(axis=-1) ** (1.0 / p)
+
+
+def wasserstein_barycenter_1d(sorted_members: np.ndarray, p: float = 1.0) -> np.ndarray:
+    """Wasserstein barycenter of sorted 1D measures: median at ``p=1``, mean at ``p=2``.
+
+    Taken rank by rank, which is what makes the result a distribution rather than an
+    average of numbers: the barycenter's smallest atom is the median of the members'
+    smallest atoms.
+    """
+    if p == 1.0:
+        return np.median(sorted_members, axis=0).astype(np.float64)
+    return sorted_members.mean(axis=0).astype(np.float64)
+
+
+def _wasserstein_assignments(
+    sorted_segments: np.ndarray, centroids: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Distance from every segment to every centroid, and each segment's nearest."""
+    dists = np.stack(
+        [
+            wasserstein_distance_1d(sorted_segments, centroids[k][None, :])
+            for k in range(centroids.shape[0])
+        ],
+        axis=1,
+    )
+    return dists, dists.argmin(axis=1)
+
+
+def fit_wasserstein_kmeans(
+    sorted_segments: np.ndarray,
+    n_clusters: int = 2,
+    max_iter: int = 50,
+    n_init: int = 5,
+    random_state: int = 42,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fit k-means on sorted 1D segments under the Wasserstein distance.
+
+    Ordinary Lloyd's algorithm with the two Euclidean quantities replaced by their
+    optimal-transport counterparts: :func:`wasserstein_distance_1d` for the assignment step
+    and :func:`wasserstein_barycenter_1d` for the update. A cluster is therefore a
+    distribution that the windows assigned to it are close to *as distributions*, which is
+    what separates a calm month from a turbulent one when both may have the same mean.
+
+    An empty cluster keeps its previous centroid rather than being re-seeded, so a restart
+    that collapses to fewer than ``n_clusters`` occupied clusters stays reproducible instead
+    of consuming draws from ``rng``.
+
+    Restarts are scored by inertia - the summed distance from each segment to the centroid
+    it was assigned - and the lowest wins. The distances that score a restart are computed
+    against the centroids that restart returns. That is not a restatement of the loop: the
+    scoring used to reuse the last assignment pass, which runs *before* the final centroid
+    update, so a restart that exhausted ``max_iter`` was scored against centroids one update
+    older than the ones it returned, and the wrong restart could win. A restart that
+    converges is unaffected, because the update it broke on moved the centroids by less than
+    ``atol``.
+
+    Returns
+    -------
+    tuple of ndarray
+        The labels and centroids of the lowest-inertia restart. Centroids come back in
+        whatever order the winning restart produced; a caller emitting a feature named for
+        one of them has to impose an order, the way ``sort_states_by_*`` does for an HMM.
+    """
+    rng = np.random.default_rng(random_state)
+    n_samples = sorted_segments.shape[0]
+    best_labels = None
+    best_centroids = None
+    best_inertia = float("inf")
+
+    for _ in range(n_init):
+        idx = rng.choice(n_samples, size=n_clusters, replace=False)
+        centroids = sorted_segments[idx].copy()
+
+        for _ in range(max_iter):
+            _, labels = _wasserstein_assignments(sorted_segments, centroids)
+
+            new_centroids = np.zeros_like(centroids)
+            for k in range(n_clusters):
+                members = sorted_segments[labels == k]
+                if len(members) > 0:
+                    new_centroids[k] = wasserstein_barycenter_1d(members, p=1.0)
+                else:
+                    new_centroids[k] = centroids[k]
+
+            if np.allclose(centroids, new_centroids, atol=1e-6):
+                break
+            centroids = new_centroids
+
+        dists, labels = _wasserstein_assignments(sorted_segments, centroids)
+        inertia = float(dists[np.arange(n_samples), labels].sum())
+        if inertia < best_inertia:
+            best_inertia = inertia
+            best_labels = labels
+            best_centroids = centroids
+
+    return best_labels, best_centroids
+
+
+def fold_feature_geometry(
+    frame: pl.DataFrame,
+    *,
+    feature_columns: Sequence[str],
+    time_column: str,
+    fold_column: str | None = "fold",
+) -> list[dict]:
+    """Per fold and feature, where the values actually start and stop.
+
+    Returns one record per (fold, feature) with the first and last timestamp carrying a
+    non-null value and the null count. This is descriptive, not a check: a fitted feature
+    legitimately begins after its estimation window, so a leading gap is only a defect
+    relative to the other features and labels on the same fold, which this frame cannot
+    see on its own.
+
+    It exists because that comparison was impossible after the fact. A model-based feature
+    that started late left no trace in the artifact, the registry or any metric:
+    ``sequence_dataset`` turns a null feature into ``0.0``, which after normalization is the
+    feature's mean, so the affected rows were fitted as average observations and nothing
+    raised. Recording the geometry at write time is what lets a later stage compare a
+    variant's start against the primary's instead of discovering it by hand.
+    """
+    records: list[dict] = []
+    # A fold-free artifact carries one estimation schedule for the whole panel, so its
+    # geometry is one record per feature with ``fold`` reported as None. The rest of the
+    # record means exactly what it means per fold.
+    parts: list[tuple[int | None, pl.DataFrame]] = (
+        [(None, frame)]
+        if fold_column is None
+        else [
+            (fold_id, part)
+            for (fold_id,), part in frame.group_by([fold_column], maintain_order=True)
+        ]
+    )
+    for fold_id, part in parts:
+        for col in feature_columns:
+            present = part.filter(pl.col(col).is_not_null())
+            records.append(
+                {
+                    "fold": fold_id,
+                    "feature": col,
+                    "n_rows": part.height,
+                    "n_null": part.height - present.height,
+                    "first_valid": None if present.is_empty() else present[time_column].min(),
+                    "last_valid": None if present.is_empty() else present[time_column].max(),
+                }
+            )
+    return records
+
+
+def _require_declared_fold_geometry(
+    frame: pl.DataFrame,
+    *,
+    fold_column: str,
+    metadata: Mapping[str, Any] | None,
+) -> None:
+    """A fold-scoped artifact must state the window each of its folds was fitted over.
+
+    The frame says which fold ids exist and never says what bounded them, and no consumer can
+    recover the boundaries from the values. `temporal_artifact_fold_boundaries` falls back to
+    `generate_cv_splits`, which returns the cross-validation folds and nothing else - so a fold
+    the producer appended beyond the rolling set is invisible to every consumer, and the window
+    its estimator was fitted over is not recorded anywhere.
+
+    That is not hypothetical. `us_equities_panel`'s stage-04 artifact carries folds 0..16 while
+    its resolved geometry declares 0..15; fold 16 holds 9,978,112 rows spanning 1990-01-30 to
+    2018-03-27, which is the holdout, and nothing states the boundary it was estimated under.
+    `require_fold_scoped_temporal_holdout_coverage` therefore accepts it on trust.
+
+    Refusing here is what makes the gap closable without a regeneration: no stage-04 producer
+    in the repository currently writes a fold column, so this costs nothing today and binds the
+    moment one does - which is when the appended fold would otherwise arrive undeclared again.
+    The declaration is validated under the same rule the consumer reads it back with, so a bad
+    one fails at the write rather than in a notebook hours later.
+    """
+    from case_studies.utils.cv_window import validated_temporal_folds
+
+    declared = (metadata or {}).get("fold_geometry")
+    present = sorted({int(f) for f in frame[fold_column].unique()})
+    if declared is None:
+        raise ValueError(
+            f"a fold-scoped artifact must declare the geometry of its folds: pass "
+            f"metadata['fold_geometry'] covering folds {present}. The frame states which "
+            "folds exist and never states what bounded them, so an undeclared fold is "
+            "invisible to every consumer that reads the artifact back."
+        )
+    folds = validated_temporal_folds(declared, source="metadata['fold_geometry']")
+    undeclared = sorted(set(present) - {fold["fold"] for fold in folds})
+    if undeclared:
+        raise ValueError(
+            f"metadata['fold_geometry'] declares folds "
+            f"{sorted(fold['fold'] for fold in folds)} and the frame carries {present}: "
+            f"{undeclared} would be written with no recorded boundary. An appended holdout "
+            "fold is declared alongside the rolling ones, not left for a consumer to trust."
+        )
+
+
+def write_model_based(
+    frame: pl.DataFrame,
+    path: Path | str,
+    *,
+    keys: Sequence[str],
+    feature_columns: Sequence[str],
+    time_column: str,
+    written_by: str,
+    fold_column: str | None = "fold",
+    expected_folds: Sequence[int] | None = None,
+    inputs: Mapping[str, str] | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> dict:
+    """Write the stage-04 artifact with the guards that were spread across eight notebooks.
+
+    Replaces the ad-hoc write block each ``04_model_based_features`` notebook carried. Those
+    blocks agreed on calling :func:`~case_studies.utils.artifact_digest.write_artifact` and
+    on nothing else: the duplicate-key assertion was in six of eight, the fold-id check in
+    none, and the schema was frozen in none, so a notebook could emit a column of the wrong
+    dtype or a fold that did not exist and the artifact would still be written and digested.
+
+    Guards, in order, each raising before anything reaches disk:
+
+    * every key and the fold column is present, and no key value is null
+    * ``keys + [fold_column]`` is unique, so a fold cannot carry a row twice
+    * every declared feature column is present and not entirely null within any fold
+    * the fold ids are exactly ``expected_folds`` when given
+
+    Pass ``fold_column=None`` for the fold-free artifact a refit schedule produces: the
+    identity becomes the keys alone, the geometry is one record per feature, and
+    ``expected_folds`` is then refused rather than ignored.
+
+    The per-fold feature geometry from :func:`fold_feature_geometry` goes into the sidecar
+    metadata under ``fold_feature_geometry``. It is recorded rather than asserted on for the
+    reason given there: this frame cannot tell a legitimate estimation warm-up from an
+    excess one, and a guard that refused every leading gap would reject the case studies
+    where the gap is correct.
+    """
+    frame_keys = list(keys)
+    # ``fold_column=None`` is the fold-free artifact: one estimation schedule for the whole
+    # panel, so a row is identified by its keys alone and there is no fold to check. Every
+    # other guard below applies unchanged.
+    fold_cols = [] if fold_column is None else [fold_column]
+    if fold_column is None and expected_folds is not None:
+        raise ValueError("expected_folds was given for a frame written without a fold column")
+
+    missing = [c for c in [*frame_keys, *fold_cols, *feature_columns] if c not in frame.columns]
+    if missing:
+        raise ValueError(f"model_based frame is missing declared columns: {missing}")
+
+    null_keys = [c for c in [*frame_keys, *fold_cols] if frame[c].null_count()]
+    if null_keys:
+        raise ValueError(f"null values in key or fold columns: {null_keys}")
+
+    identity = [*frame_keys, *fold_cols]
+    n_dup = int(frame.select(identity).is_duplicated().sum())
+    if n_dup:
+        raise ValueError(f"{n_dup:,} duplicate rows on {identity}")
+
+    geometry = fold_feature_geometry(
+        frame,
+        feature_columns=feature_columns,
+        time_column=time_column,
+        fold_column=fold_column,
+    )
+    empty_in_fold = [
+        (rec["fold"], rec["feature"]) for rec in geometry if rec["n_null"] == rec["n_rows"]
+    ]
+    if empty_in_fold:
+        raise ValueError(
+            "feature columns with no value at all in a fold, which means the fit did not "
+            f"run or its output was not joined back: {empty_in_fold}"
+        )
+
+    if expected_folds is not None:
+        got = sorted({int(f) for f in frame[fold_column].unique()})
+        want = sorted(int(f) for f in expected_folds)
+        if got != want:
+            raise ValueError(f"fold ids {got} do not match the resolved folds {want}")
+
+    if fold_column is not None:
+        _require_declared_fold_geometry(frame, fold_column=fold_column, metadata=metadata)
+
+    merged = dict(metadata or {})
+    merged["fold_feature_geometry"] = [
+        {
+            **rec,
+            "first_valid": None if rec["first_valid"] is None else str(rec["first_valid"]),
+            "last_valid": None if rec["last_valid"] is None else str(rec["last_valid"]),
+        }
+        for rec in geometry
+    ]
+    return write_artifact(
+        frame,
+        path,
+        keys=frame_keys,
+        written_by=written_by,
+        inputs=inputs,
+        metadata=merged,
+        fold_column=fold_column,
+    )
+
+
+# ---------------------------------------------------------------------------
+# The walk-forward refit schedule
+# ---------------------------------------------------------------------------
+#
+# Two channels carry data into a fitted feature value at time t: the CONDITIONING set (which
+# observations the value is computed from) and the PARAMETERS (which observations theta was
+# estimated from). A causal feature needs both to end at or before t. The forward-filtering
+# helpers above close the first channel. This closes the second.
+#
+# The design these replace fitted theta once per fold on the fold's whole training window and
+# then ran the model forward from the START of that same window. Every training row therefore
+# carried parameters estimated from its own future - for etfs' fold 0, the earliest rows carried
+# 9.8 years of it - while every validation row carried parameters estimated only from its past.
+# The model was then fitted on one version of the column and scored on another. Nothing raised,
+# because a fold's own rows are internally consistent and the artifact records no estimation
+# window.
+#
+# `walk_forward_feature` is the design cme_futures' ARIMA already used and this generalizes:
+# spend a burn-in, fit, emit until the next refit, refit on everything up to that point, carry
+# on. The schedule replaces the fold as the thing that bounds an estimate, so the artifact
+# stops needing a fold column at all - one value per (entity, timestamp), the same value
+# whichever fold later selects the row.
+
+
+def _assert_one_series_in_time_order(timestamps: np.ndarray | pl.Series, n_obs: int) -> None:
+    """Refuse a walk over anything but one entity's rows, earliest first.
+
+    ``walk_forward_feature`` emits a value for row *i* from the rows before it, so "before" has
+    to mean earlier in time. Nothing in the array it is handed says so. Every converted stage-04
+    notebook sorts by entity and timestamp and then partitions, and until this guard the
+    correctness of six case studies' fitted features rested on that discipline alone: an
+    unsorted frame, or a partition that returned two securities in one group, produced a feature
+    fitted on scrambled history and raised nothing, because a block of floats is a block of
+    floats whatever order its rows arrived in.
+
+    Strict increase is the whole test, and it covers both failures. A shuffled series steps
+    backwards somewhere. Two entities concatenated step backwards at the seam - and if they do
+    not, because one entity's history ends before the other's begins, the equal-timestamp case
+    below still catches the overlap that a real panel has. A duplicate timestamp inside one walk
+    is refused rather than tolerated: two rows the schedule cannot order are two rows it cannot
+    say which of them the other's parameters were allowed to see.
+    """
+    values = timestamps.to_numpy() if isinstance(timestamps, pl.Series) else np.asarray(timestamps)
+    if values.ndim != 1:
+        raise ValueError(f"timestamps must be one-dimensional, got shape {values.shape}")
+    if len(values) != n_obs:
+        raise ValueError(
+            f"timestamps carries {len(values):,} entries for a {n_obs:,}-row series; it must "
+            "carry the decision time of every row, in the same order"
+        )
+    if n_obs < 2:
+        return
+    # Datetime and date dtypes do not support `np.diff` on every numpy version polars hands
+    # back, and an integer index is a legitimate time axis here too. A pairwise comparison is
+    # dtype-agnostic and reads the same for all of them.
+    ordered = values[1:] > values[:-1]
+    if not bool(np.all(ordered)):
+        first = int(np.argmin(ordered))
+        raise ValueError(
+            f"timestamps do not strictly increase: entry {first + 1:,} is {values[first + 1]!r} "
+            f"against {values[first]!r} at entry {first:,}. walk_forward_feature emits each "
+            "value from the rows before it, so the rows must be one entity's, earliest first. "
+            "Sort by the time column within the entity, and partition so one call sees one "
+            "entity."
+        )
+
+
+def refit_boundaries(n_obs: int, burnin: int, refit_every: int) -> list[tuple[int, int]]:
+    """``(fit_end, emit_end)`` index pairs for one walk over ``n_obs`` observations.
+
+    ``fit_end`` is exclusive, so a block's parameters are estimated from ``obs[:fit_end]`` and
+    then speak for ``obs[fit_end:emit_end]`` - no observation is ever used to fit the model that
+    describes it. The first ``burnin`` observations are in no block: they pay for the first
+    estimate and carry no feature value.
+
+    Returns an empty list when there is not enough history to fit even once, which is a
+    statement about the series and not an error. The caller emits nulls for the whole of it.
+    """
+    if burnin < 1:
+        raise ValueError(f"burnin must be at least 1, got {burnin}")
+    if refit_every < 1:
+        raise ValueError(f"refit_every must be at least 1, got {refit_every}")
+    if n_obs <= burnin:
+        return []
+    return [
+        (fit_end, min(fit_end + refit_every, n_obs))
+        for fit_end in range(burnin, n_obs, refit_every)
+    ]
+
+
+def walk_forward_feature(
+    X: np.ndarray,
+    *,
+    timestamps: np.ndarray | pl.Series,
+    burnin: int,
+    refit_every: int,
+    fit: Callable[[np.ndarray], Any],
+    apply: Callable[[Any, np.ndarray], np.ndarray],
+    n_features: int,
+    window: int | None = None,
+    freeze_after: int | None = None,
+    on_fit_error: str = "raise",
+    apply_scope: str = "prefix",
+) -> np.ndarray:
+    """Emit a fitted feature over one series, refitting on a schedule instead of per fold.
+
+    ``fit(X_train)`` returns whatever object ``apply`` needs. ``apply(model, X_prefix)`` runs the
+    fitted model forward over ``X_prefix`` and returns one row per input row; only the rows of
+    the current block are kept, so ``apply`` may condition on everything up to each row and must
+    not read past the end of what it is handed.
+
+    ``window`` is ``None`` for an expanding estimation window - every refit sees the whole
+    history, which is what cme_futures' ARIMA does - or an integer for a rolling one of that many
+    observations, for a model whose parameters are expected to drift.
+
+    ``freeze_after`` is the index past which the walk stops re-estimating and keeps applying the
+    last parameters it fitted. It exists for the holdout: a coefficient refitted on holdout
+    sessions is a parameter estimated on the holdout however causal the recursion around it
+    looks, so the last estimate before the holdout opens is the one that speaks for all of it.
+    cme_futures' ARIMA already draws this distinction with a second ``refit=False`` walk.
+
+    ``on_fit_error="skip"`` leaves a block null and carries on with the previous parameters where
+    a single estimate fails to converge; the default raises, because a model that cannot be
+    fitted on most of its blocks is not a feature.
+
+    ``apply_scope`` says how much of the series ``apply`` is handed. ``"prefix"`` is the default
+    and the recursive case: a GARCH or Kalman filter has to run from the start of the series to
+    reach the block, so it gets ``X[:emit_end]`` and returns one row per input row. ``"block"``
+    hands it ``X[fit_end:emit_end]`` and asks for that many rows, for a model whose emitted value
+    at a row is a function of that row and the parameters alone.
+
+    That distinction is a cost, not a preference. Under ``"prefix"`` the walk hands out
+    ``sum(emit_end)`` rows, which is quadratic in the length of the series and only bounded in
+    practice by ``refit_every`` being large. nasdaq100_microstructure refits its HAR regression at
+    every bar over 174,000 bars per symbol, where the prefix form asks ``apply`` to produce 1.5e10
+    rows for the 174,000 it keeps. ``"block"`` asks for exactly the rows the walk emits.
+
+    ``timestamps`` is the decision time of each row of *X*, and it is required rather than
+    optional because it is the only thing here that can tell a walk forward from a walk over a
+    shuffled array. Everything else this function sees is a bare ``(n_obs, n_features)`` block of
+    floats: it cannot tell one entity's series from two concatenated, nor a sorted frame from an
+    unsorted one, so every guarantee above is a statement about time that the array does not
+    carry. The check is that *timestamps* strictly increases. That refuses the unsorted call, and
+    it refuses the concatenation of two entities as well, whose timestamps step backwards at the
+    seam - the two ways a caller's ``sort`` or ``partition_by`` has been the only thing standing
+    between this schedule and a feature fitted on scrambled history.
+
+    Returns ``(len(X), n_features)`` with ``np.nan`` wherever no parameters were available: the
+    burn-in prefix always, and any skipped block.
+
+    :raises ValueError: if *timestamps* does not carry one entry per row of *X*, or does not
+        strictly increase.
+    """
+    if on_fit_error not in ("raise", "skip"):
+        raise ValueError(f"on_fit_error must be 'raise' or 'skip', got {on_fit_error!r}")
+    if apply_scope not in ("prefix", "block"):
+        raise ValueError(f"apply_scope must be 'prefix' or 'block', got {apply_scope!r}")
+    _assert_one_series_in_time_order(timestamps, len(X))
+    out = np.full((len(X), n_features), np.nan, dtype=float)
+    frozen: Any = None
+    for fit_end, emit_end in refit_boundaries(len(X), burnin, refit_every):
+        if freeze_after is not None and fit_end > freeze_after:
+            if frozen is None:
+                continue
+            model = frozen
+        else:
+            fit_start = 0 if window is None else max(0, fit_end - window)
+            try:
+                model = fit(X[fit_start:fit_end])
+            except Exception:
+                if on_fit_error == "raise":
+                    raise
+                continue
+            frozen = model
+        start = 0 if apply_scope == "prefix" else fit_end
+        values = np.asarray(apply(model, X[start:emit_end]), dtype=float)
+        if len(values) != emit_end - start:
+            raise ValueError(
+                f"apply returned {len(values)} rows for a {emit_end - start}-row "
+                f"{apply_scope}; it must return one row per input row so the block slice "
+                "below lines up"
+            )
+        out[fit_end:emit_end] = values[fit_end - start :].reshape(emit_end - fit_end, n_features)
+    return out

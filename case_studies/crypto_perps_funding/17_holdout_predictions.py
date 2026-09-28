@@ -47,21 +47,22 @@
 """Crypto Perpetuals Funding: Holdout Predictions."""
 
 import sqlite3
-import warnings
 
 import polars as pl
-
-warnings.filterwarnings("ignore")
 
 from case_studies.research import open_study
 from case_studies.research.holdout import build_holdout_training_spec
 from case_studies.research.models import reconstruct_locked_model_request
 from case_studies.utils.registry import training_hash_from_spec
+from case_studies.utils.registry.maintenance import delete_prediction_generation
 from case_studies.utils.strategy_analysis import (
     resolve_solvent_carrier,
     training_run_fitted_for_the_holdout,
 )
+from case_studies.utils.warning_policy import apply_notebook_warning_policy
 from utils.paths import get_case_study_dir
+
+apply_notebook_warning_policy()
 
 # %% tags=["parameters"]
 CASE_STUDY_ID = "crypto_perps_funding"
@@ -83,33 +84,6 @@ REPLACE_HOLDOUT = False
 # %%
 study = open_study(CASE_STUDY_ID, execution_tier=EXECUTION_TIER, workspace=WORKSPACE or None)
 CASE_DIR = get_case_study_dir(CASE_STUDY_ID)
-
-
-def _delete_holdout_generation(case_dir, prediction_hash):
-    """Remove one holdout prediction set and everything registered against it.
-
-    Called only when ``REPLACE_HOLDOUT`` says a generation is superseded. The rows go rather
-    than being marked, because a superseded holdout evaluation that is still readable is
-    still a number someone can quote, and the point of replacing it is that it should not be
-    one.
-    """
-    with sqlite3.connect(str(case_dir / "run_log" / "registry.db")) as conn:
-        backtests = [
-            row[0]
-            for row in conn.execute(
-                "SELECT backtest_hash FROM backtest_runs WHERE prediction_hash = ?",
-                (prediction_hash,),
-            )
-        ]
-        for backtest_hash in backtests:
-            conn.execute(
-                "DELETE FROM backtest_paired_metrics WHERE challenger_hash = ? "
-                "OR benchmark_hash = ?",
-                (backtest_hash, backtest_hash),
-            )
-            conn.execute("DELETE FROM backtest_metrics WHERE backtest_hash = ?", (backtest_hash,))
-            conn.execute("DELETE FROM backtest_runs WHERE backtest_hash = ?", (backtest_hash,))
-        conn.execute("DELETE FROM prediction_sets WHERE prediction_hash = ?", (prediction_hash,))
 
 
 def _registered_holdout_generations(case_dir):
@@ -167,13 +141,13 @@ def _registered_holdout_generations(case_dir):
 # to agree: this resolver and the `crypto-final-validation-{label}` candidate sets that
 # [`15_risk_management`](15_risk_management.ipynb) freezes return the same backtest.
 #
-# Nothing about the holdout enters this choice. The carrier was fixed before this notebook
-# ran.
+# Nothing about the holdout enters this choice. The selected configuration was fixed before this
+# notebook ran.
 
 # %%
 carrier = resolve_solvent_carrier(CASE_STUDY_ID)
 print(
-    f"Carrier: {carrier['val_backtest_hash']}  stage={carrier['val_stage']}  "
+    f"Selected configuration: {carrier['val_backtest_hash']}  stage={carrier['val_stage']}  "
     f"family={carrier['family']}  config={carrier['config_name']}  "
     f"label={carrier['label']}"
 )
@@ -183,11 +157,11 @@ print(
 print(f"  fitted by training run {carrier['training_hash']}")
 
 # %% [markdown]
-# The checkpoint is part of the configuration. Families that checkpoint through training
-# publish one prediction set per declared iteration, and the carrier's prediction set names
-# one of them - so refitting without it would produce a model at the end of training rather
-# than the one that was ranked. A family that checkpoints once carries nulls here, and
-# passing them through unchanged is what keeps the lookup exact either way.
+# The checkpoint is part of the configuration. Families that checkpoint through training publish
+# one prediction set per declared iteration, and the selected configuration's prediction set names
+# one of them - so refitting without it would produce a model at the end of training rather than
+# the one that was ranked. A family that checkpoints once carries nulls here, and passing them
+# through unchanged is what keeps the lookup exact either way.
 
 # %%
 validation_prediction = study.results.open(carrier["val_prediction_hash"])
@@ -265,11 +239,11 @@ print(f"Holdout training ends {fold['train_end']}, holdout opens {fold['val_star
 # not the same as free: every configuration evaluated on it is another look at a period the
 # case study reports as unseen, and two evaluated quietly would make that report false.
 #
-# So the check below is on the carrier rather than on the notebook, and it has exactly two
-# outcomes. With the carrier unchanged this is an idempotent replay: the derivation is
-# deterministic and the training identity covers it, so the same identity comes back and the
-# fit is served from the registry. With the carrier changed it refuses, names both
-# configurations, and stops.
+# So the check below is on the selected configuration rather than on the notebook, and it has
+# exactly two outcomes. With the selected configuration unchanged this is an idempotent replay: the
+# derivation is deterministic and the training identity covers it, so the same identity comes back
+# and the fit is served from the registry. With the selected configuration changed it refuses,
+# names both configurations, and stops.
 #
 # `REPLACE_HOLDOUT` is the only way past that, and it is a replacement rather than an
 # addition: the superseded generation's rows are deleted, so the registry never holds two
@@ -297,7 +271,17 @@ if superseded and not REPLACE_HOLDOUT:
     )
 for row in superseded:
     print(f"REPLACING holdout generation {row['prediction_hash']} ({row['config_name']})")
-    _delete_holdout_generation(CASE_DIR, row["prediction_hash"])
+    # The rows go rather than being marked: a superseded holdout evaluation that is still
+    # readable is still a number someone can quote, and the point of replacing it is that it
+    # should not be one. `delete_prediction_generation` derives the child tables from
+    # `PRAGMA foreign_key_list` rather than listing them, so a table added to the schema
+    # later is covered without an edit, and it enables foreign keys on its own connection -
+    # SQLite leaves them off per connection, which is the only reason a delete that misses a
+    # child table appears to succeed.
+    removed = delete_prediction_generation(
+        CASE_DIR / "run_log" / "registry.db", row["prediction_hash"]
+    )
+    print(f"  removed {sum(removed.values())} rows: {removed}")
 
 # %% tags=["results"]
 request = reconstruct_locked_model_request(

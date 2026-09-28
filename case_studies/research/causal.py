@@ -156,10 +156,24 @@ class CausalResult:
                     if "refutation_placebo_json" in columns
                     else "NULL AS refutation_placebo_json"
                 )
+                placebo_t_column = (
+                    "refutation_placebo_t_json"
+                    if "refutation_placebo_t_json" in columns
+                    else "NULL AS refutation_placebo_t_json"
+                )
+                frozen_column = (
+                    "refutation_frozen_fraction"
+                    if "refutation_frozen_fraction" in columns
+                    else "NULL AS refutation_frozen_fraction"
+                )
+                covariance_column = (
+                    "covariance_type" if "covariance_type" in columns else "NULL AS covariance_type"
+                )
                 row = db.execute(
                     "SELECT n_obs, dml_effect, dml_se_hac, p_value_hac, naive_effect, "
                     f"confounding_bias_pct, refutation_p, {draws_column}, spec_json, "
-                    f"{placebo_column} "
+                    f"{placebo_column}, {placebo_t_column}, {frozen_column}, "
+                    f"{covariance_column} "
                     "FROM causal_runs WHERE causal_hash = ?",
                     (causal_hash,),
                 ).fetchone()
@@ -185,6 +199,29 @@ class CausalResult:
                     # not there. An empty list rather than None when the column exists
                     # but the run predates it, so callers need one check, not two.
                     "placebo_effects": json.loads(row[9]) if row[9] else [],
+                    # The draws refutation_p is actually computed on since the
+                    # t-statistic correction. Empty means the p-value on this row was
+                    # computed the old way, on raw thetas, and is anti-conservative: a
+                    # permuted treatment is no longer predictable from the controls, so
+                    # its residual keeps its variance, the second stage divides by a
+                    # larger number, and every placebo theta is shrunk toward zero
+                    # whether or not there is anything to find. A caller that wants to
+                    # render the distribution behind the verdict must use these and not
+                    # `placebo_effects`, and must say so when they are missing.
+                    "placebo_t_stats": json.loads(row[10]) if row[10] else [],
+                    # The diagnostic the refutation's own warning tells the reader to
+                    # weigh the p-value against. It reaches a reader only from here: the
+                    # warning fires while the fit runs, and a re-run that hits the cache
+                    # performs no fit. None rather than 0.0 when the column is absent or
+                    # the refutation recorded none - zero asserts that permutation moved
+                    # every row, which is the opposite of not knowing.
+                    "placebo_frozen_fraction": row[11],
+                    # Which estimator produced dml_se_hac: "driscoll_kraay",
+                    # "newey_west", or "failed". None means the row was written before
+                    # anything recorded it, and that is not recoverable after the fact -
+                    # the fallback returned an HC0 value under the robust name, bit for
+                    # bit, so no stored field distinguishes it from a robust result.
+                    "covariance_type": row[12],
                     # Derived here so every reader gets the same verdict from the same
                     # rule. A p-value alone cannot say whether the draws could have
                     # rejected at all, so a caller that re-applies a bare threshold
@@ -279,6 +316,12 @@ class CausalRequest:
     execution_tier: ExecutionTier
     preview_reductions: dict[str, Any]
     supersedes: str | None = None
+    # The notebook that submitted this request, for `runtime_provenance["notebook_path"]`.
+    # Provenance only - `registry/specs.py:_V2_PROVENANCE_FIELDS` excludes it from the causal
+    # identity, so two notebooks submitting the same analysis still collide on one hash. It
+    # answers the separate question of which notebook produced a row, and `entry_point` cannot:
+    # that names the module (`case_studies.utils.causal`), which every causal notebook shares.
+    notebook: str | None = None
 
     @classmethod
     def from_request(cls, study: Study, request: dict[str, Any]) -> CausalRequest:
@@ -290,6 +333,7 @@ class CausalRequest:
             "execution_tier",
             "preview_reductions",
             "supersedes",
+            "notebook",
         }
         unknown = set(request) - supported
         if unknown:
@@ -316,6 +360,10 @@ class CausalRequest:
             execution_tier=tier,
             preview_reductions=reductions,
             supersedes=(str(request["supersedes"]) if request.get("supersedes") else None),
+            # Defaulted from the study for the same reason as `model_requests`: `entry_point`
+            # and `notebook_path` answer one question, and a notebook that passed both said the
+            # same string twice.
+            notebook=(str(request["notebook"]) if request.get("notebook") else study.entry_point),
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -326,9 +374,13 @@ class CausalRequest:
             "overrides": dict(self.overrides),
             "execution_tier": self.execution_tier.value,
             "preview_reductions": dict(self.preview_reductions),
+            "notebook": self.notebook,
         }
         # `supersedes` is absent on purpose: this dict is what the resolver turns into
-        # the spec, and the spec is hashed.
+        # the spec, and the spec is hashed. `notebook` is present and safe for the same
+        # reason `supersedes` is not: the resolver reads every field by name and builds
+        # `computation` from a literal set of keys, so a request key it does not name
+        # cannot reach the hash. It lands in `provenance`, which the identity excludes.
 
     def resolve(self) -> ResolvedCausalRequest:
         module = get_adapter("causal", self.method)

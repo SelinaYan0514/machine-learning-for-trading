@@ -62,25 +62,3 @@ def test_every_population_writer_threads_supersedes(path: Path) -> None:
             f"{path.relative_to(REPO)}: {function.name} passes supersedes but does not take it, "
             "so the value cannot come from a notebook parameter"
         )
-
-
-def test_the_cme_backtest_sweeps_still_have_no_notebook_parameter() -> None:
-    """The half of ml4t/agent-workspace#1009 that is fixed in the module but not in the notebooks.
-
-    `run_official_backtest_requests` now takes `supersedes`, so nothing has to edit the module.
-    The four sweeps that publish a `cme_futures` backtest population still pass nothing, because
-    adding a papermill parameter changes the paired `.py` and the provenance gate then requires
-    the notebook to be re-executed - and under `rebalance.step` entering the backtest identity
-    (public 83141459), a re-run resolves 992 hashes none of which is registered, so it would
-    supersede the whole baseline population to land a parameter.
-
-    This test states that gap as the current contract rather than leaving it silent. Delete it
-    in the commit that adds the four parameters.
-    """
-    sweeps = ("13_backtest", "14_portfolio_management", "15_risk_management", "16_costs")
-    for stem in sweeps:
-        source = (REPO / "case_studies" / "cme_futures" / f"{stem}.py").read_text()
-        assert "SUPERSEDES_" not in source, (
-            f"{stem} now declares a supersedes parameter - thread it into "
-            "run_official_backtest_requests and delete this test"
-        )

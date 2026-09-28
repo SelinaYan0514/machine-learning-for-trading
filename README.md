@@ -21,7 +21,7 @@ machine to a running notebook, prerequisites included. The short version is unde
 [Quick Start](#quick-start) below.
 
 <!-- offerings:next start -->
-> **Next free session:** [How to Engineer a Multi-Agent System](https://maven.com/p/c7565e), a 30-minute live session on **Wednesday, September 9, 2026, 12:00 PM ET / 16:00 UTC**. [All courses, workshops, and free lessons](https://ml4trading.io/courses/?utm_source=github&utm_medium=readme&utm_campaign=ml4t3e&utm_content=offerings).
+> **Next free session:** [How to Be Productive with Coding Agents, Beyond Code](https://maven.com/p/efe730), a 30-minute live session on **Wednesday, September 30, 2026, 11:00 AM ET / 15:00 UTC**. [All courses, workshops, and free lessons](https://ml4trading.io/courses/?utm_source=github&utm_medium=readme&utm_campaign=ml4t3e&utm_content=offerings).
 <!-- offerings:next end -->
 
 <p align="center">
@@ -138,17 +138,26 @@ the workflow:
 
 | Starts | Offering | What you leave with |
 |--------|----------|---------------------|
-| Sep 16 – Dec 2, 2026 | [ML for Trading: From Research to Production](https://maven.com/stefan-jansen/research-to-production) | Take one research idea from a question to a costed, monitored strategy, with the evidence trail that makes the result checkable. |
-| Sep 26, 2026 | [Engineering a Multi-Agent Forecasting System](https://maven.com/stefan-jansen/agent-engineering) | Build a multi-agent forecasting system whose reasoning is auditable end to end. |
-| Oct 10, 2026 | [Loop Engineering: Reliable Work From Coding Agents](https://maven.com/stefan-jansen/loop-engineering) | Get reliable work out of coding agents: harness design, verification, and recovery from a bad run. |
+| Oct 3, 2026 | [Engineering a Multi-Agent Forecasting System](https://maven.com/stefan-jansen/agent-engineering) | Build a multi-agent forecasting system whose reasoning is auditable end to end. |
+| Oct 10, 2026 | [ML for Trading in the Age of AI Agents](https://maven.com/stefan-jansen/ml4t-ai-agents) | Run the whole ML for Trading workflow once, end to end, in a single session. |
+| Oct 24, 2026 | [Loop Engineering: Reliable Work From Coding Agents](https://maven.com/stefan-jansen/loop-engineering) | Get reliable work out of coding agents: harness design, verification, and recovery from a bad run. |
+| Nov 21, 2026 | [Engineering a Multi-Agent Forecasting System](https://maven.com/stefan-jansen/agent-engineering) | Build a multi-agent forecasting system whose reasoning is auditable end to end. |
+
+**Courses with no date on the calendar.** Either self-paced and on sale now, or between cohorts with a waitlist on the course page.
+
+| Offering | How it runs | What you leave with |
+|----------|-------------|---------------------|
+| [ML for Trading: Foundations](https://maven.com/stefan-jansen/ml4t-foundations) | Self-paced, start any time | Build the ML for Trading pipeline yourself, end to end, and the evidence to say what it does and does not establish. |
+| [ML for Trading: From Research to Production](https://maven.com/stefan-jansen/research-to-production) | Next cohort not yet scheduled | Take one research idea from a question to a costed, monitored strategy, with the evidence trail that makes the result checkable. |
 
 **Free live sessions.** Thirty minutes to an hour, no cost, recording sent to everyone who registers.
 
 | When | Session |
 |------|---------|
-| Wed, Sep 9, 12:00 PM ET / 16:00 UTC | [How to Engineer a Multi-Agent System](https://maven.com/p/c7565e) |
-| Wed, Sep 30, 12:00 PM ET / 16:00 UTC | [How to Be Productive with Coding Agents, Beyond Code](https://maven.com/p/efe730) |
-| Wed, Nov 4, 12:00 PM ET / 17:00 UTC | [Why Multi-Agent Systems Break, and How To Fix It](https://maven.com/p/393eee) |
+| Wed, Sep 30, 11:00 AM ET / 15:00 UTC | [How to Be Productive with Coding Agents, Beyond Code](https://maven.com/p/efe730) |
+| Thu, Oct 1, 11:00 AM ET / 15:00 UTC | [Can AI agents improve themselves?](https://maven.com/p/cf1c90) |
+| Wed, Oct 7, 11:00 AM ET / 15:00 UTC | [How AI Agents Change the ML for Trading Workflow](https://maven.com/p/222e36) |
+| Wed, Nov 4, 11:00 AM ET / 16:00 UTC | [Why Multi-Agent Systems Break, and How To Fix It](https://maven.com/p/393eee) |
 
 *Between cohorts, the [**Insights** newsletter](https://insights.ml4trading.io/) covers the same ground weekly, source by source.*
 <!-- offerings:all end -->
@@ -262,7 +271,7 @@ repository root**. New to the command line? Start with
 ```bash
 git clone https://github.com/stefan-jansen/machine-learning-for-trading.git
 cd machine-learning-for-trading
-cp .env.example .env
+cp .env.example .env   # the defaults work as-is; nothing in it needs editing to start
 ```
 
 Then pick one environment. **Option A, Docker**, carries every dependency and needs no compiler:
@@ -321,21 +330,33 @@ uv run python scripts/download_artifacts.py
 
 ### 3. Run notebooks
 
-Notebooks are paired [Jupytext](https://jupytext.readthedocs.io/) files, a `.py` source and a
-generated `.ipynb`. `uv sync` already installed Jupyter Lab.
+First confirm the install, with the one command that answers it. It prints a
+PASS or FAIL line per component and exits non-zero on any required failure:
 
 ```bash
-uv run python 01_process_is_edge/factor_regimes.py                # smoke test
-ML4T_DATA_PATH="${ML4T_DATA_PATH:-$PWD/data}" uv run jupyter lab  # local: open the URL it prints
-docker compose up -d ml4t                                         # Docker: same address
+uv run python scripts/verify_installation.py                     # Option B
+docker compose run --rm ml4t python scripts/verify_installation.py   # Option A
 ```
 
-Start Jupyter from the repository root. The `ML4T_DATA_PATH` prefix gives the loaders an absolute
-path, because Jupyter runs each notebook with its chapter folder as the working directory and the
-loaders would otherwise search inside that folder and report the datasets as missing. It keeps a
-value you have already exported and defaults to this repository's `data/`. See
-**[running notebooks](docs/running-notebooks.md)** for case-study pipelines, Papermill parameters,
-and the experiment workflow.
+Notebooks are paired [Jupytext](https://jupytext.readthedocs.io/) files, a `.py` source and a
+generated `.ipynb`. `uv sync` already installed Jupyter Lab. Start it from the repository root,
+on **one** of the two paths:
+
+```bash
+# Option B, local uv. Open the tokenized URL it prints, in full.
+ML4T_DATA_PATH="${ML4T_DATA_PATH:-$PWD/data}" uv run jupyter lab
+
+# Option A, Docker. Then open http://localhost:8888 in your browser — no token.
+docker compose up ml4t
+```
+
+The `ML4T_DATA_PATH` prefix on the local path gives the loaders an absolute path, because Jupyter
+runs each notebook with its chapter folder as the working directory and the loaders would otherwise
+search inside that folder and report the datasets as missing. It keeps a value you have already
+exported and defaults to this repository's `data/`. The Docker path needs no prefix: the compose
+file sets the variable inside the container. See
+**[running notebooks](docs/running-notebooks.md)** for the first-notebook walkthrough, case-study
+pipelines, Papermill parameters, and the experiment workflow.
 
 ### Docker images
 

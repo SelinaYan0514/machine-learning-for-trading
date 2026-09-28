@@ -411,10 +411,16 @@ features:
 #   - per-allocator overrides in backtest.sweep.allocators
 #
 # ``allocator_lookback`` is the bars-of-underlying-price window applied
-# uniformly to every moment-based allocator. 15-min bars (26 bars/day);
-# 520 bars ≈ 20 trading days ≈ 1 month of intraday coverage. ``periods_per_year``
-# annualizes Sharpe at daily-equivalent grain (252); allocator windows are
-# measured in raw 15-min bars regardless.
+# uniformly to every moment-based allocator. It is counted in ROWS OF THE PRICE
+# FRAME, and that frame is one-minute: ``config/backtest/base.yaml`` declares
+# ``calendar.data_frequency: 1m``, ``load_backtest_prices_for`` returns bars
+# measured at 60-second spacing, and ``_compute_rolling_vol`` applies
+# ``rolling_std(vol_window)`` to those rows with no resampling. So 520 is 520
+# MINUTES - about 1.3 regular sessions - and not the 20 trading days this comment
+# claimed until 2026-09-06. The value is unchanged; what was wrong was the
+# sentence describing it, which read the decision cadence as the bar size.
+# ``periods_per_year`` annualizes Sharpe at daily-equivalent grain (252),
+# independently of this window.
 #
 # Expensive allocators (RP/HRP/MVO_LW) are dropped via expensive_allocators_skip
 # below — covariance estimation at 15-min cadence is prohibitive and
@@ -430,7 +436,7 @@ features:
 execution:
   initial_cash: 1_000_000        # restores prior validated state
   share_type: integer            # US equities trade in whole shares
-  allocator_lookback: 520        # ~20 trading days of 15-min bars
+  allocator_lookback: 520        # rows of the 1-minute price frame: ~1.3 sessions
 
 mapping:
   class: intraday_rank_and_trade
@@ -551,12 +557,22 @@ backtest:
     # belongs to eq_w_topk / quintile_long_short.
     #
     # Per-prediction cardinality:
-    #   slot:      long_q(3) × max_slots(3) × hold_bars(3) × exit_signal_q(4)
-    #              × bars_per_day_grid(1) = 108 (long_only only)
+    #   slot:      long_q(3) × max_slots(3) × hold_bars(2) × exit_signal_q(2)
+    #              × bars_per_day_grid(1) = 36 (long_only only)
     #   eq_w_topk: top_k(3) × direction(2) = 6
-    # ~114 per prediction × ~12 representative preds ≈ ~1,400 backtests
-    # for the signal stage on val (less than the original 2,800 estimate
-    # because slot × long_short is dropped).
+    # 42 per prediction, and `signal_passes` below says how many predictions
+    # each of them runs on.
+    #
+    # `hold_bars` and `exit_signal_q` were cut here, from 3 and 4 values to 2
+    # each, on 2026-09-11. Both keep their endpoints: hold_bars keeps 2h and 8h
+    # and drops the 4h midpoint, exit_signal_q keeps "off" and the median
+    # crossover and drops 0.30 and 0.70. A midpoint is what a grid can lose
+    # without losing the comparison it draws - the question the sweep asks is
+    # whether a longer hold and a signal exit move the result, and two values
+    # answer it. `long_q` and `max_slots` are untouched: `14_backtest.py`'s
+    # Act 2 selects the carrier by `slots == 10` and `entry_q == 0.9`
+    # literally, so removing either value empties the table that section
+    # prints.
     signal_nasdaq100:
       selection_method: [slot_persistent_signal_exit, eq_w_topk]
       long_q: [0.90, 0.95, 0.99]
@@ -566,12 +582,75 @@ backtest:
       # the PRICE grid, now one minute. Restated from the fifteen-minute counts they carried
       # (8/16/32 and 14) at the same wall-clock durations, so the sweep asks the same question
       # of the same intervals rather than silently asking about 8, 16 and 32 minutes.
-      hold_bars: [120, 240, 480]          # 2h, 4h, 8h, in minute bars
-      exit_signal_q: [null, 0.30, 0.50, 0.70]  # null disables signal-exit
+      hold_bars: [120, 480]               # 2h, 8h, in minute bars
+      exit_signal_q: [null, 0.50]         # null disables signal-exit
       pred_freshness_max_min: 14          # tolerated staleness of a prediction, in minutes
       bars_per_day_grid: [210]            # was 14 bars of 15 minutes; same 3.5h window
       top_k_grid: [5, 10, 20]
       lookback_days: 21
+      # What this grid reaches is not what it declares, and it differs by family.
+      # `long_q` x `max_slots` x `hold_bars` x `exit_signal_q` is 36 combinations per
+      # prediction, and 36 rows per prediction were registered. Measured 2026-09-24
+      # against the canonical registry, on the reported Sharpe, total return and trade
+      # count: `deep_learning` produces 36 distinct outcomes from its 36 rows on all ten
+      # of its prediction sets and `gbm` 35.5 on average over its eighteen, but `linear`
+      # produces **4 or 5** on every one of its eight. Its 288 registered rows carry 36
+      # distinguishable results between them.
+      #
+      # The cause is in `slot_strategy.py`: entries are ranked within the candidate set
+      # and admitted up to free capacity, so raising the entry quantile only removes
+      # names the capacity cap was already excluding. On linear predictions the 0.95 and
+      # 0.99 candidate sets differ only below that cap, and `long_q: 0.90` is the only
+      # level that binds. Read a linear slot count as an upper bound on the search that
+      # was actually run.
+    # How the signal stage walks the grid above. Two passes, because the whole
+    # grid over every prediction is not affordable here and nothing else in the
+    # book has this shape: every other case study declares 2 to 4 entry schemes
+    # and one universe, and no completed case study holds more than about 3,000
+    # signal backtests.
+    #
+    # Counted against this registry and measured on 2026-09-11. A backtest of
+    # this panel costs 31.8 s (four arms timed on the live 10.1M-row price
+    # frame, both universes, 29.2 s to 36.3 s), and the registry offers 741
+    # admissible prediction sets: 226 for each of the three continuous labels
+    # and 63 for `fwd_dir_15m`.
+    #
+    #   pass 1  baseline    741 × 3 canonical arms  × cost_feasible = 2,223
+    #   pass 2  mechanism    32 × 42 arms           × cost_feasible = 1,344
+    #   pass 2  reference    32 × 3 canonical arms  × full          =    96
+    #                                                       total   = 3,663  ≈ 32 h
+    #
+    # Crossing all 117 arms with both universes over all 741 predictions, which
+    # is what this block replaces, is 173,394 backtests and about 1,500 hours.
+    # The prediction count is not what was wrong with it: 741 sets is what three
+    # DL families at 20 epoch checkpoints, 15 gbm configs at 10 tree-count
+    # checkpoints and 16 linear configs come to, and every one of them is a
+    # configuration this case study fitted on purpose. The arm count was.
+    signal_passes:
+      # Pass 1 ranks every admissible prediction on three equal-weight
+      # concentrations, on the universe the carrier actually trades. Ranking on
+      # the full universe instead would order the predictions by a Sharpe no
+      # selected strategy ever earns, because the cost-expensive tail of the
+      # panel is exactly what `universe.cost_feasible` removes.
+      baseline_schemes: [ew_top5, ew_top10, ew_top20]
+      baseline_universe: cost_feasible
+      # Pass 2 runs the mechanism grid on the strongest predictions of pass 1,
+      # per label, ranked by pass-1 validation Sharpe.
+      #
+      # By Sharpe and not by IC. `top_n_predictions.signal` is the other lever
+      # that would cut this grid and it is the wrong one: `load_prediction_index`
+      # ends `ORDER BY m.ic_mean DESC NULLS LAST`, so any positive value there
+      # screens the signal stage on rank correlation and decides which models are
+      # backtested at all before a backtest has run. All nine case studies
+      # declare `signal: 0` for that reason, and it stays 0 here.
+      mechanism_top_n: 8
+      # The full universe is kept as a reference arm rather than a second copy of
+      # the sweep: the canonical concentrations only, on the pass-2 predictions.
+      # That is what `17_costs` reads for its full-vs-screened comparison - it
+      # prices the top-1 of each pre-cost stage, which is always inside pass 2 -
+      # and what Act 1 of `14_backtest` reads to show the unscreened baseline.
+      reference_schemes: [ew_top5, ew_top10, ew_top20]
+      reference_universe: full
     # Ch19 risk overlays.
     risk_controls:
       position:
@@ -589,6 +668,86 @@ backtest:
         - {name: time_exit_10,    type: time_exit,     bars: 10}
         - {name: time_exit_20,    type: time_exit,     bars: 20}
         - {name: time_exit_40,    type: time_exit,     bars: 40}
+
+# The mean-forecast ensemble this case study features, and the only thing in the repository
+# that produces `family: ensemble` rows. Declared rather than assembled in the notebook
+# because the member set is what the ensemble *is*: change the rule and it is a different
+# object under the same name.
+#
+# The lesson this case study ends on is that choosing among a family's configurations on a
+# validation window does not carry to a later window, while the family itself does. An object
+# that makes no choice is what shows it, and that object has to be registered like a model so
+# the backtest stage, the cohort comparison and the holdout all read it the way they read one.
+ensemble:
+  # The family averaged, and the rule that decides which of its configurations are in.
+  #
+  # 31 leaves is the boundary between the regularized presets and the one that is not:
+  # `leaves_7`, `leaves_15` and `leaves_31` carry `lambda_l1`, `lambda_l2`, `bagging_fraction`
+  # and `feature_fraction`; `default` carries none of them and trains at LightGBM's own
+  # default of 31 leaves; `leaves_63` is the only configuration above the line. The rule keeps
+  # twelve of the fifteen for each continuous label - three losses across four leaf counts.
+  #
+  # A count is not declared here on purpose. The rule is the declaration and the members are
+  # resolved from what is registered, so a configuration added to `config/training/*.yaml`
+  # joins the ensemble and a number written down here could only disagree with it.
+  member_family: gbm
+  max_num_leaves: 31
+  method: mean_forecast
+  config_name: gbm_mean_leaves31
+  # Each member enters at its last checkpoint. Taking the checkpoint with the best validation
+  # metric would select on the window the ensemble is then measured on, which is the thing
+  # the ensemble exists not to do.
+  checkpoint: last
+  # The entry scheme the ensemble is backtested on, by the name `get_entry_schemes_for`
+  # gives it: 10 slots, an 8-hour maximum hold, a 0.90 entry quantile, no signal exit, on the
+  # 210-bar execution window. `14_backtest.py` Act 2 reads the carrier by `slots == 10` and
+  # `entry_q == 0.9` literally, so this arm and that filter have to agree.
+  #
+  # One arm and not the grid: the ensemble is not a sweep participant. It is the object the
+  # chapter carries, backtested on the design the sweep already chose, and putting it through
+  # the sweep would make it one more configuration to select among.
+  featured_scheme: slot_l_lq90_s10_h480_noexit_b210
+  universe_filter: cost_feasible
+
+# The model specification 04_model_based_features estimates under. Declared here rather than
+# typed into the notebook so that a window is one number in one place, readable without opening
+# the code that consumes it.
+#
+# This case study fits no GARCH, no regime chain and no ARIMA: its three procedures are a
+# heterogeneous autoregression of realized variance, a rolling Fourier transform and a rolling
+# depth-2 path signature. Only the first estimates anything, which is why only `har` carries a
+# refit schedule.
+model_based:
+  har:
+    # The three lengths of history the regression averages squared one-minute returns over,
+    # in bars. Corsi's day/week/month on a minute grid: minutes, a quarter hour, an hour.
+    components: [5, 15, 60]
+    # Bars of history each refit reads. Two hours - long enough for four coefficients to be
+    # identified, short enough that the fit follows the day rather than the quarter. It is
+    # also the burn-in: the first `fit_window + 1` bars of a symbol carry no HAR value,
+    # because they are what pays for the first estimate.
+    fit_window: 120
+    # Bars between refits. One, which is the finest cadence the panel has and the reason this
+    # artifact carries no fold column: the coefficients describing bar t come from a
+    # regression whose last observation is bar t-1, so no fold boundary enters the fit and a
+    # bar's value is the same value whichever fold selects it.
+    refit_every: 1
+    # Usable observations a refit window needs before it is fitted at all. Below this the four
+    # coefficients are estimated off too few points to identify them, and the bar keeps a null
+    # rather than a fit on whatever survived the warm-up.
+    min_train_obs: 20
+  spectrum:
+    # Bars each trailing window spans. Sixty resolves repetition periods up to an hour, which
+    # is the longest intraday rhythm this panel is asked about.
+    window: 60
+    # The period, in bars, above which power counts as low frequency. Twenty separates a slow
+    # drift in activity from minute-to-minute churn, and it is what `*_low_freq_ratio` is the
+    # share of.
+    low_frequency_period: 20
+  signature:
+    # Bars each signature path spans. Thirty is the horizon over which order flow and price are
+    # expected to lead one another, which is the quantity the cross terms measure.
+    window: 30
 
 evaluation:
   n_splits: 2
@@ -657,29 +816,38 @@ modeling:
     # CUDA-free environment fail on a requirement nobody wrote down. A run on other
     # hardware sets the notebook's DEVICE parameter, which is then what gets registered.
     device: gpu
-    # How many training windows one sequence configuration draws per fold. This is the only
-    # case study that needs the key: every row of a panel starts a window, and this panel is
-    # minute bars, so an uncapped fold builds about 4.0 million near-identical overlapping
-    # sequences where the daily case studies build tens of thousands. Measured on the
-    # canonical plan, 2026-09-02: fold 0 has 4,066,041 training rows and fold 1 has 3,997,571,
-    # across 115 symbols, so uncapped is 5.4x this value and the family's cost goes with it.
+    # How far apart the training windows of one sequence configuration sit, counted in
+    # label horizons. This is the only case study that needs the key: every row of a panel
+    # starts a window, and this panel is minute bars, so an unspaced fold builds about 4.0
+    # million near-identical overlapping sequences where the daily case studies build tens
+    # of thousands. Measured on the canonical plan, 2026-09-02: fold 0 has 4,066,041
+    # training rows and fold 1 has 3,997,571, across 115 symbols.
     #
-    # **This number is a compute budget, not a modelling claim, and it is stated that way
-    # deliberately.** It has been 750,000 since the original release and was carried unchanged
-    # through the stage-06 rebuild that moved the folds underneath it, so nothing derives it.
-    # For scale: consecutive windows share 59 of their 60 observations, one window per 60-bar
-    # lookback would give about 67,800 per fold, and one per 15-minute label horizon about
-    # 271,000. At 750,000 a window is drawn every 5.4 minutes, which is finer than the horizon,
-    # so neighbouring training windows still carry overlapping labels.
+    # One window per label horizon. Consecutive windows of a symbol then carry labels that
+    # do not overlap: the window ending at t is scored on the return from t to t+H, and the
+    # next one starts at t+H. Every window is still an example the model has to fit; what
+    # changes is that no two of them are the same example seen twice.
     #
-    # Overlapping training windows are not wrong - they are correlated examples rather than
-    # invalid ones, and a noisy intraday target is a reasonable place to want many of them.
-    # What is missing is an argument for this value rather than another, and the value is now
-    # part of the training identity, so the argument has to exist before the number can be
-    # defended. That is ml4t/agent-workspace#1015. It is left at 750,000 here because changing
-    # it changes what every deep-learning result in this chapter describes, and that is a
-    # decision to take on the evidence rather than hours before a production run.
-    max_train_sequences: 750000
+    # Declared in horizons rather than in windows because the horizon differs by label, and
+    # one line then covers all four: `fwd_ret_15m` and `fwd_dir_15m` stride 15 observations,
+    # `fwd_ret_5m` strides 5 and `fwd_ret_60m` strides 60, each spacing its own labels
+    # exactly. A single count could only be right for one of them. On fold 0 the primary
+    # label draws about 271,000 windows, and the count is derived at run time and printed,
+    # not written down here - it differs between folds because the folds differ in length.
+    #
+    # This replaces `max_train_sequences: 750000`, which had been carried unchanged since
+    # the original release and through the stage-06 rebuild that moved the folds underneath
+    # it, so nothing derived it. At 750,000 a window was drawn every 5.4 minutes, finer than
+    # the 15-minute horizon, so neighbouring training windows carried overlapping labels and
+    # the extra 2.8x of them were re-presentations of examples already in the batch. That is
+    # not wrong - correlated examples are not invalid ones - but it was a number with no
+    # argument behind it, and the number is part of the training identity
+    # (ml4t/agent-workspace#1015).
+    #
+    # `max_train_sequences` is still available and is what a case study declares when it
+    # wants the overlap: it fixes the count and lets the spacing follow. The two are
+    # mutually exclusive.
+    train_sequence_stride_horizons: 1
   gbm:
     libraries: [lightgbm]
     preset: default

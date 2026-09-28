@@ -28,7 +28,7 @@
 # - Build cross-dataset comparison tables
 # - Export summary DataFrames for downstream notebooks (02–06)
 #
-# **Book Reference**: Chapter 20, Section 20.1 (The Nine Case Studies)
+# **Book Reference**: Chapter 20, Section 20.1 (First-pass results across nine case studies)
 #
 # **Prerequisites**: Case studies must have run Ch16–19 backtests.
 
@@ -37,19 +37,19 @@
 
 import json
 import sqlite3
-import warnings
 from functools import cache
+from pathlib import Path
 
 import polars as pl
 import yaml
 from IPython.display import Markdown, display
 
-warnings.filterwarnings("ignore")
-
 from case_studies.utils.backtest_explorer import BacktestExplorer
 from case_studies.utils.benchmark import load_benchmark_returns
 from case_studies.utils.strategy_analysis import (
+    allocation_method_of,
     compute_cost_bps,
+    rank_one,
     training_run_fitted_for_the_holdout,
 )
 from utils.paths import REPO_ROOT, get_case_study_dir, get_chapter_dir
@@ -62,10 +62,16 @@ MAX_SYMBOLS = 0
 # full 9-CS aggregation.
 CASE_STUDIES: list[str] = []
 # Test-only: in an isolated test registry, nasdaq's out-of-band cost-feasible
-# carrier is absent, so its spine cannot resolve. Production leaves this False
-# (a missing carrier fails loudly); the test harness sets it True so cost/risk
+# selected configuration is absent, so its spine cannot resolve. Production leaves this False
+# (a missing selection fails loudly); the test harness sets it True so cost/risk
 # for such a case study are reported not-applicable instead of raising.
 ALLOW_MISSING_SPINE = False
+# A full-mode run overwrites the nine-case-study artifacts every downstream notebook and the
+# chapter figures read. Refuse to start one unless all nine registries are present and carry
+# backtests, so a partial aggregation cannot be published as a complete one. The test harness
+# sets this False because its isolated registry is not the production store; a subset run
+# (`CASE_STUDIES` non-empty) is the per-case-study driver path and is never full mode.
+REQUIRE_ALL_REGISTRIES = True
 
 # %%
 OUTPUT_DIR = get_chapter_dir(20) / "output"
@@ -79,7 +85,7 @@ ALL_CASE_STUDIES = [
     "us_firm_characteristics",
     # FX rank-1 is linear/ridge_a100.0 on fwd_ret_21d (val Sharpe +0.048,
     # holdout +0.194), resolved after the 2026-06-01 DL-lookback fix. The
-    # earlier deep_learning/tcn carrier (val +0.108 / holdout -1.59) was an
+    # earlier deep_learning/tcn selection (val +0.108 / holdout -1.59) was an
     # artifact of gappy validation folds (lookback=60 warmup consumed each
     # fold's head); those sets were purged and the clean lineage re-resolved.
     # See backtest_audit.md and project_registry_hash_collisions.
@@ -136,6 +142,8 @@ FREQ_MAP = {
 # %%
 explorers: dict[str, BacktestExplorer] = {}
 configs: dict[str, dict] = {}
+unreadable_registries: list[str] = []
+empty_registries: list[str] = []
 
 for cs in ALL_CASE_STUDIES:
     try:
@@ -147,91 +155,180 @@ for cs in ALL_CASE_STUDIES:
             configs[cs] = {}
         summary = explorers[cs].summary()
         total = sum(summary.values())
-        print(f"  [OK] {cs}: {total} backtests ({summary})")
+        if total == 0:
+            empty_registries.append(cs)
+            print(f"  [EMPTY] {cs}: registry.db present, zero backtest runs")
+        else:
+            print(f"  [OK] {cs}: {total} backtests ({summary})")
     except FileNotFoundError:
+        unreadable_registries.append(cs)
         print(f"  [MISSING] {cs}: no registry.db")
 
 print(f"\nLoaded: {len(explorers)}/{len(ALL_CASE_STUDIES)} case studies")
 
 # %% [markdown]
-# ## Rank-1 Cluster Diagnostics
+# ### The full-mode precondition
 #
-# Rather than pre-committing to a single rank-1 configuration per
-# case study, we inspect the *cluster* of top configurations on the validation
-# split. A signal with genuine predictive structure shows a thick top-of-the-
-# distribution: many configurations cluster within a fold-standard-error of
-# the rank-1 Sharpe, and the implied pick is insensitive to small perturbations
-# in the selection rule. A thin cluster (large gap between rank-1 and rank-N)
-# suggests the rank-1 result is closer to a tail draw than a stable optimum.
+# This notebook overwrites the nine-case-study artifacts that notebooks 02 through 08 and the
+# chapter figures read. A run that finds only some of the nine registries produces an output
+# indistinguishable from a complete one, and on 2026-08-28 that is exactly what happened: a
+# synthesis run from a worktree carrying three registries stamped itself production and
+# published a holdout Sharpe under prose describing nine case studies. The push gate caught it;
+# the notebook did not.
 #
-# For each case study we report: the rank-1 Sharpe, the rank-10 Sharpe (if
-# 10 configs exist), the spread between them, the mean per-fold Sharpe, and
-# the number of folds in which the rank-1 configuration has positive Sharpe.
-# These are measurements that feed the downstream narrative.
-#
-# ### Carrier-selection rule
-#
-# The validation rank-1 for each case study is the highest-Sharpe validation
-# backtest across the three pipeline stages — signal selection, allocation,
-# and risk overlay. The deployed holdout carrier is the same full strategy
-# spec (signal method, allocation method, risk overlay name) retrained on
-# holdout data. When holdout retrain produces no usable backtest at that
-# full spec — degenerate predictions, vol-window-vs-history mismatch,
-# universe-filter rejection, or other generation failures — the rule falls
-# back to the next-highest validation Sharpe with a usable holdout, and so
-# on until one succeeds. The `_val_rank1_carrier` helper implements this
-# walk; `query_holdout_rows` and `_holdout_lineage_for` consume its output
-# to pin val/holdout pairs to the same full strategy carrier.
+# So a full-mode run refuses to continue unless every case study named above has a readable
+# registry holding backtests. A subset run - `CASE_STUDIES` non-empty, the per-case-study
+# driver path that repopulates one case study's paired metrics after its holdout lands - is not
+# full mode and is not covered by the check.
+
 
 # %%
-# Label restrictions that align the cluster-diagnostics rank-1 with the
-# rank-1 used for Ch20 holdout retrain. sp500_options trains ret_to_expiry
-# (HTM, coherent option costs) and four fixed-horizon straddle labels
-# (vectorized path with generic bps cost). The Ch20 narrative uses
-# ret_to_expiry as the HTM-coherent option-strategy reference; restricting
-# cluster-diagnostics to the same label keeps the §20.1 top-cluster numbers
-# aligned with the §20.5/§20.6 narrative.
-from holdout import LABEL_RESTRICTIONS as _CLUSTER_LABEL_RESTRICTIONS  # noqa: E402
+def refuse_partial_full_mode(
+    *,
+    expected: list[str],
+    subset: list[str],
+    unreadable: list[str],
+    empty: list[str],
+    enforce: bool = True,
+) -> None:
+    """Raise unless a full-mode run can see every registry it claims to aggregate.
 
-# Rung restrictions that pin the headline rank-1 to a specific execution
-# regime. sp500_options is evaluated under the O'Donovan-Yu (2025)
-# cost-mitigation cascade:
-#   - Rung-1 (naive round-trip): universe_filter="full",  exit_at_max_days=10
-#   - Rung-2 (HTM, full):        universe_filter="full",  exit_at_max_days=None
-#   - Rung-3 (HTM, liquid q20):  universe_filter="liquid", exit_at_max_days=None
-# Rung-2 is the chapter-wide rank-1 for cross-case-study comparisons; Rung-3
-# carries the rung-3 cascade per O'Donovan & Yu — full-universe HTM (rung-2)
-# is the demoted variant discussed in §20.5 and §18.8; the registered
-# strategy is rung-3 HTM+liquid (universe_filter='liquid', the bottom-
-# quintile half-spread universe). Both rung-1 (mid-to-mid bps) and rung-2
-# (full-universe HTM) carry universe_filter="full", so a `universe_filter`
-# filter alone is insufficient — `ORDER BY sharpe DESC LIMIT 1` then
-# silently picks whichever rung happens to have the higher Sharpe in
-# current data. The pin combines `universe_filter` and `exit_at_max_days`
-# so the rank-1 row is deterministic and HTM-coherent. Other case studies
-# have no entry here and skip the filter altogether.
-_RUNG3_PREDICATE = (pl.col("universe_filter") == "liquid") & pl.col("exit_at_max_days").is_null()
+    A subset run - ``subset`` non-empty - is the per-case-study driver path and is not
+    full mode, so it is never refused. ``enforce`` is the seeded-test-registry escape and
+    is False in exactly one place, ``tests/overrides.yaml``.
+    """
+    if not enforce or subset or not (unreadable or empty):
+        return
+    raise RuntimeError(
+        f"Full-mode synthesis needs all {len(expected)} registries present and holding "
+        "backtests, and this checkout does not have them. Refusing before anything is "
+        "written, because the artifacts this notebook overwrites are read as a complete "
+        "set covering every case study.\n"
+        f"  no registry.db:      {unreadable or 'none'}\n"
+        f"  zero backtest runs:  {empty or 'none'}\n"
+        "Run this once every case study has registered its backtests and the fleet has "
+        "stopped writing to them. Passing CASE_STUDIES is not a way round this: a subset "
+        "run repopulates one case study's paired metrics in its own registry and writes "
+        "none of the chapter-wide artifacts."
+    )
 
-# NASDAQ-100 pin: cost-feasible ensemble, chosen before the holdout was opened
-# and matched on those two design attributes, which any registry can satisfy.
-_NASDAQ_PREDICATE = (pl.col("universe_filter") == "cost_feasible") & (
-    pl.col("family") == "ensemble"
+
+refuse_partial_full_mode(
+    expected=ALL_CASE_STUDIES,
+    subset=CASE_STUDIES,
+    unreadable=unreadable_registries,
+    empty=empty_registries,
+    enforce=REQUIRE_ALL_REGISTRIES,
 )
 
-_CLUSTER_RUNG_RESTRICTIONS: dict[str, dict[str, object]] = {
-    "sp500_options": {
-        "predicate": _RUNG3_PREDICATE,
-        # Mirrors the polars predicate above for the holdout SQL path and
-        # for `progression(...)` calls that still need the scope pin.
-        "universe_filter": "liquid",
-        "exit_at_max_days": None,
-    },
-    "nasdaq100_microstructure": {
-        "predicate": _NASDAQ_PREDICATE,
-        "universe_filter": "cost_feasible",
-        "exit_at_max_days": None,
-    },
-}
+# %% [markdown]
+# ## Top-Cluster Diagnostics
+#
+# Rather than pre-committing to a single selected configuration per case study, we inspect the
+# *cluster* of top configurations on the validation split. A signal with genuine predictive
+# structure shows a thick top of the distribution: many configurations sit within a
+# fold-standard-error of the top-ranked Sharpe, and the implied pick is insensitive to small
+# perturbations in the selection rule. A thin cluster - a large gap between the top-ranked
+# configuration and the tenth - suggests the top result is closer to a tail draw than to a
+# stable optimum.
+#
+# For each case study we report the top-ranked Sharpe, the tenth-ranked Sharpe where ten
+# configurations exist, the spread between them, the mean per-fold Sharpe, and the number of
+# folds in which the top-ranked configuration has positive Sharpe. These are measurements that
+# feed the downstream narrative.
+#
+# ### The selection rule
+#
+# **A backtest's full strategy specification is the signal method, the allocation method and the
+# risk overlay taken together.** Naming all three is what makes a validation result and a
+# holdout result comparable, because it pins every stage rather than the signal alone.
+#
+# Each case study's selected configuration is the highest-Sharpe validation backtest across
+# those three pipeline stages. The deployed holdout configuration is that same specification,
+# retrained on holdout data. When the holdout retrain produces no usable backtest at it -
+# degenerate predictions, a vol window that does not match the history available, a universe
+# filter that rejects the sample, or another generation failure - the rule falls back to the
+# next-highest validation Sharpe that does have a usable holdout, and so on until one succeeds.
+# The helper implementing that walk feeds the holdout query and the lineage resolver, which pin
+# each validation and holdout pair to one specification.
+
+# %% [markdown]
+# ### Two restrictions, and why the selection needs both
+#
+# **A label restriction**, so the cluster diagnostics and the Chapter 20 holdout retrain rank the
+# same thing. sp500_options trains a hold-to-maturity label with coherent option costs alongside
+# four fixed-horizon straddle labels priced through the vectorized path with a generic
+# basis-point cost. The Chapter 20 narrative uses the hold-to-maturity label as its
+# option-strategy reference, so restricting the cluster diagnostics to that same label keeps the
+# §20.1 top-cluster numbers aligned with the §20.5 and §20.6 narrative.
+#
+# Those two section numbers are right, and they are recorded here because they will not look it.
+# Eleven references in this chapter pointed at sections that exist and do not carry what was
+# claimed, and a sweep for §20.5 in a chapter-20 notebook now finds this one and sees the same
+# shape. It is not the same: §20.5's Table 20.6 carries an sp500_options allocator row, and which
+# row that is depends on the label pinned here; §20.6 carries the option cost model, which is the
+# hold-to-maturity accounting rather than the basis-point sweep the other four labels get. Both
+# targets hold material this restriction decides. Do not retarget it.
+#
+# **An execution-regime restriction**, because sp500_options is evaluated under the
+# O'Donovan-Yu (2025) cost-mitigation cascade, whose three rungs are a naive round trip, full
+# hold-to-maturity, and hold-to-maturity restricted to the liquid bottom-spread quintile. The
+# registered strategy is the third rung; the second is the demoted variant §18.8 discusses. The
+# first two rungs both carry the same universe filter, so filtering on that column
+# alone leaves `ORDER BY sharpe DESC LIMIT 1` free to pick whichever of the two happens to score
+# higher in the current data. Pinning the universe filter *and* the exit rule together is what
+# makes the selected row deterministic and coherent with hold-to-maturity. Case studies with no
+# entry here skip the filter altogether.
+
+# %%
+# The rung pins are imported, not restated. This file used to carry its own copy of both
+# predicates and of the dict around them, verbatim, and `paired_metrics.populate_paired_metrics`
+# carries the other - both write `backtest_paired_metrics`, so a pin corrected on one side only
+# would let one of them overwrite the other's rows with a differently-selected lineage. The
+# duplication is how that drift happens, and the mirror keys beside each predicate
+# (`universe_filter`, `exit_at_max_days`, `label`) exist for the SQL paths and `progression(...)`
+# calls that cannot take a polars expression.
+from case_studies.utils.paired_metrics import RUNG_PINS as _CLUSTER_RUNG_RESTRICTIONS  # noqa: E402
+from case_studies.utils.strategy_analysis import (  # noqa: E402
+    LABEL_RESTRICTIONS as _CLUSTER_LABEL_RESTRICTIONS,
+)
+from case_studies.utils.strategy_analysis import (  # noqa: E402
+    NoSelectableCandidates,
+    resolve_solvent_carrier,
+    selectable_validation_candidates,
+)
+
+
+@cache
+def _canonical_carrier(cs: str) -> dict | None:
+    """The configuration this case study reports, from the resolver that decides it.
+
+    This notebook built the same cross-stage rank-1 by hand in four places - concatenating
+    `explorer.best` over signal, allocation and risk_overlay, dropping benchmark families,
+    applying `LABEL_RESTRICTIONS` and `RUNG_PINS`, and taking the highest Sharpe. Three of
+    them wanted the winner and read it from here; the fourth, `_val_rank1_carrier`, walks the
+    whole field and takes it from `selectable_validation_candidates`, which is the same
+    ranking one step earlier. That is not the ranking the case studies report. `resolve_canonical_rank1_lineage` re-ranks the field
+    on exact common timestamp support whenever a conformal candidate is in it, because a
+    conformal allocator abstains until it is calibrated and books zeros over the abstention,
+    and it applies `UNIVERSE_RESTRICTIONS` and `CARRIER_PINS` besides. Measured 2026-09-18
+    against the nine canonical registries, the two rankings named different configurations on
+    two case studies: `fx_pairs` (`linear/ridge_a1000000.0` at Sharpe 0.4121
+    against `deep_learning/lstm_h64` at comparison Sharpe 0.3091) and
+    `nasdaq100_microstructure` (`deep_learning/nlinear` on fwd_ret_15m at 2.3001 against
+    `gbm/default_multiclass` on fwd_dir_15m at 2.4159). `spine_prediction_hash` is what
+    `05_portfolio_allocation` and Figure 20.7 pin their allocator comparison to, so on
+    `fx_pairs` the chapter compared allocators on a configuration the case study does not
+    report.
+
+    Returns None where the resolver finds nothing selectable, which is the state the
+    hand-built rankings reported as an empty frame. An insolvent or mis-calibrated carrier
+    still raises: it is a sweep to fix, not a case study to skip.
+    """
+    try:
+        return resolve_solvent_carrier(cs)
+    except NoSelectableCandidates:
+        return None
 
 
 def _retired(cs: str) -> frozenset[str]:
@@ -302,11 +399,11 @@ def _apply_rung_restriction(df: pl.DataFrame, cs: str) -> pl.DataFrame:
     return df.filter(rung["predicate"])
 
 
-# Carrier pin: a validation-time a-priori tie-break, distinct from the rung restrictions
-# above. EMPTY, and that is the normal state. It held
-# `"us_firm_characteristics": pl.col("config_name") == "default_huber"` until 2026-08-25,
-# copied from case_studies.utils.strategy_analysis.CARRIER_PINS and translated into a
-# config-name predicate, under a "keep in sync" comment doing the job a mechanism should.
+# There is no selected configuration pin here, and there is no mechanism for one.
+# `_CARRIER_PIN_PREDICATES` held `"us_firm_characteristics": pl.col("config_name") ==
+# "default_huber"` until 2026-08-25, copied from `case_studies.utils.strategy_analysis.CARRIER_PINS`
+# and translated into a config-name predicate, under a "keep in sync" comment doing the job a
+# mechanism should.
 #
 # It had not been in sync for a rebuild. Against the current registry `default_huber` is the
 # WEAKEST of the ten configs that reached the allocation stage (48 validation backtests, best
@@ -314,29 +411,15 @@ def _apply_rung_restriction(df: pl.DataFrame, cs: str) -> pl.DataFrame:
 # (59 backtests, 3.116). So this restricted one case study to its worst advanced configuration
 # while every notebook inside that case study reported its best.
 #
-# Worse than the hash pin removed from CARRIER_PINS the same day, because a hash pin dies loudly:
-# every hash changes when a sweep is rebuilt, so it resolves to nothing and stops. A config-name
-# predicate survives the rebuild and keeps selecting, silently and wrongly.
+# Worse than the hash pin removed from `CARRIER_PINS` the same day, because a hash pin dies
+# loudly: every hash changes when a sweep is rebuilt, so it resolves to nothing and stops. A
+# config-name predicate survives the rebuild and keeps selecting, silently and wrongly.
 #
-# If a carrier restriction is ever needed here again, call `carrier_pins.carrier_config_name(cs)`,
-# which resolves a pin to its config through the registry - the thing this copy existed to avoid
-# and the thing that would have failed loudly instead of filtering to the wrong config.
-_CARRIER_PIN_PREDICATES: dict[str, pl.Expr] = {}
-
-
-def _apply_carrier_pin(df: pl.DataFrame, cs: str) -> pl.DataFrame:
-    """Restrict candidate rows to the pinned model carrier, if configured.
-
-    Applied alongside `_apply_rung_restriction` at every cross-stage
-    carrier-selection site (signal / allocation / cross-stage spine /
-    holdout-pairing walk). Deliberately NOT applied to the §20.3 rank-cluster
-    diagnostics, which measure the rank-cluster width across the full model
-    space and must stay carrier-agnostic.
-    """
-    pred = _CARRIER_PIN_PREDICATES.get(cs)
-    if pred is None or df.is_empty() or "config_name" not in df.columns:
-        return df
-    return df.filter(pred)
+# The mapping stayed empty behind an `_apply_carrier_pin` that could no longer fire, which is a
+# second implementation of a rule nothing applied. A selected configuration restriction needed here
+# again is `carrier_pins.carrier_config_name(cs)`, which resolves an owner's pin to its config
+# through the registry - the thing the copy existed to avoid, and the thing that would have failed
+# loudly rather than filtering to the wrong config.
 
 
 def _progression_for(
@@ -517,11 +600,10 @@ overview_df = pl.DataFrame(overview_rows)
 overview_df.select("case_study", "asset_class", "frequency", "universe", "cost_bps")
 
 # %% [markdown]
-# The test bed covers equity ETFs, crypto perpetuals, intraday microstructure,
-# equity+options, firm characteristics, FX, futures, pure options, and a broad
-# equity panel. Cost assumptions range from 6.5 bps (S&P 500 Eq+Opt) to
-# 12.5 bps (US Firms, US Equities), reflecting the diversity of transaction
-# cost regimes across asset classes.
+# The test bed covers equity ETFs, crypto perpetuals, intraday microstructure, equity plus
+# options, firm characteristics, FX, futures, pure options, and a broad equity panel. The
+# `cost_bps` column of the table above records the transaction-cost assumption each one
+# carries, so a later result can be read against the cost regime it was measured under.
 
 # %% [markdown]
 # ## Model IC Comparison
@@ -594,20 +676,22 @@ else:
 ic_pivot
 
 # %% [markdown]
-# No single model family dominates across all nine case studies. GBM tends
-# to produce the best or near-best IC in most datasets (especially futures
-# and options), but linear models lead for ETFs. Negative mean ICs (e.g.,
-# FX Pairs across all families) flag case studies where prediction is
-# genuinely difficult. S&P 500 Options shows the highest raw ICs, but
-# single-name option execution costs materially compress the translated
-# Sharpe — §20.5 discusses how that compression plays out per variant.
+# Each cell is the mean of `ic_mean` over that family's non-holdout prediction sets, taken at
+# the primary label the case study declares in `setup.yaml`, with `causal_dml` excluded because
+# its runs are not fit to predict. Families are comparable within a row, since the label is
+# fixed across the row; they are not comparable across rows, because each case study declares a
+# different primary label, from a fifteen-minute forward return to a twenty-one-day one, and
+# prices a different instrument. A negative mean IC marks a case study where prediction is
+# difficult under that label rather than a defect in the family. §20.3 carries this table as
+# Table 20.4, and §20.6 works through how an option case study's raw IC translates into Sharpe
+# once single-name execution costs are charged.
 
 # %% [markdown]
 # ## Backtest Comparison
 #
-# Cross-dataset comparison of pipeline outcomes. Each row picks the best
-# result at each stage **independently** — the best signal may come from a
-# different model than the best allocation.
+# Cross-dataset comparison of pipeline outcomes. Each row takes the highest-Sharpe result at
+# each stage **independently**, so the signal that tops one column may come from a different
+# model than the allocation that tops the next.
 
 
 # %%
@@ -621,8 +705,10 @@ def build_backtest_rows():
         # etc.) since §20.4's model comparison is about trained models, not
         # passive baselines. Also apply case-study label and universe-filter
         # restrictions so the Ch20 rank-1 is HTM-coherent for sp500_options
-        # and pinned to the Rung-2 full-universe baseline (the mitigated
-        # Rung-3 liquid-subset variant is reported separately in §20.5).
+        # and pinned to the Rung-3 liquid subset, which is what
+        # `strategy_analysis.UNIVERSE_RESTRICTIONS` holds ({"sp500_options":
+        # "liquid"}). The Rung-2 full universe is retained only for the §18.8
+        # cascade comparison and never anchors the deployed carrier.
         label_restriction = _CLUSTER_LABEL_RESTRICTIONS.get(cs)
         signal_candidates = _best_pinned(explorer, cs, "signal", 200)
         if not signal_candidates.is_empty() and "family" in signal_candidates.columns:
@@ -636,14 +722,13 @@ def build_backtest_rows():
                 pl.col("label").is_in(list(label_restriction))
             )
         signal_candidates = _apply_rung_restriction(signal_candidates, cs)
-        signal_candidates = _apply_carrier_pin(signal_candidates, cs)
         best_signal = signal_candidates.head(1)
         signal_sharpe = best_signal["sharpe"][0] if not best_signal.is_empty() else None
         best_source = best_signal["source"][0] if not best_signal.is_empty() else ""
 
         # Carrier-pred pin for cost/risk. Case studies with a rung restriction
         # (nasdaq cost-feasible ensemble) carry their headline cost/risk on the
-        # carrier prediction only; the full-universe sweep rows are the
+        # selected prediction only; the full-universe sweep rows are the
         # Ch18/Ch19 cost-defeat demonstration and must not pool into the
         # cross-case comparison. Other case studies pass None (no pin) and keep
         # the registry-wide aggregation unchanged.
@@ -670,22 +755,14 @@ def build_backtest_rows():
                     pl.col("label").is_in(list(label_restriction))
                 )
             alloc_candidates = _apply_rung_restriction(alloc_candidates, cs)
-            alloc_candidates = _apply_carrier_pin(alloc_candidates, cs)
             best_alloc = alloc_candidates.head(1)
             alloc_sharpe = best_alloc["sharpe"][0] if not best_alloc.is_empty() else None
-            # When a carrier pin is active, the allocator comparison must run on
-            # the pinned carrier's prediction so the reported best_allocator NAME
-            # matches the pinned alloc_sharpe. Without this, compare_allocators
-            # pools across every prediction (e.g. an experimental conformal run on
-            # a non-carrier model) and can return an allocator that was never run
-            # on the deployed carrier. Non-pinned CSes pass None (unchanged).
-            alloc_comp_pred = (
-                best_alloc["prediction_hash"][0]
-                if cs in _CARRIER_PIN_PREDICATES and not best_alloc.is_empty()
-                else None
+            # The allocator that produced `alloc_sharpe`, read from that row's own spec, so
+            # the name and the number describe one configuration. See
+            # `strategy_analysis.allocation_method_of`.
+            best_allocator = allocation_method_of(
+                cs, best_alloc["backtest_hash"][0] if not best_alloc.is_empty() else None
             )
-            alloc_comp = explorer.compare_allocators(prediction_hash=alloc_comp_pred)
-            best_allocator = alloc_comp["allocator"][0] if not alloc_comp.is_empty() else ""
         else:
             alloc_sharpe = None
             best_allocator = ""
@@ -704,30 +781,19 @@ def build_backtest_rows():
         if _stage_applicable(cs, "risk"):
             risk_df = explorer.risk_impact(prediction_hash=carrier_pred)
             if not risk_df.is_empty():
-                best_risk_row = risk_df.sort("sharpe", descending=True).head(1)
+                # rank_one, not a one-key sort: overlays that never trigger book the
+                # baseline Sharpe exactly, so ties at the top are ordinary here and a
+                # one-key sort would let frame order decide the name reported below.
+                best_risk_row = rank_one(risk_df, by="sharpe", name="risk_name")
                 best_overlay = best_risk_row["risk_name"][0]
                 managed_sharpe = best_risk_row["sharpe"][0]
 
-        # Spine rank-1 prediction_hash — cross-stage rank-1 across
-        # signal/allocation/risk_overlay, matching the paired-bootstrap
-        # cross-stage leader logic below (and Ch20 prose Tables 20.5–20.7).
-        # Without this, Figure 20.7 can read off a different prediction than
-        # the prose tables.
-        cross_stage = pl.concat(
-            [_best_pinned(explorer, cs, s, 2000) for s in ("signal", "allocation", "risk_overlay")],
-            how="diagonal_relaxed",
-        )
-        if not cross_stage.is_empty() and "family" in cross_stage.columns:
-            cross_stage = cross_stage.filter(pl.col("family") != "benchmark")
-        if label_restriction and "label" in cross_stage.columns and not cross_stage.is_empty():
-            cross_stage = cross_stage.filter(pl.col("label").is_in(list(label_restriction)))
-        cross_stage = _apply_rung_restriction(cross_stage, cs)
-        cross_stage = _apply_carrier_pin(cross_stage, cs)
-        if not cross_stage.is_empty():
-            cross_stage = cross_stage.sort("sharpe", descending=True).unique(
-                subset=["prediction_hash"], keep="first", maintain_order=True
-            )
-        spine_pred_hash = cross_stage["prediction_hash"][0] if not cross_stage.is_empty() else None
+        # Spine rank-1 prediction_hash - the configuration the case study reports, taken
+        # from `_canonical_carrier` rather than ranked a second time here. Figure 20.7 and
+        # `05_portfolio_allocation` both read this value, and Ch20 prose Tables 20.5-20.7
+        # quote the resolver, so the two have to be one answer.
+        _carrier = _canonical_carrier(cs)
+        spine_pred_hash = _carrier["val_prediction_hash"] if _carrier else None
 
         bt_rows.append(
             {
@@ -767,41 +833,38 @@ print(
 )
 
 # %% [markdown]
-# Eight of nine case studies produce positive signal-stage Sharpe; only
-# FX Pairs enters the pipeline negative (-0.00) and stays marginal through
-# allocation. US Firms and Crypto Perps post the highest signal-stage Sharpes
-# (2.75, 2.09), and US Firms carries that signal forward to a 1.77 holdout.
-# The lineage table below traces each rank-1 prediction across the stages in
-# the order the backtests run: baseline, allocation, risk overlay, then the
-# cost sweep charged against whatever survived. A Sharpe that rises from one
-# column to the next is what that stage added, and only where the later stage
-# carries the earlier one's configuration - the paired rows above say which
-# transitions meet that test. NASDAQ-100 is excluded
-# from that comparison in v3.0 because its timing-corrected broad cost and risk
-# grids are deferred to v3.1.
+# Read the baseline column of the table above for how many case studies enter the pipeline with
+# a positive baseline-stage Sharpe and which do not. Those counts move whenever a registry is
+# rebuilt, which is why they are in the table rather than in this sentence.
+#
+# The lineage table below traces each selected prediction across the stages in the order the
+# backtests run: baseline, allocation, risk overlay, then the cost sweep charged against
+# whatever survived. A Sharpe that rises from one column to the next is what that stage added,
+# and only where the later stage carries the earlier one's configuration - the paired rows above
+# say which transitions meet that test. NASDAQ-100 is excluded from that comparison in v3.0
+# because its timing-corrected broad cost and risk grids are deferred to v3.1.
 
 # %% [markdown]
 # ## Paired-Bootstrap Comparison vs Equal-Weight Benchmark
 #
-# Each case study's rank-1 signal-stage backtest (with the same label,
-# universe-filter, and rung restrictions used for the cluster diagnostics) is
-# compared to its equal-weight benchmark using a **paired stationary block
-# bootstrap on daily strategy returns**. Block length is derived from
+# Each case study's selected baseline-stage backtest, under the same label, universe-filter and
+# rung restrictions used for the cluster diagnostics, is compared to its equal-weight benchmark
+# using a **paired stationary block bootstrap on daily strategy returns**. Block length is derived from
 # ``setup.yaml.labels.{label}.rebalance_step`` (falling back to the optimal
 # block size, never below the label horizon). Reported quantities:
 #
-# - ``sharpe_diff`` with 95 % bootstrap CI
-# - ``ret_diff`` (annualized return difference) with 95 % CI
+# - ``sharpe_diff`` with a bootstrap confidence interval
+# - ``ret_diff``, the annualized return difference, with its confidence interval
 # - ``info_ratio`` of the daily-return difference
 # - ``prob_challenger_wins`` — bootstrap fraction in which challenger Sharpe
 #   exceeds the benchmark
 # - ``p_value`` — two-sided bootstrap p-value for ``sharpe_diff = 0``
 #
 # Results land in ``backtest_paired_metrics`` (per case study) and roll up
-# into the cross-dataset table below. This is the right unit of uncertainty
-# for the headline rank-1 claim: not the Sharpe alone, but the Sharpe
-# **difference vs the passive baseline that experienced the same market
-# conditions**.
+# into the cross-dataset table below. Intervals are at the conventional confidence level the
+# bootstrap call sets. This is the right unit of uncertainty for the headline claim about the
+# selected configuration: the Sharpe **difference against the passive baseline that experienced
+# the same market conditions**, rather than the Sharpe alone.
 
 
 # %%
@@ -888,6 +951,7 @@ from case_studies.utils.uncertainty import (
     compute_independent_diff_uncertainty,
     compute_paired_uncertainty,
     descends_from,
+    joint_returns,
 )
 
 
@@ -907,58 +971,20 @@ def _min_paired_n(ppy: int) -> int:
     return 21  # daily / 8h / intraday
 
 
-def _joint_coerce(c_arr, b_arr):
-    """Filter NaN/non-finite jointly across paired series and trim leading
-    rows where *either* is zero. Matches ``_coerce_returns`` semantics but
-    preserves index alignment so ``compute_paired_uncertainty``'s
-    equal-length precondition survives — the upstream helper trims leading
-    zeros independently per series, which can desynchronize a paired
-    bootstrap if one side has more leading inactive bars than the other.
-    """
-    c = np.asarray(c_arr, dtype=np.float64)
-    b = np.asarray(b_arr, dtype=np.float64)
-    finite = np.isfinite(c) & np.isfinite(b)
-    c, b = c[finite], b[finite]
-    if c.size == 0:
-        return c, b
-    nonzero = np.flatnonzero((c != 0.0) & (b != 0.0))
-    if nonzero.size == 0:
-        return c[:0], b[:0]
-    start = int(nonzero[0])
-    return c[start:], b[start:]
-
-
 # Distinguish skipped CSs from real failures so empty cross-dataset rollups
 # aren't indistinguishable from a silent crash.
 paired_rows: list[dict] = []
 paired_skips: list[dict] = []
 
 for cs, explorer in explorers.items():
-    label_restriction = _CLUSTER_LABEL_RESTRICTIONS.get(cs)
-    # Cross-stage rank-1 (signal/allocation/risk_overlay), mirroring
-    # holdout.py::HOLDOUT_SELECTION_STAGES. Dedup by prediction_hash so the
-    # leader corresponds to a distinct trained model.
-    cand = pl.concat(
-        [_best_live(explorer, cs, s, 2000) for s in ("signal", "allocation", "risk_overlay")],
-        how="diagonal_relaxed",
-    )
-    if cand.is_empty() or "backtest_hash" not in cand.columns:
-        paired_skips.append({"case_study": cs, "reason": "no_signal_stage_candidates"})
+    # The leader is the configuration the case study reports, not a ranking rebuilt here.
+    # `_canonical_carrier` documents why the two are not the same ordering.
+    carrier = _canonical_carrier(cs)
+    if carrier is None:
+        paired_skips.append({"case_study": cs, "reason": "no_selectable_candidates"})
         continue
-    if "family" in cand.columns:
-        cand = cand.filter(pl.col("family") != "benchmark")
-    if label_restriction and "label" in cand.columns:
-        cand = cand.filter(pl.col("label").is_in(list(label_restriction)))
-    cand = _apply_rung_restriction(cand, cs)
-    if cand.is_empty():
-        paired_skips.append({"case_study": cs, "reason": "no_candidates_after_restriction"})
-        continue
-    cand = cand.sort("sharpe", descending=True).unique(
-        subset=["prediction_hash"], keep="first", maintain_order=True
-    )
-
-    leader_hash = cand["backtest_hash"][0]
-    leader_label = cand["label"][0] if "label" in cand.columns else None
+    leader_hash = carrier["val_backtest_hash"]
+    leader_label = carrier["label"]
     if not leader_label:
         paired_skips.append({"case_study": cs, "reason": "no_label_on_leader"})
         continue
@@ -985,7 +1011,9 @@ for cs, explorer in explorers.items():
             {"case_study": cs, "reason": f"insufficient_overlap:n={aligned.height}"}
         )
         continue
-    c_arr, b_arr = _joint_coerce(aligned["ret"].to_numpy(), aligned["ret_b"].to_numpy())
+    # A strategy against a benchmark: the leader's leading flat run is warmup before its
+    # first signal, not a position it held, so the sample starts where both are trading.
+    c_arr, b_arr = joint_returns(aligned["ret"].to_numpy(), aligned["ret_b"].to_numpy())
     if c_arr.size < min_n:
         paired_skips.append(
             {"case_study": cs, "reason": f"insufficient_after_coerce:n={c_arr.size}"}
@@ -1054,9 +1082,9 @@ if paired_skips:
 print(f"\npaired={len(paired_rows)}/{len(explorers)}, skipped={len(paired_skips)}/{len(explorers)}")
 
 # %% [markdown]
-# Read each row as: rank-1 challenger annualized Sharpe **minus** equal-weight
-# benchmark Sharpe, with a 95 % CI from the paired stationary block bootstrap
-# on the daily-return difference; the information ratio summarizes the
+# Read each row as the selected challenger's annualized Sharpe **minus** the equal-weight
+# benchmark's, with a confidence interval from the paired stationary block bootstrap on the
+# daily-return difference; the information ratio summarizes the
 # excess-return-to-tracking-error ratio; ``prob_wins`` is the fraction of
 # bootstrap resamples in which the challenger beat the benchmark; ``p_value``
 # tests ``H0: sharpe_diff = 0``. A confident "the model adds skill over the
@@ -1068,18 +1096,19 @@ print(f"\npaired={len(paired_rows)}/{len(explorers)}, skipped={len(paired_skips)
 # %% [markdown]
 # ## Paired metrics — full coverage for strategy-analysis notebook
 #
-# The block above populates pair type #1 (signal rank-1 vs equal-weight,
-# overall window). The strategy-analysis notebook (per-CS strategy notebooks)
+# The block above populates the first pair type, the selected baseline signal against
+# equal-weight over the whole window. The strategy-analysis notebook (per-CS strategy notebooks)
 # requires five additional pair types per case study to render §2 (stage-
 # transition waterfall), §6 (holdout decay + holdout-vs-benchmark) and §7
 # (benchmark-aware diagnostics) without inline bootstrap recomputation.
 #
 # The pair set:
 #
-# 1. signal rank-1 (overall) ↔ equal-weight (overall) — populated above
-# 2. signal rank-1 (holdout) ↔ equal-weight (holdout window)
-# 3. holdout rank-1 ↔ validation rank-1 (same lineage decay; min-length
-#    truncation since the windows are disjoint)
+# 1. selected signal (overall) ↔ equal-weight (overall) — populated above
+# 2. selected signal (holdout) ↔ equal-weight (holdout window)
+# 3. the selected configuration on holdout ↔ the same configuration on
+#    validation (same lineage decay; min-length truncation since the
+#    windows are disjoint)
 # 4-6. one pair per consecutive stage transition the prediction actually has,
 #    in ``STAGE_SEQUENCE`` order: allocation ↔ signal, risk-overlay ↔
 #    allocation, cost-sensitivity ↔ risk-overlay. A case study that did not
@@ -1101,7 +1130,7 @@ def _full_strategy_spec_from_backtest(db: sqlite3.Connection, bt_hash: str) -> d
     `bt_hash`'s spec_json. Returns None if the row is missing or signal has
     no `method` field.
 
-    The carrier of a backtest is the tuple (signal, allocation, risk). Pinning
+    A backtest's full specification is the tuple (signal, allocation, risk). Pinning
     the val→holdout pair on this full spec keeps the comparison apples-to-
     apples; pinning on signal alone allows MAX(sharpe) to surface a holdout
     row with a different allocation (e.g. conformal_weighted) or risk overlay
@@ -1140,7 +1169,7 @@ def _val_rank1_carrier(cs: str) -> dict | None:
     """Return ``{'spec', 'prediction_hash'}`` for ``cs``'s validation rank-1 carrier.
 
     The prediction hash is carried out alongside the spec because the holdout resolver
-    needs it: naming the carrier pins the configuration AND the checkpoint, and without
+    needs it: naming all three stages pins the configuration AND the checkpoint, and without
     it a case study that registered several checkpoints against one strategy is ambiguous
     and the resolver refuses. It was determinable all along - this walk had it in hand and
     threw it away - so refusing there would have dropped a case study out of the
@@ -1151,7 +1180,7 @@ def _val_rank1_carrier(cs: str) -> dict | None:
     risk_overlay) stages — walking candidates by val Sharpe descending until
     one with a matching holdout backtest at the SAME full spec is found.
 
-    Implements the carrier-selection rule documented in §20.1: the deployed
+    Implements the selection rule documented in §20.1: the deployed
     holdout for each case study is the val rank-1 across all three pipeline
     stages, retrained on holdout data; when retrain produces no usable
     holdout at that full spec (degenerate predictions, vol-window mismatch,
@@ -1166,36 +1195,30 @@ def _val_rank1_carrier(cs: str) -> dict | None:
     explorer = explorers.get(cs)
     if explorer is None:
         return None
-    cand = pl.concat(
-        [_best_live(explorer, cs, s, 2000) for s in ("signal", "allocation", "risk_overlay")],
-        how="diagonal_relaxed",
-    )
-    if cand.is_empty() or "backtest_hash" not in cand.columns:
+    # The field the resolver ranks, in the resolver's order, rather than a concat of
+    # `explorer.best` re-filtered here: the walk starts at the carrier `_canonical_carrier`
+    # names and falls through in the same order the resolver would. Every row is kept - no
+    # dedup by prediction_hash - because when the rank-1 configuration has no matching holdout
+    # retrain but a same-prediction lower-Sharpe variant (a different allocator or risk
+    # overlay) does, a dedup would jump to a different prediction instead of accepting the
+    # same-prediction variant as the apples-to-apples match.
+    try:
+        candidates = selectable_validation_candidates(cs)
+    except NoSelectableCandidates:
+        # The helper raises on an empty pool rather than returning one, and this walk's
+        # callers read `None` as "no holdout pair for this case study" - the state the
+        # hand-built ranking reported as an empty frame. A pool with nothing eligible in it
+        # is that state, not a reason to stop aggregating the other eight.
         return None
-    if "family" in cand.columns:
-        cand = cand.filter(pl.col("family") != "benchmark")
     label_restriction = _CLUSTER_LABEL_RESTRICTIONS.get(cs)
-    if label_restriction and "label" in cand.columns:
-        cand = cand.filter(pl.col("label").is_in(list(label_restriction)))
-    cand = _apply_rung_restriction(cand, cs)
-    cand = _apply_carrier_pin(cand, cs)
-    if cand.is_empty():
-        return None
-    # Do NOT dedup by prediction_hash here. The walk needs to surface every
-    # registered (signal, allocation, risk_overlay) tuple — when the val
-    # rank-1 carrier has no matching holdout retrain but a same-prediction
-    # lower-sharpe variant (different allocator or risk overlay) does, the
-    # dedup would silently jump to a *different* prediction instead of
-    # accepting the same-prediction variant as the apples-to-apples carrier.
-    cand = cand.sort("sharpe", descending=True)
 
     case_dir = get_case_study_dir(cs)
     db_path = case_dir / "run_log" / "registry.db"
     rung = _CLUSTER_RUNG_RESTRICTIONS.get(cs)
     db = sqlite3.connect(str(db_path))
     try:
-        for i in range(min(cand.height, 200)):
-            bt_hash = cand["backtest_hash"][i]
+        for candidate in candidates[:200]:
+            bt_hash = candidate["backtest_hash"]
             spec = _full_strategy_spec_from_backtest(db, bt_hash)
             if spec is None:
                 continue
@@ -1204,7 +1227,7 @@ def _val_rank1_carrier(cs: str) -> dict | None:
             #
             # Matching the spec alone made the walk stop at a candidate whose own checkpoint
             # had no holdout whenever a sibling checkpoint had one at the same spec. The
-            # resolver, handed that carrier, then finds nothing for it - and the walk has
+            # resolver, handed that configuration, then finds nothing for it - and the walk has
             # already stopped, so the case study reports no holdout while one exists for a
             # later candidate. Advancing instead is what makes the fall-through the resolver
             # no longer performs unnecessary rather than merely forbidden.
@@ -1216,7 +1239,7 @@ def _val_rank1_carrier(cs: str) -> dict | None:
                 JOIN training_runs t ON t.training_hash = p.training_hash
                 WHERE p.prediction_hash = ?
                 """,
-                (cand["prediction_hash"][i],),
+                (candidate["prediction_hash"],),
             ).fetchone()
             if carrier_row is None:
                 continue
@@ -1274,7 +1297,7 @@ def _val_rank1_carrier(cs: str) -> dict | None:
             ).fetchall()
             row = any(training_run_fitted_for_the_holdout(probe[0]) for probe in probe_rows)
             if row:
-                return {"spec": spec, "prediction_hash": cand["prediction_hash"][i]}
+                return {"spec": spec, "prediction_hash": candidate["prediction_hash"]}
     finally:
         db.close()
     return None
@@ -1377,7 +1400,7 @@ def _holdout_lineage_for(
     copies of the rule let a Chapter 20 run overwrite the case study's pairs with a different
     lineage, which is the reason the delegation matters beyond the duplication.
 
-    The carrier is named by its PREDICTION hash rather than its training hash, because that
+    The specification is named by its PREDICTION hash rather than its training hash, because
     pins the checkpoint as well as the configuration: one trained model registers one
     prediction set per declared checkpoint and they share a strategy spec.
 
@@ -1455,18 +1478,28 @@ def _populate_pair(
     label,
     *,
     disjoint_windows: bool = False,
+    challenger_overlays_baseline: bool = False,
     benchmark_label: str | None = None,
 ):
     """Compute one paired-metric row without mutating a case-study registry.
 
-    With ``disjoint_windows=True`` (val→holdout decay), each side is
-    bootstrapped independently over its full window and the difference
-    distribution is built from independent draws — no spurious head/tail
-    truncation. ``info_ratio`` columns will be NaN since there is no
-    aligned diff series to ratio.
+    With ``disjoint_windows=True`` (val→holdout decay), each side is bootstrapped
+    over its full window and the difference distribution is built from those draws,
+    because two windows sharing no timestamps leave no difference series to pair on.
+    ``info_ratio`` columns will be NaN for the same reason. See
+    :func:`case_studies.utils.uncertainty.compute_independent_diff_uncertainty` for
+    what that interval does and does not cover.
 
-    Otherwise, the streams are inner-joined on timestamp and a paired
-    stationary bootstrap runs on the aligned diff series.
+    Otherwise, the streams are inner-joined on timestamp and a paired stationary
+    bootstrap runs on the aligned diff series.
+
+    ``challenger_overlays_baseline`` says what a leading flat run on the challenger
+    means, and only the caller knows. Against a benchmark it is warmup before the
+    challenger's first signal and the sample starts where both are trading; for a risk
+    overlay against its own carrier it is a position the overlay chose to hold and is
+    the effect being measured, so the sample starts where either has traded. Every pair
+    this notebook builds is the first kind, and it says so rather than relying on a
+    default: see :func:`case_studies.utils.uncertainty.joint_returns`.
     """
     min_n = _min_paired_n(ppy)
     if disjoint_windows:
@@ -1507,8 +1540,14 @@ def _populate_pair(
             }
         c_arr = aligned["ret"].to_numpy()
         b_arr = aligned["ret_b"].to_numpy()
-        c_arr, b_arr = _joint_coerce(c_arr, b_arr)
-        n_overlap = c_arr.size
+        # Measured here, applied once inside `compute_paired_uncertainty`, which trims
+        # whatever it is handed. Handing it the already-trimmed pair silently undoes the
+        # overlay rule: the second trim runs under this function's own default, so an
+        # overlay pair would come back with the benchmark shape and no error. Same
+        # arrangement `paired_metrics._populate_pair` uses, because both write this table.
+        n_overlap = joint_returns(
+            c_arr, b_arr, challenger_overlays_baseline=challenger_overlays_baseline
+        )[0].size
         if n_overlap < min_n:
             return {
                 "cs": cs,
@@ -1525,6 +1564,7 @@ def _populate_pair(
             label=label,
             n_boot=2000,
             seed=42,
+            challenger_overlays_baseline=challenger_overlays_baseline,
         )
 
     if not paired:
@@ -1539,7 +1579,7 @@ def _populate_pair(
     # sizes); use min(n_c, n_b) so n_overlap reflects what the bootstrap
     # actually used, not the pre-coerce min from the populator. For the
     # paired path, paired has no n_c/n_b and n_overlap is already the
-    # post-_joint_coerce length.
+    # post-`joint_returns` length.
     n_actual = n_overlap
     n_c = paired.get("n_c")
     n_b = paired.get("n_b")
@@ -1563,39 +1603,17 @@ def _populate_pair(
 extra_paired_rows: list[dict] = []
 _PAIRED_STAGES = ("signal", "allocation", "risk_overlay")
 for cs, explorer in explorers.items():
-    label_restriction = _CLUSTER_LABEL_RESTRICTIONS.get(cs)
-    # Pool validation backtests across the same stages that holdout.py uses
-    # for cross-stage rank-1 (`HOLDOUT_SELECTION_STAGES`). When the val
-    # rank-1 is an allocation- or risk_overlay-stage strategy, the holdout
-    # retrain uses THAT strategy_spec; pulling only signal-stage candidates
-    # here surfaces a leader whose signal.method differs from the holdout's,
-    # so `_val_rank1_signal_spec` can't find a matching holdout (e.g.,
-    # crypto signal-stage rank-1 = quintile_long_short but cross-stage
-    # rank-1 = score_weighted/equal_weight_top_k). Carrier-selection rule:
-    # val rank-1 is the highest-Sharpe validation backtest across the three
-    # stages; see `_val_rank1_carrier`.
-    cand = pl.concat(
-        [_best_live(explorer, cs, s, 2000) for s in _PAIRED_STAGES],
-        how="diagonal_relaxed",
-    )
-    if cand.is_empty() or "backtest_hash" not in cand.columns:
+    # The same carrier the spine and the paired-bootstrap leader above take. The holdout
+    # retrain replays the rank-1's whole strategy spec, which is why this reads the
+    # cross-stage carrier rather than a signal-stage rank-1: on crypto the signal-stage
+    # rank-1 is `quintile_long_short` while the carrier is `score_weighted` over
+    # `equal_weight_top_k`, and `_val_rank1_signal_spec` would find no matching holdout.
+    carrier = _canonical_carrier(cs)
+    if carrier is None:
         continue
-    if "family" in cand.columns:
-        cand = cand.filter(pl.col("family") != "benchmark")
-    if label_restriction and "label" in cand.columns:
-        cand = cand.filter(pl.col("label").is_in(list(label_restriction)))
-    cand = _apply_rung_restriction(cand, cs)
-    cand = _apply_carrier_pin(cand, cs)
-    if cand.is_empty():
-        continue
-    cand = cand.sort("sharpe", descending=True).unique(
-        subset=["prediction_hash"], keep="first", maintain_order=True
-    )
-
-    leader = cand.row(0, named=True)
-    leader_hash = leader["backtest_hash"]
-    leader_phash = leader["prediction_hash"]
-    leader_label = leader.get("label")
+    leader_hash = carrier["val_backtest_hash"]
+    leader_phash = carrier["val_prediction_hash"]
+    leader_label = carrier["label"]
     if not leader_label:
         continue
     ppy = {"daily": 252, "weekly": 52, "monthly": 12, "8h": 1095}.get(
@@ -1616,18 +1634,18 @@ for cs, explorer in explorers.items():
     # risk) spec so val→holdout decay isn't measured across different
     # allocators (e.g. score_weighted vs conformal_weighted), different
     # position-sizing parameters, or different risk overlays.
-    # The carrier is whatever the WALK settled on, spec and prediction hash together, and it
+    # The selected configuration is whatever the WALK settled on, spec and prediction hash together, and it
     # is not `leader_phash`. The walk advances past the leader when the leader has no holdout
     # of its own, so passing the leader's hash alongside a later candidate's spec asks for a
     # holdout that matches neither - and the strict pin answers None rather than quietly
-    # falling through, which is how the case study would lose a fallback carrier it has.
+    # falling through, which is how the case study would lose a fallback configuration it has.
     #
     # The prediction hash is what is passed, not the training hash: it pins the checkpoint as
     # well as the configuration, and a correct holdout refit registers a NEW training identity
     # covering the holdout CV interval, so preferring the validation training hash could only
     # ever match a holdout scored from the validation-fitted model. The lookup that used to
     # sit here - prediction hash to training hash, with its own connection and error branch -
-    # is gone with it; the resolver reads the carrier itself.
+    # is gone with it; the resolver reads the selected configuration itself.
     #
     # The refusal is caught here for the same reason `query_holdout_rows` catches it: it is a
     # statement about ONE case study, and letting it propagate would end the loop and drop the
@@ -1662,6 +1680,9 @@ for cs, explorer in explorers.items():
                 bench_ho_norm,
                 ppy,
                 ho_label,
+                # A strategy against a benchmark, so a flat opening run on the holdout
+                # challenger is warmup before its first signal rather than a held position.
+                challenger_overlays_baseline=False,
                 benchmark_label=bench_ho_label,
             )
         )
@@ -1689,9 +1710,9 @@ for cs, explorer in explorers.items():
         )
 
     # Pair #3: holdout rank-1 ↔ validation backtest of the SAME lineage.
-    # Per-CS holdout regen may fall back from val rank-1 to rank-K when the
-    # rank-1 retrain produces degenerate predictions (see holdout.py
-    # `generate_holdout` fallback loop). When that happens, comparing the
+    # A case study's holdout notebook may fall back from val rank-1 to rank-K
+    # when the rank-1 retrain produces degenerate predictions. When that happens,
+    # comparing the
     # holdout against the val rank-1 of a *different* lineage measures
     # cross-lineage difference, not decay. Always pair against the
     # holdout-lineage's own validation backtest so val_rank1_self holds its
@@ -1700,8 +1721,8 @@ for cs, explorer in explorers.items():
         ho_family = ho_lineage["family"]
         ho_config = ho_lineage["config_name"]
         same_lineage = (
-            ho_family == leader["family"]
-            and ho_config == leader["config_name"]
+            ho_family == carrier["family"]
+            and ho_config == carrier["config_name"]
             and ho_label == leader_label
         )
         if same_lineage:
@@ -1758,6 +1779,11 @@ for cs, explorer in explorers.items():
                 prev_returns,
                 ppy,
                 leader_label,
+                # `champion_lineage` takes the best backtest at each stage independently, so
+                # two adjacent entries are not demonstrably parent and child and the later
+                # one can carry a genuine warmup. Same position `populate_paired_metrics`
+                # takes on the same transitions, because both write this table.
+                challenger_overlays_baseline=False,
             )
         )
 
@@ -1855,26 +1881,21 @@ else:
 prog_pivot
 
 # %% [markdown]
-# Most case studies only have complete data through the signal and allocation
-# stages for their best prediction hash. Where the full pipeline is available
-# (ETFs, CME Futures, S&P 500 Options), allocation generally preserves or
-# modestly improves signal-stage Sharpe, while costs and risk overlays
-# have mixed effects. The `null` entries indicate that the specific
-# prediction hash traced here was not tested at that stage — it does not
-# mean the case study lacks those stages entirely.
+# Read the columns left to right to see how far the selected prediction hash was carried and
+# where the trace stops. A `null` entry says that hash was not tested at that stage; it does
+# not say the case study lacks the stage.
 
 # %% [markdown]
-# ## Rank-1 Lineage
+# ## Selected-Configuration Lineage
 #
-# For each case study, trace the *locked* path through the pipeline for
-# the rank-1 validation signal: how Sharpe evolves when the same
-# prediction set is carried through allocation, cost, and risk stages.
-# Locking the prediction makes stage-to-stage deltas attributable — if
-# Sharpe moves between allocation and cost, we know the variable is
-# costs, not a silently changed upstream signal.
+# For each case study, trace the *locked* path through the pipeline for the selected validation
+# signal: how Sharpe moves when the same prediction set is carried through the allocation, cost
+# and risk stages. Locking the prediction makes each stage-to-stage difference attributable - if
+# Sharpe moves between allocation and cost, the variable is cost and not a silently changed
+# upstream signal.
 #
-# The path is: signal rank-1 → best allocation on that signal →
-# cost-tested version → risk-managed version.
+# The path is: the selected signal, then the highest-Sharpe allocation on that signal, then the
+# cost-tested version, then the risk-managed version.
 
 # %%
 lineage_rows = []
@@ -1944,20 +1965,18 @@ if not lineage_df.is_empty():
     )
 
 # %% [markdown]
-# The lineage table shows how the rank-1 signal's Sharpe moves stage by
-# stage. Case studies with blanks in later stages haven't run downstream
-# backtests for their specific rank-1 prediction hash — this says nothing
-# about whether those stages exist in the pipeline, only that they weren't
-# re-run after this hash became the rank-1. §20.3 discusses how to read
-# this pattern.
+# The lineage table shows how the selected signal's Sharpe moves stage by stage. A blank in a
+# later stage means no downstream backtest has been run for that prediction hash. It says
+# nothing about whether the stage exists in the pipeline, only that it was not re-run after this
+# hash became the selection. §20.3 works through how to read the pattern.
 
 # %% [markdown]
 # ## Holdout Integration
 #
 # Load holdout backtest results from each case study's registry.
-# These are the frozen out-of-sample validations generated by
-# [`00_holdout_predictions`](00_holdout_predictions.ipynb) and registered in `prediction_sets`
-# with `split='holdout'`.
+# These are the frozen out-of-sample validations each case study generates in its own
+# `NN_holdout_predictions` and `NN_holdout_backtest` pair, registered in `prediction_sets`
+# with `split='holdout'`. This chapter reads them; it does not produce them.
 
 
 # %%
@@ -1978,11 +1997,13 @@ def query_holdout_rows():
 
     Applies the same label / universe-filter restrictions as the
     cluster-diagnostics rank-1 selection so the reported holdout follows
-    the canonical signal. For sp500_options this means the headline
-    holdout row is the Rung-2 retrain (full universe, HTM) that matches
-    §20.1's −0.361 number; the Rung-3 retrain (liquid subset, +0.455) is
-    the §20.5 mitigation story and surfaced separately by the cascade
-    section of 20_strategy_analysis rather than as the headline.
+    the canonical signal. For sp500_options that is the Rung-3 retrain -
+    hold to maturity on the liquid bottom-quintile-half-spread subset -
+    because ``strategy_analysis.UNIVERSE_RESTRICTIONS`` pins the case study
+    to ``liquid`` and excludes full-universe rows from rank-1 selection.
+    The Rung-2 full-universe variant is the demoted one, kept for the
+    cost-mitigation cascade §18.8 works through rung by rung, and it is not
+    the headline here.
     """
     holdout_rows = []
     for cs in ALL_CASE_STUDIES:
@@ -2004,12 +2025,12 @@ def query_holdout_rows():
         # several candidates survive, and the other eight case studies still have rows to
         # report. The reason is printed rather than swallowed, because a case study silently
         # missing from the holdout table looks like unrun work.
-        # No carrier is an ANSWER here, and the answer is no row.
+        # No selected configuration is an ANSWER here, and the answer is no row.
         #
-        # The carrier IS the selection: the rank-1 validation configuration is the only thing
+        # The selection IS the answer: the rank-1 validation configuration is the only thing
         # that nominates a holdout, and the invariant the resolver exists to hold is that the
         # holdout is never chosen by its own holdout result. Falling through to an unpinned
-        # query when the carrier is missing breaks exactly that - it publishes whatever single
+        # query when the selected configuration is missing breaks exactly that - it publishes whatever single
         # eligible holdout the registry happens to hold, which is a holdout that selected
         # itself. This table is reader-facing, so it takes the pinned answer or none.
         #
@@ -2149,25 +2170,20 @@ if not holdout_df.is_empty():
     )
 
 # %% [markdown]
-# Six of nine holdout backtests are positive: US Firms (+1.77), CME Futures
-# (+1.11), ETFs (+1.00), sp500_options Rung-3 HTM+liquid (+0.97), NASDAQ-100
-# (+0.41), and FX Pairs (+0.19). The three negative holdouts are S&P 500
-# Eq+Opt (-0.73), US Equities Panel (-0.49), and Crypto Perps (-0.13). Holdout
-# IC is positive on five case studies (US Firms 0.048, CME 0.047, ETFs 0.046,
-# S&P Eq+Opt 0.036, NASDAQ-100 0.010) and negative on four (Crypto -0.029,
-# sp500_options -0.011, US Equities -0.006, FX -0.002). The IC/Sharpe agreement
-# is imperfect — sp500_options and FX Pairs both pair a negative holdout IC
-# with a positive holdout Sharpe, while S&P 500 Eq+Opt does the reverse
-# (positive IC 0.036, negative Sharpe -0.73), reflecting portfolio
-# construction contributing variance independent of out-of-sample ranking
-# accuracy.
+# The table above is the whole holdout result, and it is the place to read which case studies
+# come out positive on Sharpe and which on IC. Those two columns need not agree for a given
+# case study, which is why both columns are printed rather than one. Ranking accuracy and
+# portfolio construction are different things, and a case study can have one without the
+# other: the construction contributes variance that out-of-sample ranking accuracy says
+# nothing about.
 #
-# **Crypto carrier note**: Crypto's deployed carrier is the gbm/leaves_7_huber
-# signal model on fwd_ret_24h, carried from the validation rank-1 (signal
-# Sharpe 2.09) into the holdout retrain. That retrain posts a holdout Sharpe of
-# -0.13 and a holdout IC of -0.029, so Crypto is the one case study whose
-# validated edge does not survive out-of-sample — the model ranking inverts on
-# the holdout window.
+# **Reading a case study whose edge does not carry forward.** Where a case study's holdout
+# Sharpe and holdout IC are both negative while its validation Sharpe was strongly positive, the
+# model ranking has inverted on the holdout window. That is the outcome the holdout exists to
+# be able to report, and the table above says which configuration was retrained.
+#
+# The counts on both columns move whenever a registry is rebuilt, which is why this section
+# states the shape and leaves the tally to the table.
 
 # %% [markdown]
 # ## Stage Attrition Funnel
@@ -2180,7 +2196,7 @@ if not holdout_df.is_empty():
 #
 # Each row is counted *independently* against `bt_df` and `holdout_df` —
 # a case study can appear in `cost_surviving` without appearing in
-# `tradable_gross`, since the pipeline runs both stages off the rank-1
+# `tradable_gross`, since the pipeline runs both stages off the selected
 # trained model. NB08 reports a *cumulative* version of the same funnel
 # (each gate is the subset that passed every preceding gate); use NB08
 # for the strict survivor count and this section for the per-stage
@@ -2236,26 +2252,23 @@ for stage, count in attrition.items():
     print(f"  {stage:20s}  {bar}  {count}/{total}")
 
 # %% [markdown]
-# The funnel reads top-down with per-stage independent counts: 9 of 9
-# case studies produce positive IC, 8 of 9 produce positive signal-stage
-# Sharpe, 8 of 9 survive their assumed cost regime, 7 of 9 remain
-# risk-tolerable, and 6 of 9 sustain positive Sharpe on holdout. Counting
-# how many case studies each independent gate removes, the largest
-# single-stage attrition is the holdout step (3 of 9 fail to sustain a
-# positive holdout Sharpe), followed by the risk-tolerance gate (2 of 9);
-# the gross-Sharpe and cost-survival gates each remove 1. See NB08 for the
-# cumulative funnel (gates compounded) and the named drop-outs at each cut.
-# The 6-of-9 holdout rate does not account for evidence quality, which the
-# next section addresses.
+# Each row is an independent count: how many of the nine case studies pass that one gate,
+# tested against `bt_df` and `holdout_df` rather than against the set that cleared the gate
+# above it. A row's own failures are nine minus its count. The difference between two adjacent
+# rows is not how many case studies a gate removed, because two gates can pass the same number
+# while failing different case studies, and a case study can appear in a lower row without
+# appearing in a higher one. See NB08 for the cumulative funnel, where each gate is applied to
+# the survivors of the one above it and the drop-outs are named at each cut. Whatever holdout
+# rate these counts give, it does not account for evidence quality, which the next section
+# addresses.
 
 # %% [markdown]
 # ## Measurement Quality Disclosures
 #
-# Rather than a single trust label per case study, we surface the
-# measurement characteristics that drive how much a rank-1 number should
-# be trusted: how much the per-fold Sharpe moves around, how many folds
-# are positive, how wide the spread is to the 10th-ranked configuration,
-# and how severe the validation→holdout decay is. These are independent
+# Rather than a single trust label per case study, we surface the measurement characteristics
+# that decide how far a selected configuration's number should be trusted: how much the per-fold
+# Sharpe moves around, how many folds are positive, how wide the spread is to the tenth-ranked
+# configuration, and how severe the validation-to-holdout decay is. These are independent
 # axes; a case study can have narrow per-fold dispersion but sharp holdout
 # decay (signal is temporally stable in validation but doesn't generalize
 # forward), or vice versa. Collapsing these into "high-confidence /
@@ -2404,17 +2417,14 @@ if not variant_df.is_empty():
     )
 
 # %% [markdown]
-# The `pct_positive` column reveals a stark divide: ETFs, S&P 500 Eq+Opt,
-# S&P 500 Options, and US Equities have 96%+ variants with positive
-# Sharpe at the signal stage — nearly every model configuration produces
-# a profitable signal-stage result. At the other extreme, FX Pairs (11%)
-# and NASDAQ-100 (18%) struggle, with most variants producing negative
-# Sharpe. This echoes the IC landscape: asset classes with weak ICs
-# produce few positive strategies regardless of model choice. The S&P 500
-# Options positive-Sharpe rate is measured before execution costs — the
-# HTM short-straddle backtest with full option bid-ask and commissions in
-# §20.5 shows how that rate collapses once single-name option costs are
-# recognized.
+# The `pct_positive` column reports the share of a case study's signal-stage model variants
+# whose baseline Sharpe is positive. It is a property of the variant space rather than of the
+# selected configuration: a case study can carry a strong selected row and a low positive-Sharpe
+# share, or the reverse.
+#
+# One caveat applies to the option case studies, and it is large. The positive-Sharpe rate here
+# is measured **before execution costs**. The hold-to-maturity short-straddle backtest in §20.6
+# charges the full option bid-ask and commissions and reports the rate that survives them.
 
 # %% [markdown]
 # ## Synthesis JSON
@@ -2517,39 +2527,78 @@ for cs_id, cs_data in synthesis_dict.items():
 # ## Save Aggregated DataFrames
 #
 # Export for use by downstream notebooks (02–06).
+#
+# **A subset run writes none of these.** Downstream notebooks and the chapter figures read
+# every path below as a complete set covering all nine case studies, so a run restricted to
+# one case study would replace nine case studies' worth of tables with one's. Its job is the
+# paired metrics it has already written into that case study's own registry, and it stops
+# here.
+
 
 # %%
-overview_df.write_parquet(OUTPUT_DIR / "overview.parquet")
-if not ic_df.is_empty():
-    ic_df.write_parquet(OUTPUT_DIR / "ic_comparison.parquet")
-bt_df.write_parquet(OUTPUT_DIR / "backtest_comparison.parquet")
-if not prog_df.is_empty():
-    prog_df.write_parquet(OUTPUT_DIR / "sharpe_progression.parquet")
-if not lineage_df.is_empty():
-    lineage_df.write_parquet(OUTPUT_DIR / "lineage.parquet")
-# Written unconditionally, unlike its neighbours above. 04_signal_to_strategy and
-# 08_recommendations both read this path with a bare pl.read_parquet, and 08 already
-# distinguishes "no holdout row for this case study" from "failed a gate" - so an empty
-# table is a state it can report, while an absent file is a FileNotFoundError in cell 5.
-# The CI fixture seeds no holdout rows for any case study, which is the all-empty case.
-holdout_df.write_parquet(OUTPUT_DIR / "holdout_results.parquet")
-if not cluster_df.is_empty():
-    cluster_df.write_parquet(OUTPUT_DIR / "rank1_cluster_diagnostics.parquet")
-measurement_df.write_parquet(OUTPUT_DIR / "measurement_quality.parquet")
-if not variant_df.is_empty():
-    variant_df.write_parquet(OUTPUT_DIR / "variant_analysis.parquet")
+def write_chapter_artifacts(
+    output_dir: Path,
+    frames: dict[str, pl.DataFrame | None],
+    documents: dict[str, object],
+    *,
+    subset: list[str],
+) -> list[str]:
+    """Write the chapter-wide artifacts and return their names, or write none for a subset run.
 
-# Save JSON artifacts
-(OUTPUT_DIR / "stage_attrition.json").write_text(
-    json.dumps({"total": total, "stages": attrition}, indent=2)
+    A ``None`` frame is one there is nothing to write; the caller decides which tables are
+    allowed to be absent and which have to exist even when empty.
+    """
+    if subset:
+        print(
+            "Subset run over "
+            f"{subset}: chapter-wide artifacts left as they are. They cover every case "
+            "study, and a subset cannot produce them."
+        )
+        return []
+    written: list[str] = []
+    for name, frame in frames.items():
+        if frame is None:
+            continue
+        frame.write_parquet(output_dir / name)
+        written.append(name)
+    for name, payload in documents.items():
+        (output_dir / name).write_text(json.dumps(payload, indent=2))
+        written.append(name)
+    return written
+
+
+# `holdout_results.parquet` and `measurement_quality.parquet` are written even when empty,
+# unlike their neighbours. 04_signal_to_strategy and 08_recommendations both read them with a
+# bare `pl.read_parquet`, and 08 already distinguishes "no holdout row for this case study"
+# from "failed a gate" - so an empty table is a state it can report, while an absent file is a
+# FileNotFoundError in its fifth cell. The CI fixture seeds no holdout rows for any case study,
+# which is the all-empty case.
+saved = write_chapter_artifacts(
+    OUTPUT_DIR,
+    {
+        "overview.parquet": overview_df,
+        "ic_comparison.parquet": None if ic_df.is_empty() else ic_df,
+        "backtest_comparison.parquet": bt_df,
+        "sharpe_progression.parquet": None if prog_df.is_empty() else prog_df,
+        "lineage.parquet": None if lineage_df.is_empty() else lineage_df,
+        "holdout_results.parquet": holdout_df,
+        "rank1_cluster_diagnostics.parquet": None if cluster_df.is_empty() else cluster_df,
+        "measurement_quality.parquet": measurement_df,
+        "variant_analysis.parquet": None if variant_df.is_empty() else variant_df,
+    },
+    {
+        "stage_attrition.json": {"total": total, "stages": attrition},
+        "all_synthesis.json": synthesis_dict,
+    },
+    subset=CASE_STUDIES,
 )
-(OUTPUT_DIR / "all_synthesis.json").write_text(json.dumps(synthesis_dict, indent=2))
 
 # Relative to the repository root: an absolute path is specific to the machine
 # that ran the notebook and tells a reader nothing.
-print(f"\nSaved aggregated data to {OUTPUT_DIR.relative_to(REPO_ROOT)}")
-for f in sorted(OUTPUT_DIR.glob("*.parquet")) + sorted(OUTPUT_DIR.glob("*.json")):
-    print(f"  {f.name}: {f.stat().st_size / 1024:.1f} KB")
+if saved:
+    print(f"\nSaved aggregated data to {OUTPUT_DIR.relative_to(REPO_ROOT)}")
+    for name in saved:
+        print(f"  {name}: {(OUTPUT_DIR / name).stat().st_size / 1024:.1f} KB")
 
 # %% [markdown]
 # ## What the Empty Cells Mean
@@ -2588,21 +2637,23 @@ display(
 #
 # - `overview.parquet`: Case study metadata (asset class, frequency, universe
 #   size, cost assumptions, primary label, number of model families).
-# - `ic_comparison.parquet`: Rank-1 per-family IC per case study, for the
-#   model-family comparison in §20.2 / notebook 02.
+# - `ic_comparison.parquet`: Top-ranked per-family IC per case study, for the
+#   model-family comparison of Table 20.4 in §20.3, read by notebooks 03 and 04.
 # - `backtest_comparison.parquet`: Per-(case-study, stage) Sharpe / CAGR /
-#   drawdown for the rank-1 configuration at each pipeline stage.
-# - `sharpe_progression.parquet`: Stage-by-stage Sharpe for the rank-1
-#   configuration per case study — the funnel that §20.4 describes.
+#   drawdown for the selected configuration at each pipeline stage.
+# - `sharpe_progression.parquet`: Stage-by-stage Sharpe for the selected
+#   configuration per case study.
 # - `lineage.parquet`: The stage-path from signal → allocation → cost →
-#   risk for the rank-1 configuration per case study.
-# - `holdout_results.parquet`: Validation-vs-holdout Sharpe for the rank-1
-#   configuration, used for the validation→holdout decay analysis in §20.6.
-# - `rank1_cluster_diagnostics.parquet`: Rank-1 / rank-10 / spread / fold-SE /
-#   folds-positive for each case study — the measurement that lets readers
-#   judge how stable each rank-1 number is.
-# - `measurement_quality.parquet`: Per-case-study disclosures (fold-SE,
-#   rank-1-to-rank-10 spread, folds-positive fraction, holdout decay) —
+#   risk for the selected configuration per case study.
+# - `holdout_results.parquet`: Validation-vs-holdout Sharpe for the selected
+#   configuration, used for the validation→holdout decay analysis in §20.1.
+# - `rank1_cluster_diagnostics.parquet`: top-ranked and tenth-ranked Sharpe,
+#   the spread between them, the fold standard error and the folds-positive
+#   count for each case study — the measurement that lets readers judge how
+#   stable each selection is. The filename predates the vocabulary and is kept
+#   because downstream notebooks read it by name.
+# - `measurement_quality.parquet`: Per-case-study disclosures (fold standard
+#   error, the top-to-tenth spread, folds-positive fraction, holdout decay) —
 #   the evidence the reader needs to weigh, unbundled from any single
 #   trust label.
 # - `variant_analysis.parquet`: All model variants per case study with IC,

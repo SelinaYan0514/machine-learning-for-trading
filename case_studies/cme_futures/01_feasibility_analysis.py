@@ -49,7 +49,6 @@
 """CME Futures Case Study - Feasibility Analysis."""
 
 import re
-import warnings
 from datetime import date
 
 import matplotlib.pyplot as plt
@@ -60,13 +59,14 @@ from IPython.display import display
 from pandas.tseries.holiday import GoodFriday
 
 from case_studies.utils.feasibility import exceedance_curve, fold_timeline, panel_acf
+from case_studies.utils.warning_policy import apply_notebook_warning_policy
 from data import load_cme_futures
 from utils.config import REPO_ROOT
 from utils.cv_splits import generate_cv_splits
 from utils.paths import get_case_study_dir
 from utils.style import COLORS, FIGSIZE, add_message_title, show_with_alt
 
-warnings.filterwarnings("ignore")
+apply_notebook_warning_policy()
 
 # %% tags=["parameters"]
 CASE_STUDY_ID = "cme_futures"
@@ -712,10 +712,10 @@ print(
 # figure then draws the boundaries the splitter returned, rather than recomputing them, so the
 # picture and the folds cannot disagree.
 #
-# `generate_cv_splits` numbers folds from zero backwards from the most recent, so fold 0 is the last
-# one before the holdout and the highest number is the earliest. The figure draws them earliest-first
-# and labels each with that number, which is why the labels count down; every later stage prints
-# the same ones.
+# `generate_cv_splits` numbers folds chronologically, so fold 0 is the earliest and the highest
+# number is the last one before the holdout. The figure draws them earliest-first and labels each
+# with that number, so the labels count up alongside the dates; every later stage prints the same
+# ones.
 #
 # The splitter is given the whole sample, holdout included, and applies the holdout boundary
 # itself from `evaluation.holdout_start`, which is what every later stage does too. Trimming the

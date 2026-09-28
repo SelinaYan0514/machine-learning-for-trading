@@ -14,13 +14,22 @@ from __future__ import annotations
 
 import os
 import platform
-import resource
 import subprocess
 import sys
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
+
+# POSIX only, and this module is imported by every model runner, so a bare import made
+# `import case_studies.utils.gbm` fail outright on native Windows - found by the Reader
+# install walk once econml 0.17.0 made `uv sync` complete there. The two readings it
+# provides have exact Windows equivalents below; nothing here influences a fitted result,
+# so a platform difference in how a cost is measured is not a difference in the result.
+try:
+    import resource
+except ModuleNotFoundError:  # pragma: no cover - Windows
+    resource = None
 
 __all__ = [
     "ResourceUsage",
@@ -30,13 +39,57 @@ __all__ = [
     "resource_measurement",
     "runtime_provenance",
     "source_commit",
+    "worktree_marker",
 ]
 
 
-def source_commit(repository_root: Any) -> str:
-    """Return the commit the run was executed from, or ``unknown``."""
+def worktree_marker(repository_root: Any | None = None) -> str:
+    """Return the suffix that says whether the recorded commit describes the tree.
+
+    A commit names what was committed, not what was executed. A run started from a
+    worktree carrying uncommitted edits attests a source that could not have produced
+    it, and nothing in the row says so. Three states, each distinct:
+
+    * ``""`` - the worktree matched the commit.
+    * ``"+dirty"`` - a tracked file differed, staged or not.
+    * ``"+untracked"`` - every tracked file matched and something untracked was present.
+      It is the weaker failure and still a failure: an untracked module is importable
+      and an untracked artifact is readable.
+    * ``"+unknown"`` - git could not answer, so neither can the row.
+
+    Same three words, in the same order of severity, as ``py_vs_head`` at
+    ``scripts/nb-run.sh:1103`` in ``ml4t/agents``, so a reader comparing a register row
+    with a registry row is comparing like with like.
+
+    Only runs written after this lands carry a marker. An unmarked historical row is
+    not a clean one; the trees it would have been compared against are gone, so no
+    backfill is possible and none is attempted.
+
+    That marker answers a narrower question - whether one notebook's paired .py matches
+    HEAD, in a different repository - and does not reach this column.
+    """
+    command = ["git", "--no-optional-locks"]
+    if repository_root is not None:
+        command += ["-C", str(repository_root)]
+    command += ["status", "--porcelain"]
     try:
-        return subprocess.check_output(
+        status = subprocess.check_output(command, stderr=subprocess.DEVNULL, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return "+unknown"
+    lines = [line for line in status.splitlines() if line.strip()]
+    if any(not line.startswith("??") for line in lines):
+        return "+dirty"
+    return "+untracked" if lines else ""
+
+
+def source_commit(repository_root: Any) -> str:
+    """Return the commit the run was executed from, with a worktree marker appended.
+
+    ``unknown`` when git cannot answer at all. See :func:`worktree_marker` for what the
+    suffix means and why an unmarked row is not evidence of a clean tree.
+    """
+    try:
+        commit = subprocess.check_output(
             ["git", "-C", str(repository_root), "rev-parse", "HEAD"],
             stderr=subprocess.DEVNULL,
             text=True,
@@ -44,6 +97,7 @@ def source_commit(repository_root: Any) -> str:
         ).strip()
     except (OSError, subprocess.SubprocessError):
         return "unknown"
+    return commit + worktree_marker(repository_root)
 
 
 def runtime_provenance(
@@ -78,6 +132,41 @@ class ResourceUsage(dict):
         return float(self.get("elapsed_s", 0.0))
 
 
+def _windows_peak_working_set() -> int:
+    """Peak working set of this process, in bytes - the Windows reading of `ru_maxrss`.
+
+    `PROCESS_MEMORY_COUNTERS` is `cb`, `PageFaultCount`, then eight `SIZE_T` fields, of which
+    `PeakWorkingSetSize` is the first. Reported in bytes already, so no scale is applied.
+    Returning 0 on failure would be a false measurement, so this raises nothing and the
+    caller sees the zero only if the API itself refused.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    class _Counters(ctypes.Structure):
+        _fields_ = [
+            ("cb", wintypes.DWORD),
+            ("PageFaultCount", wintypes.DWORD),
+            ("PeakWorkingSetSize", ctypes.c_size_t),
+            ("WorkingSetSize", ctypes.c_size_t),
+            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+            ("PagefileUsage", ctypes.c_size_t),
+            ("PeakPagefileUsage", ctypes.c_size_t),
+        ]
+
+    counters = _Counters()
+    counters.cb = ctypes.sizeof(_Counters)
+    ok = ctypes.windll.psapi.GetProcessMemoryInfo(
+        ctypes.windll.kernel32.GetCurrentProcess(),
+        ctypes.byref(counters),
+        counters.cb,
+    )
+    return int(counters.PeakWorkingSetSize) if ok else 0
+
+
 def peak_rss_bytes() -> int:
     """Peak resident set size of this process, in bytes.
 
@@ -91,6 +180,8 @@ def peak_rss_bytes() -> int:
     reports a peak 1024 times too large, and `scripts/pre_run_gate.py` prints that figure in GB
     as a check it passes on.
     """
+    if resource is None:  # pragma: no cover - Windows
+        return _windows_peak_working_set()
     usage = resource.getrusage(resource.RUSAGE_SELF)
     scale = 1 if sys.platform == "darwin" else 1024
     return int(usage.ru_maxrss) * scale
@@ -98,6 +189,9 @@ def peak_rss_bytes() -> int:
 
 def cpu_seconds() -> float:
     """CPU time consumed by this process so far. Differences between two readings are the run."""
+    if resource is None:  # pragma: no cover - Windows
+        # User plus system CPU for this process, which is what ru_utime + ru_stime sums.
+        return float(time.process_time())
     usage = resource.getrusage(resource.RUSAGE_SELF)
     return float(usage.ru_utime + usage.ru_stime)
 

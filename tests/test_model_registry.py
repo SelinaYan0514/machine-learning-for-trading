@@ -42,6 +42,7 @@ import pytest
 from tests.pm_helpers import (
     STAGE_RE,
     get_overrides,
+    gpu_skip_reason,
     resolved_registry_path,
     run_notebook,
     stage_sort_key,
@@ -196,8 +197,37 @@ def _quick_parameters(
         parameters.update(_LATENT_FACTOR_OVERRIDES)
     if case_study in _SPARSE_DATA_CASE_STUDIES:
         parameters.update(_SPARSE_DATA_OVERRIDES)
+    # FORCE_RETRAIN is a training-family lever and there is no causal equivalent. A causal run is
+    # addressed by its request, so `fx_pairs/11_causal_dml` and
+    # `sp500_equity_option_analytics/12_causal_dml` raise "an identical complete causal request is
+    # reused; change the request to refit" the moment it arrives as True - the two of the nine
+    # causal notebooks that declare the parameter at all. Injecting it failed both whenever the
+    # case study's stage 01-05 artifacts were reachable, which is any maintainer worktree built
+    # with --case-study; a fresh worktree skips the test earlier and never saw it. Dropped before
+    # override_params so a notebook that wants it back can still say so in overrides.yaml.
+    if suffix == "causal_dml":
+        parameters.pop("FORCE_RETRAIN", None)
     parameters.update(override_params)
     return parameters, suffix
+
+
+def test_a_causal_notebook_is_not_asked_to_force_a_retrain() -> None:
+    """The lever exists for training families and has no causal counterpart.
+
+    Both causal notebooks that bind FORCE_RETRAIN raise on it rather than honouring it, so
+    injecting the default aborted them in cell 6 before any fit. A notebook may still ask for
+    it back through its own overrides, which is why this checks the default rather than the
+    parameter's absence.
+    """
+    causal, suffix = _quick_parameters("fx_pairs", "11_causal_dml", {})
+    assert suffix == "causal_dml"
+    assert "FORCE_RETRAIN" not in causal
+
+    training, _ = _quick_parameters("fx_pairs", "06_linear", {})
+    assert training["FORCE_RETRAIN"] is True
+
+    reinstated, _ = _quick_parameters("fx_pairs", "11_causal_dml", {"FORCE_RETRAIN": True})
+    assert reinstated["FORCE_RETRAIN"] is True
 
 
 def test_notebook_override_parameters_have_final_precedence() -> None:
@@ -506,14 +536,9 @@ def test_model_notebook(case_study, stage, notebook_path, isolated_model_output)
             "~/ml4t/artifacts and which no CI runner and no fresh worktree has"
         )
 
-    if overrides.get("gpu"):
-        try:
-            import torch
-
-            if not torch.cuda.is_available():
-                pytest.skip("GPU required but not available")
-        except ImportError:
-            pytest.skip("torch not installed")
+    reason = gpu_skip_reason(overrides)
+    if reason:
+        pytest.skip(reason)
 
     # --- Parameters ---
     # Start with quick defaults, then retain notebook-specific reduced settings.
@@ -665,6 +690,17 @@ def test_model_notebook(case_study, stage, notebook_path, isolated_model_output)
                 finally:
                     db.close()
                 assert {5, 6}.issubset(checkpoints), checkpoints
+            # `10_dl_tsmixer`, not `dl_tsmixer`. The family name was what the runner wrote
+            # before the migration; the notebook now declares `entry_point="10_dl_tsmixer"` to
+            # `open_study`, which is the stem every registering notebook records per
+            # `test_a_registering_stage_is_recognised_by_its_suffix` above. The literal survived
+            # the mapping's removal unchanged, and nothing caught it because this test runs in
+            # no job and cannot: it skips above without the stage 01-05 inputs no runner has,
+            # so `.github/ci/unit-test-quarantine.txt` deselects it rather than leaving every
+            # parametrization to skip. Measured 2026-09-12 against the etfs production
+            # registry - 2 rows at `10_dl_tsmixer`, 0 at `dl_tsmixer` - so the query returned
+            # the empty set and the `issubset` below could only have failed, on the first
+            # machine that ever ran it.
             if case_study == "etfs" and notebook_path.stem == "10_dl_tsmixer":
                 db = sqlite3.connect(str(registry_db))
                 try:
@@ -675,7 +711,7 @@ def test_model_notebook(case_study, stage, notebook_path, isolated_model_output)
                             SELECT ps.checkpoint_value
                             FROM prediction_sets ps
                             JOIN training_runs tr USING (training_hash)
-                            WHERE tr.entry_point = 'dl_tsmixer'
+                            WHERE tr.entry_point = '10_dl_tsmixer'
                               AND ps.split = 'validation'
                             """
                         )

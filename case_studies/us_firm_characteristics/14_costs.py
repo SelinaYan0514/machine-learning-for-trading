@@ -49,15 +49,11 @@
 
 import json
 import time
-import warnings
 from collections import Counter
 
 import polars as pl
 
-from utils.style import COLORS, add_message_title, show_with_alt
-
-warnings.filterwarnings("ignore")
-
+from case_studies.research import open_study, reuse_disclosure
 from case_studies.utils.backtest_loaders import get_backtest_config, load_backtest_prices_for
 from case_studies.utils.backtest_presets import (
     clone_backtest_spec,
@@ -75,11 +71,28 @@ from case_studies.utils.registry import (
 from case_studies.utils.strategy_analysis import resolve_solvent_carrier
 from case_studies.utils.sweep_config import get_cost_grid_bps
 from utils.paths import get_case_study_dir
+from utils.style import COLORS, add_message_title, show_with_alt
 
 # %% tags=["parameters"]
 CASE_STUDY_ID = "us_firm_characteristics"
 LABEL = ""
 MAX_SYMBOLS = 0
+# Both names stay bound here although nothing below reads them: that is what makes the harness
+# force preview and supply a workspace - `_declares_tier_and_workspace` in `tests/pm_helpers.py`
+# looks for exactly this pair. Without them the canonical branch regenerates in place, which
+# needs symlinks a CI checkout does not have.
+EXECUTION_TIER = "canonical"
+WORKSPACE: str = ""
+
+# %% [markdown]
+# The study is opened before anything resolves a path or reads the registry. Under the preview
+# tier, opening it activates a workspace and rewrites `ML4T_OUTPUT_DIR` process-wide, and every
+# later `get_case_study_dir` call resolves against that. A `CASE_DIR`, a candidate index or a
+# `BacktestExplorer` built first would address the released registry while this notebook writes
+# to the preview one, and the two never meet.
+
+# %%
+study = open_study(CASE_STUDY_ID, execution_tier=EXECUTION_TIER, workspace=WORKSPACE or None)
 
 # %%
 CASE_DIR = get_case_study_dir(CASE_STUDY_ID)
@@ -106,20 +119,20 @@ COST_GRID_BPS = get_cost_grid_bps(CASE_STUDY_ID)
 # case study does not report, and [`17_strategy_analysis`](17_strategy_analysis.ipynb) would
 # find no cost rows for the one it does.
 #
-# `resolve_solvent_carrier` also refuses a carrier whose equity reached zero. This book is
-# long-short with no margin call, so a run can compound through zero and carry a Sharpe
-# computed on a balance that no longer exists - and such a Sharpe can top a ranking. It
-# raises rather than quietly sweeping the runner-up, because substituting a different
-# configuration is the divergence the shared resolver exists to remove.
+# `resolve_solvent_carrier` also refuses a selected configuration whose equity reached zero. This
+# book is long-short with no margin call, so a run can compound through zero and carry a Sharpe
+# computed on a balance that no longer exists - and such a Sharpe can top a ranking. It raises
+# rather than quietly sweeping the runner-up, because substituting a different configuration is the
+# divergence the shared resolver exists to remove.
 #
-# Which stage the carrier came from is printed rather than assumed.
+# Which stage the selected configuration came from is printed rather than assumed.
 
 # %%
 carrier = resolve_solvent_carrier(CASE_STUDY_ID)
 
-# The label is the carrier's, not the case study's declared primary. They are the same here,
-# and reading it from the carrier is what keeps the prices and the predictions loaded below
-# on the same label the swept configuration was fitted and ranked on.
+# The label is the selected configuration's, not the case study's declared primary. They are the
+# same here, and reading it from the selected configuration is what keeps the prices and the
+# predictions loaded below on the same label the swept configuration was fitted and ranked on.
 if carrier["label"] != LABEL:
     print(f"Carrier is on {carrier['label']}, not the declared primary label {LABEL}.")
     LABEL = carrier["label"]
@@ -263,8 +276,8 @@ elapsed = time.time() - t0
 stage_total = len(load_existing_backtest_hashes(CASE_STUDY_ID, stage="cost_sensitivity"))
 print(f"\nCost-sensitivity stage: {stage_total} backtests registered.")
 print(
-    f"This execution: {n_done - n_reused - n_failed} computed, {n_reused} reused, "
-    f"{n_failed} failed, over {n_done} of {n_total} declared levels "
+    f"This execution: {reuse_disclosure(n_done - n_reused - n_failed, n_reused, n_failed)}, "
+    f"over {n_done} of {n_total} declared levels "
     f"attempted in {elapsed:.0f}s."
 )
 for reason, count in failures.most_common():
@@ -371,12 +384,14 @@ if not cost_df.is_empty():
         subtitle="Validation months; the strategy is unchanged, only what it pays to trade",
     )
     ax.legend(frameon=False)
-    fig.tight_layout()
+    # No tight_layout(): matplotlibrc sets `figure.constrained_layout.use: True` repo-wide,
+    # and calling tight_layout() over it makes matplotlib switch layout engines and say so in
+    # a stderr block under the figure.
     show_with_alt(
         fig,
         "Line chart of validation Sharpe against the total commission and slippage "
         "charged per leg, from zero to fifty basis points. The line starts just under "
-        "2.95 and falls almost straight to about 2.65 at the right edge, staying far "
+        "3.66 and falls almost straight to about 3.36 at the right edge, staying far "
         "above the dashed zero reference across the whole grid. A dotted vertical "
         "marker near the left shows the cost level the rest of the case study was "
         "charged at, with most of the swept range lying to its right.",

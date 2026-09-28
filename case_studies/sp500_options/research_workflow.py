@@ -45,6 +45,7 @@ from case_studies.utils.backtest_runner import (
     normalize_prediction_columns,
 )
 from case_studies.utils.registry import prediction_hash_from_parts
+from case_studies.utils.runtime import source_commit
 from utils.modeling import load_configs
 from utils.paths import REPO_ROOT
 
@@ -107,9 +108,22 @@ def declared_dl_device(requested: str | None = None) -> str:
 
 
 def open_study(*, execution_tier: str, workspace: str | Path | None = None) -> Study:
-    """Open canonical regeneration or an isolated reader preview."""
+    """Open canonical regeneration, canonical execution into a workspace, or a reader preview.
+
+    ``workspace`` used to be read on the preview branch only, so a canonical run that passed one
+    was answered with ``Study.regenerate`` and wrote to the released case directory. It did not
+    raise and it did not warn: the caller read from the workspace it asked for and registered its
+    backtests somewhere else. On 2026-09-15 a rehearsal run against a private registry left 60
+    allocation rows and 60 artifact directories in the published ``sp500_options`` store that way.
+
+    Canonical *with* a workspace is the same full-fidelity computation writing to that root
+    instead, which is also the only form a checkout without the generated-artifact symlinks can
+    run - CI seeds its fixture into a workspace and has nothing to regenerate over.
+    """
     if execution_tier == "canonical":
-        return Study.regenerate(CASE_STUDY)
+        if workspace is None:
+            return Study.regenerate(CASE_STUDY)
+        return Study.open(CASE_STUDY, workspace=Path(workspace).expanduser().resolve())
     if execution_tier != "preview":
         raise ValueError("execution_tier must be canonical or preview")
     if workspace is None:
@@ -134,9 +148,7 @@ def open_study(*, execution_tier: str, workspace: str | Path | None = None) -> S
             manifest={
                 "schema_version": 1,
                 "case_study": CASE_STUDY,
-                "baseline_source_commit": subprocess.check_output(
-                    ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, text=True
-                ).strip(),
+                "baseline_source_commit": source_commit(REPO_ROOT),
                 "preview_only": True,
             },
         )
@@ -153,6 +165,11 @@ def model_request_catalog(
 ) -> pl.DataFrame:
     """Return the declared model population as visible Polars rows."""
     selected = set(config_names) if config_names is not None else None
+    if selected is not None and not selected:
+        # An empty selection is the caller's, so say so. Falling through left every row filtered
+        # out and the function reported "no declared requests for <family>", blaming the family's
+        # menu for a list the caller passed empty.
+        raise ValueError("config_names is empty; omit it to request every declared configuration")
     rows = []
     for label in labels:
         for config in load_configs(CASE_STUDY, label, family):
@@ -172,7 +189,18 @@ def resolve_model_requests(
     overrides: dict[str, Any] | None = None,
     preview_reductions: dict[str, Any] | None = None,
 ) -> tuple[ResolvedModelRequest, ...]:
-    """Resolve visible catalog rows through the shared family boundary."""
+    """Resolve visible catalog rows through the shared family boundary.
+
+    Its three callers - `09_deep_learning`, `09a_lstm`, `09b_patchtst` - are all family
+    `deep_learning`, and `case_studies/utils/deep_learning.py` defines neither
+    `run_model_requests` nor `plan_model_requests`. So `run_models` and `plan_models` both fall
+    through to the same per-request `resolve()` this does, and there is no batch runner for a
+    caller here to reach or to miss. Handing the results to `run_resolved_model_requests` is not
+    the batch bypass it looks like from the shape of the call.
+
+    The three notebooks that do reach a batch runner - `06_linear`, `07_gbm`, `08_tabular_dl` -
+    resolve inline and call the shared `run_model_population` rather than going through here.
+    """
     required = {"family", "label", "config_name"}
     missing = required - set(request_catalog.columns)
     if missing:
@@ -376,6 +404,99 @@ def official_prediction_catalog(
         "checkpoint_kind",
         "checkpoint_value",
     )
+
+
+def preview_prediction_candidates(
+    study: Study,
+    *,
+    labels: Iterable[str],
+    limit: int,
+) -> pl.DataFrame:
+    """The preview validation predictions to backtest, capped per label.
+
+    A canonical run resolves named populations, which a preview cannot: preview results
+    never enter one. It used to name its prediction sets as literal hashes instead, and
+    that is why `12_backtest` could not run anywhere but on the workstation that had just
+    produced them - a hash is a property of the run, so nothing could declare one ahead
+    of time and the notebook was skipped in CI rather than executed.
+
+    The selection is declarative instead: the label, and how many configurations of it to
+    trade. The cap is applied per label rather than to the whole frame, so a later label
+    is not left short by whichever one sorts first; sp500_options declares a single label
+    today and the grouping is what keeps that true if it declares another.
+
+    This lives here rather than inline in the notebook so the notebook and its test call
+    the same code.
+    """
+    labels = list(labels)
+    if not labels:
+        raise ValueError("preview prediction selection requires at least one label")
+    if limit < 1:
+        raise ValueError("preview prediction selection requires a positive limit")
+    candidates = (
+        study.predictions.table(include_preview=True)
+        .filter(
+            (pl.col("execution_tier") == "preview")
+            & (pl.col("split") == "validation")
+            & pl.col("complete")
+            & pl.col("label").is_in(labels)
+        )
+        .sort("label", "family", "config_name", "checkpoint_kind", "checkpoint_value")
+        .group_by("label", maintain_order=True)
+        .head(limit)
+    )
+    starved = [label for label in labels if candidates.filter(pl.col("label") == label).is_empty()]
+    if starved:
+        raise RuntimeError(
+            f"preview execution found no complete validation predictions for {starved}"
+        )
+    return candidates
+
+
+def preview_baseline_candidates(
+    study: Study,
+    *,
+    labels: Iterable[str],
+    limit: int,
+) -> pl.DataFrame:
+    """The preview baseline backtests a downstream stage builds on, capped per label.
+
+    The counterpart of :func:`preview_prediction_candidates` one stage on. A canonical run
+    reads the named baseline population; a preview reads what the preview baseline stage
+    just registered in the same workspace, selected by label rather than by hash for the
+    same reason.
+
+    The cap counts model configurations, not backtest rows: the baseline stage registers
+    one row per concentration and per saved checkpoint, so a limit applied to rows would
+    spend the whole budget on the first configuration's grid and hand the next stage a
+    shortlist with one model in it. Every row of each selected configuration is returned,
+    because a downstream stage ranks within a configuration before it ranks across them.
+    """
+    labels = list(labels)
+    if not labels:
+        raise ValueError("preview baseline selection requires at least one label")
+    if limit < 1:
+        raise ValueError("preview baseline selection requires a positive limit")
+    baselines = (
+        study.backtests.table(include_preview=True)
+        .filter(
+            (pl.col("execution_tier") == "preview")
+            & (pl.col("stage") == "signal")
+            & pl.col("complete")
+            & pl.col("label").is_in(labels)
+        )
+        .sort("label", "family", "config_name", "backtest_hash")
+    )
+    selected = []
+    for label in labels:
+        rows = baselines.filter(pl.col("label") == label)
+        if rows.is_empty():
+            raise RuntimeError(
+                f"preview execution found no complete baseline backtests for {label!r}"
+            )
+        keep = rows.select("family", "config_name").unique(maintain_order=True).head(limit)
+        selected.append(rows.join(keep, on=["family", "config_name"], how="semi"))
+    return pl.concat(selected)
 
 
 def option_decision_dates(

@@ -1,0 +1,62 @@
+# Notebooks still carrying the blanket `warnings.filterwarnings("ignore")`.
+#
+# The standard used to prescribe it. `rules/notebook-standards.md` clause M2 was narrowed on
+# 2026-09-08 (ml4t/agent-workspace#1096): suppress the noisy messages by name, filtered by
+# category and module, and leave visible anything that may report a real problem -
+# ConvergenceWarning and other optimization failures, RuntimeWarning for overflow,
+# divide-by-zero and invalid value, and anything the notebook's own result depends on.
+#
+# These files predate that ruling and conform to the old one. They are listed rather than
+# fixed because removing the call is a code-cell change: the provenance gate marks the
+# notebook STALE and it has to be re-executed before it can be committed, which is correct -
+# the point of the change is that renders start showing warnings, so the render has to be
+# regenerated. 204 of the 243 files carrying the call are stamped, so this is a re-execution
+# programme rather than a text sweep, and it proceeds a notebook at a time.
+#
+# HOW TO USE THIS FILE: when you re-execute a notebook for any reason, drop its blanket call
+# first, name whatever noise the run then shows, and delete its line here. The list may only
+# ever shrink - tests/test_blanket_warning_filters.py fails on an entry whose file no longer
+# carries the call, so a stale line cannot sit here unnoticed, and it fails on a file that
+# carries the call and is not listed, so a new notebook cannot add one.
+#
+# 2026-09-13: 34 case-study notebooks left this list in one sweep. Each now calls
+# `case_studies.utils.warning_policy.apply_notebook_warning_policy()` in place of the blanket
+# call and was re-executed. The eighteen that remain are held for three separate reasons:
+#
+#   - Eight register backtests. This worktree resolves ml4t-backtest to 0.1.6, whose
+#     `BacktestConfig.to_dict()` carries three fields 0.1.3 did not (`share_rounding`,
+#     `lock_notional_update_mode`, `vwap_col`). Every registered backtest in the book was
+#     written under the 0.1.3 shape, so re-executing one of these under the current lock
+#     registers it under a different `backtest_hash` and the run goes cold. That re-key is
+#     its own decision; a warnings fix must not be what triggers it.
+#   - Seven belong to `nasdaq100_microstructure` and `us_equities_panel`, which have runs in
+#     flight against their worktrees and registries.
+#   - `crypto_perps_funding/_archive/11_autoencoder.py` is archived, and the two
+#     `20_strategy_synthesis` notebooks import nothing from `case_studies`, so the policy
+#     helper is the wrong dependency for them and they need a chapter-side equivalent.
+#
+# The four stage-04 notebooks in ml4t/agent-workspace#1095 are the sharpest case: they fork a
+# worker pool from a process holding a BLAS thread pool and filter the 3.14 warning that says
+# the child may deadlock. Two of the four are already fixed on this branch; cme_futures and
+# fx_pairs are stamped and wait for a re-execution, and theirs must not regenerate
+# features/model_based.parquet, whose sha256 keys every model fitted against it.
+
+20_strategy_synthesis/03_signal_quality.py
+20_strategy_synthesis/04_signal_to_strategy.py
+case_studies/cme_futures/18_holdout_backtest.py
+case_studies/crypto_perps_funding/18_holdout_backtest.py
+case_studies/crypto_perps_funding/_archive/11_autoencoder.py
+case_studies/etfs/15_portfolio_management.py
+case_studies/etfs/16_risk_management.py
+case_studies/etfs/17_costs.py
+case_studies/etfs/19_holdout_backtest.py
+case_studies/nasdaq100_microstructure/01_feasibility_analysis.py
+case_studies/nasdaq100_microstructure/02_labels.py
+case_studies/nasdaq100_microstructure/03_financial_features.py
+case_studies/nasdaq100_microstructure/04_model_based_features.py
+case_studies/sp500_options/17_holdout_backtest.py
+case_studies/us_equities_panel/01_feasibility_analysis.py
+case_studies/us_equities_panel/02_labels.py
+case_studies/us_equities_panel/03_financial_features.py
+case_studies/us_firm_characteristics/13_risk_management.py
+case_studies/us_firm_characteristics/16_holdout_backtest.py

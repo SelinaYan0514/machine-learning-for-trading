@@ -41,8 +41,8 @@
 #   recent activity has been, and read those numbers back.
 # - Summarise a short stretch of price and order flow by which one moved first, in a form a
 #   model can use as a column.
-# - Write out a feature table whose rows carry the walk-forward window each one belongs to, and
-#   check that the table covers every window every configured prediction target will ask for.
+# - Write out a feature table keyed by bar rather than by fold, and check that it covers every
+#   window every configured prediction target will ask for.
 # - Measure whether any of it ranks the cross-section, with a standard error that accounts for
 #   the dependence between neighbouring observations of a time series.
 #
@@ -50,8 +50,9 @@
 #
 # - Reads the AlgoSeek minute archive through `load_nasdaq100_bars`, and the label files under
 #   `labels/` for their timestamps alone - those decide the walk-forward windows.
-# - Writes `features/model_based.parquet`, one row per (`timestamp`, `symbol`, `fold`), with a
-#   `.digest.json` sidecar beside it recording what was written and what it was built from.
+# - Writes `features/model_based.parquet`, one row per (`timestamp`, `symbol`) and no `fold`
+#   column - Section E says why - with a `.digest.json` sidecar beside it recording what was
+#   written and what it was built from.
 #
 # **Prerequisites**: [`02_labels`](02_labels.ipynb) must have run, because its output defines the
 # windows here. [`03_financial_features`](03_financial_features.ipynb) need not have run; its
@@ -66,6 +67,7 @@
 """NASDAQ-100 Microstructure: Model-Based Features (Ch9)."""
 
 import warnings
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -77,10 +79,12 @@ from ml4t.diagnostic.evaluation.stats import benjamini_hochberg_fdr
 from ml4t.diagnostic.metrics import compute_ic_hac_stats, cross_sectional_ic_series
 from ml4t.diagnostic.splitters.calendar import TradingCalendar
 
-from case_studies.utils.artifact_digest import value_digest, write_artifact
+from case_studies.utils.artifact_digest import value_digest
+from case_studies.utils.temporal import walk_forward_feature, write_model_based
 from data import load_nasdaq100_bars
 from utils.artifact_specs import resolve_label_buffer, resolve_label_horizon
 from utils.cv_splits import generate_cv_splits, load_evaluation_config
+from utils.data_quality import top_entities
 from utils.paths import get_case_study_dir
 from utils.style import COLORS, show_plotly_with_alt
 
@@ -91,19 +95,28 @@ CASE_STUDY_ID = "nasdaq100_microstructure"
 START_DATE = "2020-01-01"
 END_DATE = "2021-12-31"
 MAX_SYMBOLS = 0
+# Where the artifact is written. Empty is the production path: beside the case study's other
+# features. A reduced run sets it to a throwaway directory so that a five-symbol preview cannot
+# replace the 115-symbol artifact every registered training run is pinned to by file hash.
+# Reads are never redirected - a preview resolves its labels and its panel from the committed
+# artifacts, so it is a run of this notebook rather than of a smaller case study.
+WORKSPACE = ""
 
 # %% [markdown]
 # ## Configuration
 #
 # Everything the run depends on is bound from `config/setup.yaml` rather than typed here, so a
 # change to the case study's declared window or label set reaches this notebook without an edit.
-# The four estimation windows below are this notebook's own model specification and are declared
-# here for the same reason - once, where they can be read, rather than at each call site.
+# The estimation windows below are this notebook's own model specification and come from the same
+# file, under `model_based`: a window typed at a call site is a number a reader has to find in the
+# code to know what was fitted.
 
 # %%
 CASE_DIR = get_case_study_dir(CASE_STUDY_ID)
 FEATURES_DIR = CASE_DIR / "features"
 LABELS_DIR = CASE_DIR / "labels"
+OUTPUT_DIR = Path(WORKSPACE) / "features" if WORKSPACE else FEATURES_DIR
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 SETUP = yaml.safe_load((CASE_DIR / "config" / "setup.yaml").read_text())
 EVAL_CFG = load_evaluation_config(CASE_STUDY_ID)
@@ -127,12 +140,21 @@ LABEL_HORIZON = SETUP["labels"]["horizons"][PRIMARY_LABEL]
 LABEL_HORIZON_BARS = int(pd.Timedelta(LABEL_HORIZON) // BAR)
 IC_SAMPLE_STEP = LABEL_HORIZON_BARS
 
-# The three lengths of history the HAR regression averages squared returns over, the amount of
-# history each of its refits reads, and the window each spectrum and each signature path spans.
-HAR_COMPONENTS = (5, 15, 60)
-HAR_FIT_WINDOW = 120
-FFT_WINDOW = 60
-SIG_WINDOW = 30
+# The model specification, read from `setup.yaml::model_based`. The three lengths of history the
+# HAR regression averages squared returns over, the history each of its refits reads, how often it
+# refits, the floor on a refit's usable observations, and the window each spectrum and each
+# signature path spans.
+MODEL_BASED = SETUP["model_based"]
+HAR_COMPONENTS = tuple(MODEL_BASED["har"]["components"])
+HAR_FIT_WINDOW = MODEL_BASED["har"]["fit_window"]
+HAR_REFIT_EVERY = MODEL_BASED["har"]["refit_every"]
+HAR_MIN_TRAIN_OBS = MODEL_BASED["har"]["min_train_obs"]
+# The refit window is the burn-in: the walk's first estimate reads `HAR_FIT_WINDOW` bars and the
+# bar after them is the first one any parameters speak for.
+HAR_BURNIN = HAR_FIT_WINDOW + 1
+FFT_WINDOW = MODEL_BASED["spectrum"]["window"]
+FFT_LOW_FREQ_PERIOD = MODEL_BASED["spectrum"]["low_frequency_period"]
+SIG_WINDOW = MODEL_BASED["signature"]["window"]
 
 # The exchange's regular session. Bars outside it are not part of any decision.
 OPEN_HOUR, OPEN_MINUTE, CLOSE_HOUR = 9, 30, 16
@@ -192,28 +214,42 @@ READ = [
     "trade_at_ask",
 ]
 
-df = load_nasdaq100_bars(
+# `lazy=True` is what makes the projection above worth writing. `include_microstructure`
+# returns the raw archive schema with no projection of its own, so collecting first and
+# selecting afterwards reads all sixty columns into memory to keep eleven. Deferring the
+# collect pushes the projection, the universe filter and the session-hours filter into the
+# parquet scan, so only the columns and rows this notebook reads are ever materialized.
+_lf = load_nasdaq100_bars(
     start_date=START_DATE,
     end_date=str(END_DATE),
     include_microstructure=True,
     symbols=UNIVERSE,
+    lazy=True,
 ).select(READ)
 
 if MAX_SYMBOLS:
-    top_syms = (
-        df.group_by("symbol")
-        .agg(pl.len().alias("n"))
-        .sort("n", descending=True)
-        .head(MAX_SYMBOLS)["symbol"]
-        .to_list()
-    )
-    df = df.filter(pl.col("symbol").is_in(top_syms))
+    # `top_entities` and not a local sort. Every symbol on this panel quotes on the same
+    # padded minute grid, so the row counts a reduction sorts on are equal for every name
+    # that traded the whole window - and a descending sort over a group of equal counts
+    # returns whatever order the group-by produced, which polars does not fix and which is
+    # not stable between two runs of this notebook. Two runs of the same reduced
+    # configuration measured here on 2026-09-05 chose {AAPL, MSFT, TSLA} and {AMZN, FB,
+    # GOOG}. The shared rule breaks the tie on the symbol name, which is what makes a
+    # reduced 04 read the same universe that the reduced 02, 03 and 05 wrote.
+    top_syms = top_entities(_lf, MAX_SYMBOLS)
+    _lf = _lf.filter(pl.col("symbol").is_in(pl.Series("symbol", top_syms).implode()))
     print(f"Restricted to {MAX_SYMBOLS} symbols: {top_syms}")
 
 _hour, _minute = pl.col("timestamp").dt.hour(), pl.col("timestamp").dt.minute()
-df = df.filter(
-    ((_hour > OPEN_HOUR) | ((_hour == OPEN_HOUR) & (_minute >= OPEN_MINUTE))) & (_hour < CLOSE_HOUR)
-).with_columns(pl.col("timestamp").dt.date().alias("session_date"))
+df = (
+    _lf.filter(
+        ((_hour > OPEN_HOUR) | ((_hour == OPEN_HOUR) & (_minute >= OPEN_MINUTE)))
+        & (_hour < CLOSE_HOUR)
+    )
+    .with_columns(pl.col("timestamp").dt.date().alias("session_date"))
+    .collect()
+)
+del _lf
 
 # %% [markdown]
 # The vendor emits a padded 390-bar grid on every date, including the afternoons the exchange
@@ -363,9 +399,11 @@ print(f"Minute panel digest: {RAW_DIGEST}")
 # parameter to place.
 #
 # Two consequences run through the rest of the notebook. First, the feature values do not depend
-# on the walk-forward split, so the `fold` column written at the end selects rows rather than
-# changing any of them - which is not true of a case study whose model is fitted once per fold,
-# and Section E says what changes there. Second, nothing protects a *diagnostic* the same way:
+# on the walk-forward split at all, which is why the artifact written in Section E carries no
+# fold column: there is nothing for a fold tag to distinguish, and the label being fitted selects
+# its own rows by its own boundaries. A case study whose model is fitted once per fold cannot do
+# that, and Section E says what changes there. Second, nothing protects a *diagnostic* the same
+# way:
 # a number printed about the features is as capable of reading the holdout as a fitted parameter
 # is. That is why the folds are resolved next, before anything is computed or printed.
 
@@ -449,11 +487,15 @@ for label, label_split in label_splits.items():
 print(f"The contract holds for {N_FOLDS} folds on each of {len(label_splits)} targets.")
 
 # %% [markdown]
-# A row is emitted under a fold if it falls anywhere in that fold's window, and the window has
-# to be wide enough for every target that will read it. So the emitted span for a fold runs from
-# the earliest training start to the latest validation end across the targets. The differences
-# are minutes, because the horizons are minutes, and minutes are exactly what a coverage check
-# downstream is counting.
+# The four targets disagree about where each fold starts and ends, by minutes, because their
+# horizons differ by minutes. The span a fold needs covered therefore runs from the earliest
+# training start to the latest validation end across the targets, and minutes are exactly what
+# a coverage check downstream is counting.
+#
+# These spans are what the artifact has to reach, not a tag it carries. Section E writes one row
+# per bar with no fold column, so nothing here decides which rows a model reads - the boundaries
+# of the label being fitted do. What the spans are used for is the coverage check in Section E
+# and the figure below.
 
 # %%
 fold_window = {
@@ -474,9 +516,9 @@ fold_window = {
     for s in splits
 }
 for fold, (start, end) in sorted(fold_window.items()):
-    print(f"  Fold {fold} emits {start} .. {end}")
+    print(f"  Fold {fold} needs {start} .. {end}")
 print(
-    f"  Fold {N_FOLDS} emits every bar from {min(w[0] for w in fold_window.values())} to "
+    f"  Fold {N_FOLDS} needs every bar from {min(w[0] for w in fold_window.values())} to "
     f"{HOLDOUT_END.date()}, and is trained on everything before the holdout opens."
 )
 
@@ -502,16 +544,25 @@ def validation_rows(frame: pl.DataFrame) -> pl.DataFrame:
 
 
 # %% [markdown]
-# **Figure F1** draws what the artifact will contain. Each fold is a training span and the
-# validation span that follows it; the top row is the extra fold written for the holdout
-# period, whose training bars all lie before the holdout opens so that a model scored on the
-# holdout has features for it without any of them having been built from it. The point to read
-# off the figure is that no bar of any training span lies to the right of the rule.
+# **Figure F1** draws the geometry the artifact has to cover. Each fold is a training span and
+# the validation span that follows it; the top row is the holdout, whose training bars all lie
+# before the holdout opens so that a model scored on the holdout has features for it without any
+# of them having been built from it. The point to read off the figure is that no bar of any
+# training span lies to the right of the rule.
+#
+# The artifact spans the union of everything drawn here, in one row per bar. The figure is a
+# picture of what will be asked of it, not of how it is laid out.
 
 # %%
+# Sorted by fold id, so the row order is a property of this cell rather than of the order
+# `generate_cv_splits` happens to return. Plotly lays a categorical axis out in order of first
+# appearance, bottom upwards, so without the sort the bottom row is whichever fold the splits
+# list puts first - and that is exactly what the fold renumbering changes. The rendered figure
+# is unchanged today; what changes is that the description below stays true when the numbering
+# moves.
 spans = [
     (f"Fold {s['fold']}", kind, pd.Timestamp(s[f"{key}_start"]), pd.Timestamp(s[f"{key}_end"]))
-    for s in splits
+    for s in sorted(splits, key=lambda s: s["fold"])
     for kind, key in (("Training bars", "train"), ("Validation bars", "val"))
 ]
 spans += [
@@ -569,15 +620,15 @@ fig.update_layout(
 )
 show_plotly_with_alt(
     fig,
-    "Horizontal timeline with one row per fold on a session axis. Every row below the top is a "
-    "validation fold: a long dark navy training bar followed by the shorter amber validation bar "
-    "it is scored on. Fold 0 is the bottom row and holds the latest of those validation windows, "
-    "and each validation row above it holds an earlier one, so their bars overlap. A dashed red "
-    "rule marks where the holdout opens and a shaded band to its right is the holdout itself. "
-    "The top row is the extra fold written for the holdout and has no validation bar: its "
-    "training bar runs from the left edge up to the rule and its light grey holdout bar sits "
-    "inside the band, later than every validation window. No training bar of any row crosses "
-    "the rule.",
+    "Horizontal timeline with one row per fold on a session axis, lowest-numbered fold at the "
+    "bottom. Every row below the top is a validation fold: a long dark navy training bar "
+    "followed by the shorter amber validation bar it is scored on. The validation windows sit "
+    "at different points along the axis and the training bars overlap between rows, because a "
+    "fold tag selects rows rather than changing values. A dashed red rule marks where the "
+    "holdout opens and a shaded band to its right is the holdout itself. The top row is the "
+    "extra fold written for the holdout and has no validation bar: its training bar runs from "
+    "the left edge up to the rule and its light grey holdout bar sits inside the band, later "
+    "than every validation window. No training bar of any row crosses the rule.",
 )
 
 # %% [markdown]
@@ -668,62 +719,55 @@ def build_har_features_intraday(
 # is the discipline Section A described, applied at the finest cadence available: the
 # coefficients used to describe bar $t$ come from a regression whose last observation is bar
 # $t-1$, so there is no window in which a parameter and the bar it describes share information.
-# A refit that reads fewer than twenty usable observations is skipped rather than fitted on
-# whatever survived, and the bar keeps a null.
+# A refit that reads fewer than `HAR_MIN_TRAIN_OBS` usable observations is skipped rather than
+# fitted on whatever survived, and the bar keeps a null.
+#
+# The schedule that walks the fit forward is not written here. `walk_forward_feature` in
+# `case_studies/utils/temporal.py` owns it for every case study that fits anything, and it is
+# what makes the two channels a fitted feature carries - which bars a value is computed from,
+# and which bars its parameters came from - end at or before the bar being described. What this
+# notebook supplies is the two halves that are specific to a HAR: how one refit window is
+# turned into coefficients, and how those coefficients produce a bar's forecast.
+#
+# `apply_scope="block"` is the second half of that. A GARCH or a Kalman filter has to be run
+# from the start of the series to reach the bar it is describing, so the harness hands it every
+# row up to the block. A HAR forecast is a dot product of the bar's own three regressors with
+# the coefficients, and nothing earlier enters it - so the harness hands it the block alone.
+# At one refit per bar over 174,000 bars the difference is not stylistic: the prefix form would
+# ask for 1.5e10 rows per symbol to keep 174,000 of them.
 
 
 # %%
-def fit_har_rolling(
-    rv_5: np.ndarray,
-    rv_15: np.ndarray,
-    rv_60: np.ndarray,
-    fit_window: int = HAR_FIT_WINDOW,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Refit the HAR at every bar on ``[t - fit_window, t)`` and forecast one step ahead.
+def fit_har_window(block: np.ndarray) -> np.ndarray:
+    """Least squares of the next bar's short-horizon variance on the three components.
 
-    Returns the forecast of the short-horizon realized variance, the error in the forecast made
-    for the current bar, and the rolling coefficients.
+    ``block`` is one refit window, ``(fit_window, 4)``: the three regressors at each bar,
+    followed by the value being regressed on them, which is the short-horizon variance of the
+    bar after. Carrying the target as a column of the same array is what keeps the fit inside
+    the window the schedule handed over - a target read from outside it would be an
+    observation the schedule never sanctioned.
     """
-    n = len(rv_5)
-    har_forecast = np.full(n, np.nan)
-    har_residual = np.full(n, np.nan)
-    har_betas = np.full((n, 4), np.nan)
-
-    for t in range(fit_window + 1, n):
-        start = t - fit_window
-        y_train = rv_5[start + 1 : t + 1]
-        X_train = np.column_stack(
-            [
-                np.ones(fit_window),
-                rv_5[start:t],
-                rv_15[start:t],
-                rv_60[start:t],
-            ]
+    regressors = np.column_stack([np.ones(len(block)), block[:, :3]])
+    target = block[:, 3]
+    usable = np.isfinite(target) & np.all(np.isfinite(regressors), axis=1)
+    if usable.sum() < HAR_MIN_TRAIN_OBS:
+        raise ValueError(
+            f"{usable.sum()} usable observations in the refit window, "
+            f"below the declared {HAR_MIN_TRAIN_OBS}"
         )
+    return np.linalg.lstsq(regressors[usable], target[usable], rcond=None)[0]
 
-        valid_mask = np.isfinite(y_train) & np.all(np.isfinite(X_train), axis=1)
-        if valid_mask.sum() < 20:
-            continue
 
-        y_fit = y_train[valid_mask]
-        X_fit = X_train[valid_mask]
+def apply_har(beta: np.ndarray, block: np.ndarray) -> np.ndarray:
+    """The forecast for each bar of the block, and the coefficients that produced it.
 
-        try:
-            beta = np.linalg.lstsq(X_fit, y_fit, rcond=None)[0]
-        except np.linalg.LinAlgError:
-            continue
-
-        har_betas[t] = beta
-
-        x_t = np.array([1.0, rv_5[t], rv_15[t], rv_60[t]])
-        if np.all(np.isfinite(x_t)):
-            har_forecast[t] = x_t @ beta
-            if np.isfinite(rv_5[t]):
-                har_residual[t] = (
-                    rv_5[t] - har_forecast[t - 1] if np.isfinite(har_forecast[t - 1]) else np.nan
-                )
-
-    return har_forecast, har_residual, har_betas
+    The coefficients travel with the forecast because Section D reads them: they are what says
+    which of the three horizons the fit is leaning on, and they exist per bar for the same
+    reason the forecast does.
+    """
+    regressors = np.column_stack([np.ones(len(block)), block[:, :3]])
+    forecast = np.where(np.all(np.isfinite(regressors), axis=1), regressors @ beta, np.nan)
+    return np.column_stack([forecast, np.tile(beta[1:], (len(block), 1))])
 
 
 # %% [markdown]
@@ -742,11 +786,42 @@ def compute_har_per_symbol(
     r1m = np.nan_to_num(r1m, nan=0.0)
 
     har_regs = build_har_features_intraday(r1m)
-    har_forecast, har_residual, har_betas = fit_har_rolling(
-        har_regs["rv_5m"],
-        har_regs["rv_15m"],
-        har_regs["rv_60m"],
-        fit_window=HAR_FIT_WINDOW,
+    rv_5 = har_regs["rv_5m"]
+    # The fourth column is the target: the short-horizon variance of the bar after this one.
+    # It is a column of the same array rather than a second argument because the walk hands
+    # `fit_har_window` a slice and nothing else, which is what bounds the fit.
+    series = np.column_stack(
+        [rv_5, har_regs["rv_15m"], har_regs["rv_60m"], np.append(rv_5[1:], np.nan)]
+    )
+
+    emitted = walk_forward_feature(
+        series,
+        # One symbol's bars, already sorted: the caller below partitions by symbol and sorts by
+        # timestamp, and this is what makes the harness refuse the call rather than trust it.
+        timestamps=symbol_df["timestamp"],
+        burnin=HAR_BURNIN,
+        refit_every=HAR_REFIT_EVERY,
+        window=HAR_FIT_WINDOW,
+        fit=fit_har_window,
+        apply=apply_har,
+        apply_scope="block",
+        n_features=4,
+        # A window too thin to identify the regression is a statement about that stretch of the
+        # symbol's history, not a failure of the notebook. The bar keeps a null and the walk
+        # carries on to the next refit.
+        on_fit_error="skip",
+    )
+    har_forecast, har_betas = emitted[:, 0], emitted[:, 1:]
+
+    # The residual is what the PREVIOUS bar's forecast got wrong, so it is read off the emitted
+    # column rather than computed inside the walk: `har_residual[t] = rv_5[t] - forecast[t-1]`.
+    # It exists only where both forecasts do - a bar whose own refit was skipped has no
+    # coefficients to be judged against, which is the rule the loop this replaces applied.
+    previous_forecast = np.concatenate([[np.nan], har_forecast[:-1]])
+    har_residual = np.where(
+        np.isfinite(har_forecast) & np.isfinite(previous_forecast),
+        rv_5 - previous_forecast,
+        np.nan,
     )
 
     features = pl.DataFrame(
@@ -765,9 +840,9 @@ def compute_har_per_symbol(
                 "symbol": symbol_df["symbol"],
                 "session_date": symbol_df["session_date"],
                 "bar_of_day": symbol_df["bar_of_day"],
-                "beta_5": har_betas[:, 1],
-                "beta_15": har_betas[:, 2],
-                "beta_60": har_betas[:, 3],
+                "beta_5": har_betas[:, 0],
+                "beta_15": har_betas[:, 1],
+                "beta_60": har_betas[:, 2],
             }
         )
         .filter(pl.col("bar_of_day") == pl.col("bar_of_day").max().over("session_date"))
@@ -946,8 +1021,8 @@ show_plotly_with_alt(
 # total once the level is removed. The **dominant period** is the repetition length carrying the
 # most of it, in bars. **Spectral entropy** is how evenly the variation is spread across
 # frequencies: low when one rhythm dominates, high when the window is closer to noise. The
-# **low-frequency ratio** is the share sitting at periods longer than twenty bars, which
-# separates a slow drift in activity from minute-to-minute churn.
+# **low-frequency ratio** is the share sitting at periods longer than `FFT_LOW_FREQ_PERIOD`
+# bars, which separates a slow drift in activity from minute-to-minute churn.
 #
 # Each window ends at $t$ exclusive, so nothing at or after the bar being described enters its
 # own spectrum.
@@ -957,6 +1032,7 @@ show_plotly_with_alt(
 def rolling_fft_features(
     signal: np.ndarray,
     window: int = FFT_WINDOW,
+    low_frequency_period: int = FFT_LOW_FREQ_PERIOD,
 ) -> dict[str, np.ndarray]:
     """Four descriptions of the power spectrum of each trailing window of *signal*."""
     n = len(signal)
@@ -992,7 +1068,7 @@ def rolling_fft_features(
         p_norm = p_norm[p_norm > 0]
         spectral_entropy[t] = -np.sum(p_norm * np.log(p_norm))
 
-        low_mask = freqs[1:] < (1.0 / 20.0)
+        low_mask = freqs[1:] < (1.0 / low_frequency_period)
         if low_mask.any():
             low_freq_ratio[t] = np.sum(power[1:][low_mask]) / total_power
 
@@ -1264,6 +1340,12 @@ print(
     f"{_full.height:,} rows on {len(_check_symbols)} symbols recomputed from a panel ending "
     f"{HOLDOUT_START.date()}; every value identical."
 )
+# The minute panel's own decision times, kept because the coverage check in Section E is a
+# comparison between what the panel offered and what the artifact carries. Taken from `df`
+# rather than from the feature frame, which is the point: the two differ by exactly the
+# warm-up rows, and a check that read the feature frame on both sides would be comparing a
+# frame against itself.
+PANEL_TS = set(df["timestamp"].unique().to_list())
 del _full, _truncated, _truncated_parts, df
 
 # %% [markdown]
@@ -1464,58 +1546,80 @@ display(
 del labels_keys, temporal_keys, joined
 
 # %% [markdown]
-# ### Tag each row with the walk-forward window it falls in
+# ### The artifact carries no fold column, and why that is the correct shape here
 #
-# Every row is written once per fold whose window contains it, and once more under the extra
-# fold covering the holdout. A row therefore appears several times, under different fold tags,
-# with identical feature values - which is correct here and worth being explicit about: these
-# procedures estimate nothing per fold, so the tag says which model may read the row, not what
-# the row contains. A case study whose model is fitted once per fold cannot do this, because
-# there the same bar genuinely has a different value under each fold's parameters.
+# The obvious thing to write is one row per (bar, fold): tag each row with every walk-forward
+# window that contains it, so a downstream reader can ask for fold 1 and get fold 1's rows. That
+# is the only correct shape for a model fitted once per fold, because there the same bar
+# genuinely holds a different value under each fold's parameters - and it is what every case
+# study wrote before the refit schedule replaced the fold as the thing that bounds an estimate.
 #
-# The fold numbering follows what `load_modeling_dataset` expects: the walk-forward folds keep
-# the numbers `generate_cv_splits` gave them, and the holdout fold takes the next number after
-# them.
+# It is the wrong shape here, and Section A said why before anything was computed: **these three
+# procedures estimate nothing per fold.** The HAR is refitted at every bar on the immediately
+# preceding stretch, and the Fourier transform and the path signature estimate no parameters at
+# all. A bar's twenty-two feature values are what they are whichever fold reads them.
+#
+# So a fold column would be a row selector and nothing else - and the reader downstream already
+# has a better one. `split_frames` filters the dataset to `train_start .. train_end` and
+# `val_start .. val_end` **of the label being fitted** before it looks at temporal features at
+# all, so the dates do the selecting either way. Writing the tag as well would replicate every
+# row once per fold to say something the dates already say.
+#
+# Two things follow, and the second is the one worth the paragraph.
+#
+# 1. **The artifact halves.** 40,110,414 rows over 20,010,985 keys becomes 20,010,985 rows;
+#    6.2 GB becomes 1.5 GB once the columns are narrowed below. That is what every stage from
+#    here on loads, and `06_linear` holds it while it fits.
+# 2. **A fold tag baked in at this stage can only be one label's.** The window a row is tagged
+#    under has to come from some label's split, and this case study configures four whose
+#    horizons differ, so their splits disagree about where training ends. Emitting the union of
+#    the four - which the previous version of this cell did - keeps every label covered, but it
+#    also means the tag is not any single label's geometry. Leaving the tag out entirely is what
+#    makes each label's own boundaries the only thing that selects its rows.
+#
+# The features are stored as `Float32`. They are stored values, not accumulators: every one was
+# computed in double precision and is written once, so the only error is representation, bounded
+# by the format at a relative 6e-08. The labels stay `Float64`. What is measured here is a rank
+# correlation of order 1e-03, and 6e-08 does not reach it.
 
 # %%
-fold_frames = []
-for fold, (start, end) in sorted(fold_window.items()):
-    fold_df = temporal_clean.filter(
-        (pl.col("timestamp") >= start) & (pl.col("timestamp") <= end)
-    ).with_columns(pl.lit(fold, dtype=pl.Int32).alias("fold"))
-    fold_frames.append(fold_df)
-    print(f"  Fold {fold}: {fold_df.height:,} rows")
-
-earliest_train_start = min(w[0] for w in fold_window.values())
-holdout_df = temporal_clean.filter(
-    (pl.col("timestamp") >= earliest_train_start) & (pl.col("timestamp") < HOLDOUT_END_EXCLUSIVE)
-).with_columns(pl.lit(N_FOLDS, dtype=pl.Int32).alias("fold"))
-assert holdout_df.filter(pl.col("timestamp").dt.date() == HOLDOUT_END.date()).height > 0, (
-    f"the holdout fold does not reach {HOLDOUT_END.date()}, the last date it is configured to cover"
+FEATURE_COLS = [c for c in temporal_clean.columns if c not in ("timestamp", "symbol")]
+temporal_out = temporal_clean.with_columns(
+    [pl.col(c).cast(pl.Float32) for c in FEATURE_COLS if temporal_clean.schema[c] == pl.Float64]
 )
-fold_frames.append(holdout_df)
-print(f"  Fold {N_FOLDS} (holdout): {holdout_df.height:,} rows")
-
-temporal_with_folds = pl.concat(fold_frames)
-del fold_frames, holdout_df
-print(f"{temporal_with_folds.height:,} rows across {temporal_with_folds['fold'].n_unique()} folds")
+print(
+    f"{temporal_out.height:,} rows, one per (timestamp, symbol), "
+    f"{len(FEATURE_COLS)} features stored as Float32."
+)
 
 # %% [markdown]
-# The check that the fold tags mean what the downstream reader will take them to mean. For every
+# The check that this artifact answers what the downstream reader will ask it. For every
 # configured target and every fold, take the decision times that target asks about inside the
 # training and the validation window, and ask two separate questions of them. **Is it in the
 # panel at all** - a bar with no quote produced no features and never will, and the count is
-# reported rather than asserted on. **Was it tagged with this fold** - and that one has to be
-# every single one, because a decision time the target asks for and this artifact answers under
-# the wrong fold is precisely the defect that shows up three stages downstream as a coverage
-# failure with no visible cause.
+# reported rather than asserted on. **Is it in the artifact** - and that one has to be every
+# single one, because a decision time the target asks for and this artifact does not carry is
+# precisely the defect that shows up three stages downstream as a coverage failure with no
+# visible cause.
+#
+# Dropping the fold column is what makes the second column the whole question. Under a tagged
+# artifact this cell had to check the tag as well, and a row present but tagged under another
+# fold read as missing to the fold that wanted it. There is no tag left to disagree with the
+# dates, so what is checked is coverage and nothing else.
+#
+# The panel side of the comparison is the minute panel, not the feature frame. Reading the
+# feature frame on both sides makes the two columns the same number by construction and the
+# assertion below unfailable - which is what this cell used to do. The difference between them
+# is the warm-up: the first `HAR_BURNIN` bars of the earliest symbols carry no fit and are
+# dropped, so the decision times on them are asked for, present in the panel and absent from the
+# artifact. That is a leading prefix and nothing else, which is what is asserted: every decision
+# time the artifact does not carry lies before the first bar it carries at all. A hole opening
+# anywhere later is the failure this exists to catch.
 
 # %%
-panel_ts = set(temporal_clean["timestamp"].unique().to_list())
-emitted_ts = {
-    fold: set(temporal_with_folds.filter(pl.col("fold") == fold)["timestamp"].unique().to_list())
-    for fold in range(N_FOLDS)
-}
+written_ts = set(temporal_out["timestamp"].unique().to_list())
+ARTIFACT_START = temporal_out["timestamp"].min()
+uncarried: set = set()
 coverage_rows = []
 for label, label_split in label_splits.items():
     label_ts = (
@@ -1532,8 +1636,9 @@ for label, label_split in label_splits.items():
         ):
             start, end = pd.Timestamp(s[start_key]), pd.Timestamp(s[end_key])
             asked = label_ts.filter((label_ts >= start) & (label_ts <= end)).to_list()
-            available = [t for t in asked if t in panel_ts]
-            tagged = sum(t in emitted_ts[s["fold"]] for t in available)
+            available = [t for t in asked if t in PANEL_TS]
+            missing = [t for t in available if t not in written_ts]
+            uncarried.update(missing)
             coverage_rows.append(
                 {
                     "label": label,
@@ -1541,35 +1646,56 @@ for label, label_split in label_splits.items():
                     "window": window,
                     "decision times asked for": len(asked),
                     "in the panel": len(available),
-                    "tagged with this fold": tagged,
+                    "in the artifact": len(available) - len(missing),
+                    "lost to warm-up": len(missing),
                 }
             )
 coverage = pl.DataFrame(coverage_rows)
 display(coverage.sort(["label", "fold", "window"]))
-assert coverage.filter(pl.col("tagged with this fold") < pl.col("in the panel")).is_empty(), (
-    "a configured target has a fold window this artifact does not fully cover"
+_late = sorted(t for t in uncarried if t >= ARTIFACT_START)
+assert not _late, (
+    f"{len(_late):,} decision times between {_late[0]} and {_late[-1]} are in the panel and not "
+    "in the artifact, after the artifact has started: this is a hole rather than a warm-up"
 )
 print(
-    f"Every fold window of all {len(label_splits)} configured targets is covered by the fold it "
-    "is tagged under."
+    f"Every fold window of all {len(label_splits)} configured targets is carried by the artifact "
+    f"from {ARTIFACT_START} on; {len(uncarried):,} earlier decision times are lost to the "
+    f"{HAR_BURNIN}-bar warm-up."
 )
-del emitted_ts, panel_ts
+del written_ts, PANEL_TS, uncarried
 
 # %% [markdown]
-# The artifact is written with a sidecar recording the digest of its values, its row count and
-# its key columns, and the digests of what it was built from. The digest is over content rather
-# than file bytes, so row order and parquet metadata leave it alone and any feature value moves
-# it. Two things go in `inputs` here. The minute panel is the obvious one: every feature value
+# The write goes through `write_model_based`, which is where the guards every stage-04 notebook
+# needs live: that the keys are present and not null, that no key is carried twice, that every
+# declared feature column has a value somewhere, and that the frame's geometry - where each
+# column's values start and stop - is recorded in the sidecar. The duplicate-key check this
+# notebook used to make for itself is one of them, so it is not repeated below.
+#
+# The sidecar records the digest of the artifact's values, its row count and its key columns,
+# and the digests of what it was built from. The digest is over content rather than file bytes,
+# so row order and parquet metadata leave it alone and any feature value moves it. Two things go
+# in `inputs` here. The minute panel is the obvious one: every feature value
 # came out of it. The second is the set of decision times each configured target carries - not
 # its label values, none of which enters a feature, but its timeline, because that is what
 # decided the fold boundaries. Move a target's decision times and the `fold` column this
 # artifact ships moves with them.
+#
+# The timeline digests stay in `inputs` even though no fold column is written any more. They are
+# still what decided which bars had to be covered - the coverage check above is run against
+# them - so a target whose decision times move is a target this artifact may no longer answer,
+# and the sidecar has to say so.
 
 # %%
-record = write_artifact(
-    temporal_with_folds,
-    FEATURES_DIR / "model_based.parquet",
-    keys=["timestamp", "symbol", "fold"],
+record = write_model_based(
+    temporal_out,
+    OUTPUT_DIR / "model_based.parquet",
+    keys=["timestamp", "symbol"],
+    feature_columns=FEATURE_COLS,
+    time_column="timestamp",
+    # No fold column, for the reason argued above. `write_model_based` refuses
+    # `expected_folds` alongside this rather than ignoring it, so the two statements cannot
+    # drift apart.
+    fold_column=None,
     written_by="case_studies/nasdaq100_microstructure/04_model_based_features.py",
     inputs={
         "load_nasdaq100_bars": RAW_DIGEST,
@@ -1579,14 +1705,20 @@ record = write_artifact(
 print(f"Wrote features/model_based.parquet, digest {record['digest']}, {record['n_rows']:,} rows")
 
 # %%
-_written = pl.scan_parquet(FEATURES_DIR / "model_based.parquet")
-assert _written.select(pl.len()).collect().item() == temporal_with_folds.height
-assert (
-    temporal_with_folds.select(pl.struct("timestamp", "symbol", "fold").n_unique()).item()
-    == temporal_with_folds.height
-), "duplicate (timestamp, symbol, fold) key in the artifact"
-assert set(temporal_with_folds["fold"].unique().to_list()) == set(range(N_FOLDS + 1))
-print(f"Artifact reconciled: {temporal_with_folds.height:,} rows, {N_FOLDS + 1} folds")
+_written = pl.scan_parquet(OUTPUT_DIR / "model_based.parquet")
+_written_schema = _written.collect_schema()
+assert _written.select(pl.len()).collect().item() == temporal_out.height
+assert "fold" not in _written_schema.names(), (
+    "the artifact carries a fold column: a reader would select rows by a tag rather than by the "
+    "boundaries of the label it is fitting"
+)
+assert {_written_schema[c] for c in FEATURE_COLS} == {pl.Float32}, (
+    "a feature column was not written as Float32"
+)
+print(
+    f"Artifact reconciled: {temporal_out.height:,} rows on (timestamp, symbol), "
+    f"{len(FEATURE_COLS)} Float32 features, no fold column."
+)
 
 # %% [markdown]
 # ## F. Incremental evaluation: does a temporal feature rank the cross-section on its own?

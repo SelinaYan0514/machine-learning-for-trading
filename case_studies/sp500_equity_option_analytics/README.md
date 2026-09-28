@@ -7,7 +7,7 @@ lagged one day, and trades execute at the following Monday open. The distinctive
 whether options contain information, but whether that information survives point-in-time feature
 engineering, weekly portfolio construction, costs, risk controls, and a regime change.
 
-## Dataset Profile
+## At a Glance
 
 | Property | Value |
 |---|---|
@@ -20,13 +20,11 @@ engineering, weekly portfolio construction, costs, risk controls, and a regime c
 | Evaluation | Two walk-forward folds; 10-session embargo; 2021 holdout |
 | Execution | Friday close to Monday open; one-day lag on option features |
 | Cost model | 13 bps round trip at the configured midpoint; 0-50 bps stress grid |
-| Current evidence | v3.1 validation carrier: NLinear, score weighted, top 10, 5% trailing stop |
+| Holdout | 2021, observed on an earlier lineage; see the note below |
 
-The corrected v3.1 validation Sharpe is 2.088 with a 95% interval of `[1.005, 3.117]`. The
-matching NLinear holdout was not run because the 2021 holdout had already been observed on an older
-IPCA lineage. The current notebooks therefore present validation evidence, label out-of-sample
-efficacy unresolved, and make no deployment claim. The book-aligned v3.0 record remains preserved;
-the two result versions are not mixed.
+The 2021 holdout was observed before the current sweep was built, on an IPCA lineage that the
+rebuild superseded. The notebooks therefore report validation evidence and leave out-of-sample
+efficacy unresolved rather than re-spending a window that has already been looked at.
 
 ## Pipeline
 
@@ -62,9 +60,11 @@ the two result versions are not mixed.
 
 Run the pipeline from the repository root in the locked environment. Set `ML4T_DATA_PATH` to a
 directory containing `equities/market/sp500/daily_bars.parquet` and
-`equities/market/sp500/options_surface_daily.parquet`. The equity bars require an AlgoSeek license;
-the options-surface loader provides the materialized research file when available. Missing data
-raises an error with acquisition instructions.
+`equities/market/sp500/options_surface_daily.parquet`. The equity bars ship in this repository at
+`data/equities/market/sp500/daily_bars.parquet`, redistributed with AlgoSeek's permission, so no
+account, key or license request is needed; cite [algoseek.com](https://algoseek.com) as the source
+in anything you publish from them. The options-surface loader provides the materialized research
+file when available. Missing data raises an error with acquisition instructions.
 
 ```bash
 uv sync --frozen
@@ -72,8 +72,9 @@ uv sync --frozen
 for notebook in \
   01_feasibility_analysis 02_labels 03_financial_features 04_model_based_features \
   05_evaluation 06_linear 07_gbm 08_tabular_dl 09_dl_lstm 10_dl_patchtst \
-  11_latent_factors 11a_pca 11b_ipca 11c_conditional_autoencoder \
-  11d_stochastic_discount_factor 11e_supervised_autoencoder 12_causal_dml \
+  11a_pca 11b_ipca 11c_conditional_autoencoder \
+  11d_stochastic_discount_factor 11e_supervised_autoencoder 11_latent_factors \
+  12_causal_dml \
   13_model_analysis 14_backtest 15_portfolio_management 16_risk_management \
   17_costs 18_holdout_predictions 19_holdout_backtest 20_strategy_analysis
 do
@@ -90,3 +91,32 @@ the greedy funnel is valid only after all model predictions and all equal-weight
 The results source of truth is `run_log/registry.db`, with content-addressed artifacts under
 `run_log/training/`, `run_log/predictions/`, and `run_log/backtest/`. Legacy `results/*.json` files
 are not used.
+
+## Results
+
+This README describes how the case study is built, not what it found. Results are
+not restated here: the registry is rebuilt whenever the case study is re-derived,
+and a number copied into prose stays correct only until the next rebuild.
+
+[`20_strategy_analysis`](20_strategy_analysis.ipynb) reads the registry back and reports the selected
+configuration with its interval evidence. That notebook, and the registry it reads,
+are where a result comes from.
+
+To read the results without training anything, download the published bundle, which
+carries the registry and the artifacts behind it:
+
+```bash
+uv run python scripts/download_artifacts.py --cs sp500_equity_option_analytics
+```
+
+Two bundles are published, and they are separate generations rather than revisions
+of one another. `v3.1.0-artifacts` is current and is what the command above fetches.
+`v3.0.0-artifacts` holds the results as first published. The 3.1 rebuild re-keyed
+every content-addressed hash, so a hash taken from one bundle does not resolve in
+the other.
+
+## Run Log
+
+`run_log/registry.db` records every training run, prediction set and backtest,
+each addressed by a hash of the specification that produced it. The artifacts sit
+beside it under `run_log/training/`, `run_log/predictions/` and `run_log/backtest/`.

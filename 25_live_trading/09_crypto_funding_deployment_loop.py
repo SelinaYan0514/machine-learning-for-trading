@@ -1,6 +1,7 @@
 # ---
 # jupyter:
 #   jupytext:
+#     cell_metadata_filter: tags,-all
 #     formats: py:percent,ipynb
 #     text_representation:
 #       extension: .py
@@ -16,10 +17,11 @@
 # %% [markdown]
 # # Crypto Funding Deployment Loop
 #
-# **Chapter 25: Live Trading Systems**
-# **Section**: 25.6 (Pipeline Verification: Ensuring Technical Parity)
+# **Book Reference**: Chapter 25, Section 25.6 (Ensuring technical parity through pipeline
+# verification)
 #
-# **Docker image**: `ml4t-gpu` (includes CUDA LightGBM and `python-okx`)
+# **Requires**: the `live` optional dependency group (`uv sync --extra live`), which supplies
+# `python-okx` for the data plane and `alpaca-py` for the execution plane.
 #
 # This notebook is the chapter's crypto deployment-loop demonstration. The
 # *Chapter 12* funding-rate case study trains on Binance-derived perpetuals;
@@ -56,8 +58,8 @@
 # **Cross-References**
 # - Chapter 12: Funding-rate case study (model training and registry)
 # - Chapter 7: Triple-barrier and direction labels
-# - Chapter 25.3: Alpaca integration and paper trading
-# - Chapter 25.6: Pipeline verification across venues
+# - Chapter 25.3: Integrating with Alpaca
+# - Chapter 25.6: Ensuring technical parity through pipeline verification
 # - Chapter 26: Repeated model serving and monitoring
 #
 # **Learning Objectives**
@@ -111,7 +113,7 @@ from sklearn.preprocessing import StandardScaler
 from data import load_crypto_perps, load_crypto_premium
 from utils.paths import display_path, get_chapter_dir, get_output_dir
 from utils.reproducibility import set_global_seeds
-from utils.style import COLORS
+from utils.style import COLORS, show_plotly_with_alt
 
 logging.basicConfig(
     level=logging.INFO,
@@ -128,7 +130,7 @@ LEARNING_RATE = 0.05
 NUM_LEAVES = 31
 NUM_THREADS = 4
 SEED = 42
-TRAIN_DEVICE = "cuda"
+TRAIN_DEVICE = "cpu"  # deterministic CPU training; a reader reproduces the artifact bit for bit
 PROB_LONG_THRESHOLD = (
     0.30  # any non-trivial probability mass on P(up); soft for demo (production: ≥0.45)
 )
@@ -138,6 +140,7 @@ PROB_SHORT_THRESHOLD = (
 NOTIONAL_PER_LEG_USD = 100.0  # paper notional per symbol
 SUBMIT_PAPER_ORDERS = False  # explicit opt-in only; publication execution is dry-run
 MIN_OKX_LIVE_COVERAGE = 0.75
+MAX_FUNDING_AGE_HOURS = 8.0  # funding settles every 8h; one missed settlement is the limit
 
 # %% [markdown]
 # ## 1. Setup and Venue Connections
@@ -193,12 +196,18 @@ OKX_INSTRUMENT = {sym: f"{sym[:-4]}-USDT-SWAP" for sym in CASE_STUDY_UNIVERSE}
 # The demo carries an explicit eleven-pair mapping for its paper-execution rehearsal.
 
 
+# %% [markdown]
+# The mapping is written out rather than queried, and both halves of that choice matter. USD
+# pairs rather than USDT ones, because the paper account is funded in USD and a quote-currency
+# mismatch is a different instrument. And a fixed list rather than a live catalogue lookup,
+# because a venue's listings change and a notebook that silently tracked them would produce a
+# different universe on every run with nothing recording which one it used.
+#
+# The cost is that the list goes stale, which is the right cost to pay here: a stale mapping
+# fails visibly against a symbol the venue no longer lists, where a silent one changes the
+# strategy underneath the reader.
+
 # %%
-# Mapping from case-study perp symbol to Alpaca USD-quoted spot pair (eleven
-# mapped to a USD-quoted spot equivalent). We use USD pairs rather than USDT
-# pairs because the demo's paper account is funded in USD. Venue listings can
-# change, so this fixed mapping is an explicit teaching input rather than a
-# claim about the current complete Alpaca catalogue.
 ALPACA_USD_PAIR = {
     "AAVEUSDT": "AAVE/USD",
     "ADAUSDT": "ADA/USD",
@@ -262,7 +271,7 @@ print(f"Order submission:  {'ENABLED' if SUBMIT_PAPER_ORDERS else 'DISABLED (dry
 set_global_seeds(SEED)
 
 # %% [markdown]
-# **Finding.** Eight of the nineteen case-study perps are absent from the
+# Eight of the nineteen case-study perps are absent from the
 # demo's fixed Alpaca mapping. The strategy was researched on a universe chosen
 # for funding-data depth, while the execution rehearsal uses a narrower spot
 # universe. That declared gap illustrates the research/deployment alignment
@@ -670,7 +679,8 @@ X_train_scaled = scaler.transform(X_train)
 
 
 # %% [markdown]
-# LightGBM trains on CUDA with fixed seeds; the feature scaler is fit on the sealed training rows only.
+# LightGBM trains on the CPU with fixed seeds, and the feature scaler is fit on the training rows
+# alone so no validation or live row contributes to the mean and scale it applies.
 
 
 # %%
@@ -684,6 +694,8 @@ model = lgb.train(
         "num_leaves": NUM_LEAVES,
         "verbose": -1,
         "device_type": TRAIN_DEVICE,
+        "deterministic": True,
+        "force_col_wise": True,
         "num_threads": NUM_THREADS,
         "max_bin": 63,
         "seed": SEED,
@@ -698,9 +710,10 @@ print(f"Model trained: {NUM_BOOST_ROUND} rounds, {NUM_LEAVES} leaves")
 
 
 # %% [markdown]
-# Fixed seeds control LightGBM's statistical random choices, but CUDA histogram updates are not
-# bit-exact across runs. The production contract is the pinned GPU environment plus empirical prediction
-# stability; readers who require bitwise repeatability can use LightGBM's deterministic CPU settings.
+# `deterministic` and `force_col_wise` fix LightGBM's histogram construction order, so the same
+# inputs in the same pinned environment produce the same booster on a re-run. A different platform
+# or a differently compiled LightGBM can still differ, and a CUDA build differs between runs of
+# itself, so anything that crosses environments is verified by comparing predictions, not hashes.
 
 # %% [markdown]
 # The model, scaler, and feature order form one deployment artifact contract.
@@ -748,14 +761,14 @@ with open(metadata_path, "w") as f:
 print(f"Persisted artefacts to {display_path(ARTIFACTS_DIR)}")
 
 # %% [markdown]
-# **Finding.** The deployment artefact is a *separate fit* from the case
+# The deployment artefact is a *separate fit* from the case
 # study's research artefact. Same data, same labels, but a different feature
 # subset (the thirteen the live pipeline can compute) and a different code
 # path (this notebook's `compute_features_8h`, not
 # `case_studies/crypto_perps_funding/03_financial_features.py`). Hyperparameter
 # choices are inherited; trained weights are not. This separation is the
 # right architecture: research artefacts live in the registry; deployment
-# artefacts live under `25_live_trading/live_artifacts/`.
+# artefacts live under `25_live_trading/output/crypto_funding_deployment/`.
 
 # %% [markdown]
 # ## 4. Live Cross-Section from OKX
@@ -892,14 +905,14 @@ if live_funding_frames:
 
 
 # %% [markdown]
-# Funding observations are joined backward within each symbol, preventing a future funding timestamp
-# from informing an earlier bar.
+# Funding settles every eight hours and bars arrive far more often, so the two have to be aligned
+# before either can be a feature. The join is backward and per symbol: each bar takes the most
+# recent funding rate at or before its own timestamp, which is the only rate that existed when
+# that bar closed. A forward or nearest join would put a funding print into a bar that preceded
+# it, and the resulting feature would be a small, invisible piece of the future.
 
 
 # %%
-# Build a panel that aligns funding (8h cadence) with bar timestamps using a
-# backward asof join per symbol. The resulting `funding_rate` is the most
-# recent funding rate at or before each bar's timestamp.
 if len(live_funding) > 0:
     parts = []
     for sym in live_prices["symbol"].unique().to_list():
@@ -910,14 +923,14 @@ if len(live_funding) > 0:
                 [
                     pl.lit(None, dtype=pl.Float64).alias("funding_rate"),
                     pl.lit(None, dtype=pl.Float64).alias("premium"),
+                    pl.lit(None, dtype=pl.Datetime("ms", "UTC")).alias("funding_asof"),
                 ]
             )
         else:
-            joined = sym_bars.join_asof(
-                sym_fund.select(["timestamp", "funding_rate"]),
-                on="timestamp",
-                strategy="backward",
+            sym_fund_asof = sym_fund.select(["timestamp", "funding_rate"]).with_columns(
+                pl.col("timestamp").alias("funding_asof")
             )
+            joined = sym_bars.join_asof(sym_fund_asof, on="timestamp", strategy="backward")
             sym_bars = joined.with_columns((pl.col("funding_rate") * 3.0).alias("premium"))
         parts.append(sym_bars)
     live_panel = pl.concat(parts).sort(["symbol", "timestamp"])
@@ -926,26 +939,65 @@ else:
         [
             pl.lit(None, dtype=pl.Float64).alias("funding_rate"),
             pl.lit(None, dtype=pl.Float64).alias("premium"),
+            pl.lit(None, dtype=pl.Datetime("ms", "UTC")).alias("funding_asof"),
         ]
     )
 
 
 # %% [markdown]
-# The latest fully populated row per symbol is the only live observation eligible for inference.
+# The latest fully populated row per symbol is the only live observation eligible for inference,
+# and populated is not the same as current. The as-of join carries the last funding print forward
+# for as long as the feed stays silent, so `funding_rate` and the `premium` derived from it are
+# never null once a single rate has arrived: a symbol whose funding stopped publishing a week ago
+# still produces a complete feature row, and the null check cannot distinguish it from a live one.
+# A null count answers when the series began, never whether it kept going. The age of the matched
+# print against the eight-hour settlement grid answers the second question, and a symbol reading a
+# rate older than `MAX_FUNDING_AGE_HOURS` leaves the cross-section rather than being scored.
 
 
 # %%
-live_features = compute_features_8h(live_panel)
+live_features = compute_features_8h(live_panel).with_columns(
+    ((pl.col("timestamp") - pl.col("funding_asof")).dt.total_minutes() / 60.0).alias(
+        "funding_age_hours"
+    )
+)
 
-# The latest valid feature row per symbol becomes the prediction input
-latest_features = (
+# The latest valid feature row per symbol is the prediction candidate
+latest_candidates = (
     live_features.filter(pl.all_horizontal([pl.col(c).is_not_null() for c in FEATURE_COLS]))
     .group_by("symbol")
     .agg(pl.all().last())
     .sort("symbol")
 )
-print(f"Latest valid feature rows: {latest_features.shape[0]} of {len(CASE_STUDY_UNIVERSE)} perps")
-assert set(latest_features["symbol"]) == set(available_symbols)
+print(
+    f"Latest valid feature rows: {latest_candidates.shape[0]} of {len(CASE_STUDY_UNIVERSE)} perps"
+)
+assert set(latest_candidates["symbol"]) == set(available_symbols)
+
+funding_age = latest_candidates["funding_age_hours"]
+print(
+    f"Funding age at the inference row: median {funding_age.median():.1f}h, "
+    f"max {funding_age.max():.1f}h (tolerance {MAX_FUNDING_AGE_HOURS:.0f}h)"
+)
+is_fresh = pl.col("funding_age_hours").is_not_null() & (
+    pl.col("funding_age_hours") <= MAX_FUNDING_AGE_HOURS
+)
+stale_funding = latest_candidates.filter(~is_fresh).select("symbol", "funding_age_hours")
+if len(stale_funding) > 0:
+    print("Dropped for stale funding: " + ", ".join(stale_funding["symbol"]))
+    print(stale_funding)
+
+latest_features = latest_candidates.filter(is_fresh)
+fresh_coverage = len(latest_features) / len(CASE_STUDY_UNIVERSE)
+print(
+    f"Inference cross-section: {len(latest_features)} of "
+    f"{len(CASE_STUDY_UNIVERSE)} requested perps ({fresh_coverage:.1%})"
+)
+if fresh_coverage < MIN_OKX_LIVE_COVERAGE:
+    raise RuntimeError(
+        f"Coverage after the funding-freshness gate is {fresh_coverage:.1%}, below the "
+        f"{MIN_OKX_LIVE_COVERAGE:.0%} deployment floor"
+    )
 
 # %% [markdown]
 # ## 5. Predict Direction Probabilities
@@ -985,17 +1037,14 @@ predictions = latest_features.select(["symbol", "timestamp", "close"]).with_colu
 )
 assert predictions.select(pl.struct(["symbol", "timestamp"]).n_unique()).item() == len(predictions)
 
-
 # %% [markdown]
-# When both directional thresholds fire, the larger tail probability determines the intent.
+# Both directional thresholds can fire at once, which happens whenever the flat probability is
+# small enough that the two tails together clear it. The intent then goes to whichever tail is
+# larger, so the position follows the model's own ranking of the two directions rather than the
+# order the conditions happen to be written in.
 
 
 # %%
-# Decide intent: long on strong P(up), short on strong P(down), else flat.
-# When both thresholds fire (possible whenever P(flat) is small), pick the
-# direction with the higher tail probability rather than the first branch
-# that matches. Otherwise a row with p_up=0.31, p_down=0.39, p_flat=0.30
-# would be tagged "long" despite P(down) being materially larger.
 predictions = predictions.with_columns(
     pl.when((pl.col("p_up") >= PROB_LONG_THRESHOLD) & (pl.col("p_up") >= pl.col("p_down")))
     .then(pl.lit("long"))
@@ -1033,14 +1082,22 @@ for intent in ["short", "flat", "long"]:
         marker_color=intent_colors[intent],
     )
 fig.update_layout(
-    title="Current live direction edges by active intent: "
-    + ", ".join(plot_predictions["intent"].unique(maintain_order=True)),
-    xaxis_title="P(up) - P(down) (probability)",
+    title="Intent follows class probability, not the size of the directional edge",
+    xaxis_title="P(up) minus P(down)",
     yaxis_title="Perpetual swap",
     barmode="stack",
     legend_title_text="Intent",
 )
-fig.show()
+show_plotly_with_alt(
+    fig,
+    "Horizontal bar chart of the directional edge, P(up) minus P(down), for each perpetual in "
+    "the live cross-section, sorted and coloured by the intent it produced. "
+    + ", ".join(
+        f"{intent}: {len(plot_predictions.filter(pl.col('intent') == intent))}"
+        for intent in ["short", "flat", "long"]
+    )
+    + ".",
+)
 
 # %% [markdown]
 # ## 6. Trade: Alpaca Paper Crypto
@@ -1169,7 +1226,7 @@ for r in exec_results:
     print(f"  {r['symbol']:<10} {r['intent']:<6} p_up={r['p_up']:.2f} → {r['status']:<20} {extra}")
 
 # %% [markdown]
-# **Finding.** The execution summary distinguishes flat intent, an absent
+# The execution summary distinguishes flat intent, an absent
 # mapping, an unsupported spot short, an intentional dry run, and a missing
 # credential. Each status has a different operator response. Publication mode
 # should contain no `submitted` record because order submission is disabled.
@@ -1179,7 +1236,7 @@ for r in exec_results:
 #
 # The run record is the per-cycle audit trail. It captures the model
 # fingerprint, the predict cross-section, and the execution disposition for
-# every symbol. Run JSONs are gitignored under `live_artifacts/` and
+# every symbol. Run JSONs are gitignored under the output directory and
 # accumulate as the deployment loop runs.
 
 # %%
@@ -1198,6 +1255,10 @@ run = {
         "instruments_fetched": available_symbols,
         "coverage": coverage,
         "minimum_coverage": MIN_OKX_LIVE_COVERAGE,
+        "instruments_scored": latest_features["symbol"].to_list(),
+        "coverage_after_funding_freshness": fresh_coverage,
+        "maximum_funding_age_hours": MAX_FUNDING_AGE_HOURS,
+        "stale_funding": stale_funding.to_dicts(),
         "fetch_errors": [{"symbol": s, "error": e} for s, e in fetch_errors],
         "latest_bar_ts_utc": str(live_prices["timestamp"].max()),
         "candle_parser_audit": audit_frame.to_dicts(),
@@ -1236,7 +1297,11 @@ print(f"Run persisted: {display_path(run_path)}")
 #    fixed teaching map routes eleven perps to Alpaca paper and records the
 #    remaining eight as signal-only. The OKX data plane separately records
 #    instruments retired by the live venue and stops if coverage falls below
-#    the declared floor. Both gaps are explicit deployment inputs.
+#    the declared floor. A symbol can also drop out while still returning
+#    data: the funding as-of join carries the last print forward for as long
+#    as the feed is silent, so freshness is checked as an age against the
+#    eight-hour settlement grid rather than as a null. All three gaps are
+#    explicit deployment inputs.
 # 3. **The deployment artefact is not the research artefact.** Same data,
 #    same labels, different feature subset (the thirteen the live pipeline
 #    can compute), different code path. Hyperparameters cross over from

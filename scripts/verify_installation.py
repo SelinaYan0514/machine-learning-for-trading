@@ -362,10 +362,16 @@ def check_storage():
 
 
 def check_ml4t_libraries():
+    # Every ``ml4t.<sub>`` the repository imports has to appear here, and
+    # tests/test_publish_gate_sees_subpackages.py fails when one does not.
+    # Nothing else looks at this granularity: the publish smoke test scans
+    # top-level names, so `from ml4t.live.brokers.ib import ...` reaches it as
+    # `ml4t`, and importing `ml4t` never executes `ml4t/live/__init__.py`.
     cat = "ML4T Libraries"
     check_import(cat, "ml4t.data", "ml4t-data")
     check_import(cat, "ml4t.diagnostic", "ml4t-diagnostic")
     check_import(cat, "ml4t.engineer", "ml4t-engineer")
+    check_import(cat, "ml4t.models", "ml4t-models")
     check_import(cat, "ml4t.backtest", "ml4t-backtest")
     check_import(cat, "ml4t.live", "ml4t-live")
 
@@ -398,7 +404,7 @@ def check_repo_imports():
 
     # utils
     try:
-        import utils  # noqa: F811
+        import utils  # noqa: F401,F811 - the import IS the check
 
         results.append((cat, "utils", "PASS", "importable"))
     except Exception as exc:
@@ -425,7 +431,7 @@ def check_repo_imports():
 
     # data package
     try:
-        import data  # noqa: F811
+        import data  # noqa: F401,F811 - the import IS the check
 
         results.append((cat, "data", "PASS", "importable"))
     except Exception as exc:
@@ -437,7 +443,7 @@ def check_repo_imports():
 
     # case_studies package
     try:
-        import case_studies  # noqa: F811
+        import case_studies  # noqa: F401,F811 - the import IS the check
 
         results.append((cat, "case_studies", "PASS", "importable"))
     except Exception as exc:
@@ -632,7 +638,7 @@ def check_optional():
     check_import(cat, "clickhouse_connect", "clickhouse-connect (db-benchmark extra)")
     check_import(cat, "influxdb_client", "influxdb-client (db-benchmark extra)")
     # Live trading
-    check_import(cat, "ib_async", "ib_insync/ib_async (live extra)")
+    check_import(cat, "ib_async", "ib_async (live extra)")
     check_import(cat, "alpaca", "alpaca-py (live extra)")
     # Feast / MLOps
     check_import(cat, "feast", "feast (mlops extra)")

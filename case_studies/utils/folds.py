@@ -500,10 +500,47 @@ def split_frames(mds: Any, split: dict[str, Any]) -> tuple[pl.DataFrame, pl.Data
     return train_df, val_df
 
 
+def fold_seed(seed: int, fold_id: int) -> int:
+    """The seed one walk-forward window is fitted under.
+
+    A fold's *index* is an input to the fit here, not a label on it. Six sites derive a
+    seed this way, and they come through this one definition so the coupling has a single
+    address rather than six that drift:
+
+    * ``tabular_dl.py`` - every fold, every run
+    * ``latent_factors/cv.py`` - every fold, every run
+    * ``deep_learning.py`` - every fold, every run
+    * ``darts_forecasting.py`` - every fold, every run, and the value also lands in the
+      model's own ``random_state`` rather than only in the process-global RNG
+    * ``gbm.py`` and ``_subsample_index`` below - only when ``0.0 < train_sample_frac < 1.0``
+
+    **Renumbering the folds is therefore a refit, not a relabel**, for `tabular_dl`,
+    `latent_factors`, `deep_learning`, `darts_forecasting` and any reduced run.
+    ``ml4t-diagnostic`` 0.1.4 did exactly that, emitting the windows chronologically so
+    fold 0 became the earliest rather than the most recent. None of the six leaves a
+    signal in any artifact - the fold's contribution to the seed is consumed and
+    discarded - so a migration that relabels stored results claims a numbering under
+    which a fresh run would seed differently, and the registry serves the old artifact
+    for the new identity without anything noticing.
+
+    Seeding from the window boundaries instead would make a renumber stop being a
+    computation change, and it is the right design. It also moves fitted values for
+    every one of those families in every case study, and that trade was declined on
+    2026-09-06. This is recorded and guarded, not fixed:
+    ``tests/test_fold_seed_coupling.py`` pins the derivation, and
+    ``utils/cv_splits.py::_assert_chronological`` refuses a fold set that is not numbered
+    oldest first. Changing either without a declared refit of those families is the
+    failure both exist to catch. See #1056.
+    """
+    return int(seed) + int(fold_id)
+
+
 def _subsample_index(n_rows: int, fold_id: int, train_sample_frac: float, seed: int) -> np.ndarray:
     """Which training rows a reduced run keeps. One definition, so every caller keeps the same."""
     keep = max(1, int(n_rows * train_sample_frac))
-    rng = np.random.default_rng(seed + fold_id)
+    # Which rows a reduced run keeps depends on the fold's number, so renumbering the
+    # windows resamples them. See `fold_seed`.
+    rng = np.random.default_rng(fold_seed(seed, fold_id))
     return np.sort(rng.choice(n_rows, size=keep, replace=False))
 
 
@@ -662,8 +699,16 @@ def iter_raw_folds(
 
         # Only the design matrix has its dtype pinned. A classification label is integral and
         # coercing it to float would change what the family is asked to fit.
-        X_train = _contiguous(train_df.select(feature_names).to_numpy(), design_dtype)
-        X_val = _contiguous(val_df.select(feature_names).to_numpy(), design_dtype)
+        #
+        # `order="c"` is asked for rather than fixed afterwards. polars defaults to Fortran
+        # order, so `_contiguous` was allocating a second full design matrix and holding both
+        # until the F-order original fell out of scope: measured on a 4,000,000 x 88 float32
+        # frame, 2.63 GB of transient for a 1.31 GB matrix against 1.31 GB asking polars for
+        # the layout directly. The values are bit-identical either way - checked against
+        # float32 with nulls, float64, and mixed-precision frames cast both ways - so this is
+        # not a preparation change and `FOLD_PREPARATION_VERSION` does not move.
+        X_train = _contiguous(train_df.select(feature_names).to_numpy(order="c"), design_dtype)
+        X_val = _contiguous(val_df.select(feature_names).to_numpy(order="c"), design_dtype)
         y_train = np.ascontiguousarray(train_df[label_col].to_numpy())
         y_val = np.ascontiguousarray(val_df[label_col].to_numpy())
         y_eval = np.ascontiguousarray(val_df[eval_label_col].to_numpy()) if eval_label_col else None
@@ -855,7 +900,7 @@ def gbm_fold(
     imputing a median would replace with a fabricated observation.
 
     Only the design matrix is cast. The labels stay float64, which is where this differs from the
-    ``prepare_gbm_folds`` path it replaces: LightGBM converts a label to its own precision anyway,
+    pandas fold preparation it replaced: LightGBM converts a label to its own precision anyway,
     so the fit is identical either way (measured, squared error and huber alike, to zero
     difference), while ``y_eval`` is the target IC is measured against and the standardising
     families keep it float64. Casting it here would have made a GBM IC and a linear IC two

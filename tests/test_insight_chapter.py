@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import json
 
-import numpy as np
 import polars as pl
 import pytest
 
 from case_studies.utils import insight_chapter
+from case_studies.utils.conformal import (
+    holdout_conformal_embargo_steps,
+    walk_forward_conformal_coverage,
+)
 
 
 def test_compare_ic_uses_only_shared_intraday_timestamps() -> None:
@@ -34,76 +37,159 @@ def test_compare_ic_uses_only_shared_intraday_timestamps() -> None:
     }
 
 
-def test_selected_prediction_conformal_coverage_uses_chronology_and_exact_rank(
+def _write_prediction_panel(
+    prediction_dir, residuals: dict[str, list[float]], *, fold_ids: list[int] | None = None
+):
+    """One row per (day, symbol), with `y_true - y_score` exactly as `residuals` says."""
+    lengths = {len(values) for values in residuals.values()}
+    assert len(lengths) == 1
+    steps = lengths.pop()
+    days = [f"2020-{1 + step // 28:02d}-{1 + step % 28:02d}" for step in range(steps)]
+    scores = [float(step) / steps for step in range(steps)]
+    folds = fold_ids or [1 if step < steps // 2 else 0 for step in range(steps)]
+    pl.DataFrame(
+        {
+            "timestamp": [day for day in days for _ in residuals],
+            "symbol": [symbol for _ in days for symbol in residuals],
+            "y_true": [
+                scores[step] + residuals[symbol][step]
+                for step in range(steps)
+                for symbol in residuals
+            ],
+            "y_score": [scores[step] for step in range(steps) for _ in residuals],
+            "fold_id": [folds[step] for step in range(steps) for _ in residuals],
+        }
+    ).write_parquet(prediction_dir / "predictions.parquet")
+
+
+def _selected(prediction_hash: str, spec: dict, *, label: str = "fwd_ret_5d") -> dict:
+    return {
+        "case_study": "probe",
+        "family": "gbm",
+        "config_name": "probe-config",
+        "label": label,
+        "prediction_hash": prediction_hash,
+        "spec_json": json.dumps(spec),
+    }
+
+
+_TWO_FOLD_SPEC = {"computation": {"expected_prediction_keys": {"n_folds": 2}}}
+_FOUR_FOLD_SPEC = {"computation": {"expected_prediction_keys": {"n_folds": 4}}}
+
+
+def test_selected_prediction_conformal_coverage_measures_the_sizing_widths(
     tmp_path, monkeypatch
 ) -> None:
+    """The chapter reports the estimator `conformal_weighted` allocates with.
+
+    Asserted against `walk_forward_conformal_coverage` on the same artifact, because what this
+    pins is that the two are one measurement: the chapter used to run a second estimator -
+    pooled across symbols, fixed on the earliest fold, unembargoed - and print its coverage as
+    the strategy's.
+    """
     case_dir = tmp_path / "case_studies" / "probe"
     prediction_dir = case_dir / "run_log" / "predictions" / "prediction-a"
     prediction_dir.mkdir(parents=True)
-    calibration = [0.1] * 33 + [5.0] * 7
-    evaluation = [1.0] * 40
-    pl.DataFrame(
-        {
-            "timestamp": ["2019-01-02"] * 40 + ["2020-01-02"] * 40,
-            "y_true": calibration + evaluation,
-            "y_score": [0.0] * 80,
-            "fold_id": [1] * 40 + [0] * 40,
-        }
-    ).write_parquet(prediction_dir / "predictions.parquet")
+    _write_prediction_panel(prediction_dir, {"CALM": [0.1] * 80, "WILD": [10.0] * 80})
     monkeypatch.setattr(insight_chapter, "get_case_study_dir", lambda _case_study: case_dir)
 
     result = insight_chapter.conformal_coverage_for_selected_prediction(
-        {
-            "case_study": "probe",
-            "family": "gbm",
-            "config_name": "probe-config",
-            "prediction_hash": "prediction-a",
-            "spec_json": json.dumps({"computation": {"expected_prediction_keys": {"n_folds": 2}}}),
-        },
-        levels=(0.80,),
+        _selected("prediction-a", _TWO_FOLD_SPEC), levels=(0.80,), embargo_steps=1
+    )
+    expected = walk_forward_conformal_coverage(
+        pl.read_parquet(prediction_dir / "predictions.parquet"), levels=(0.80,), embargo_steps=1
     )
 
-    calibration_scale = pl.Series(calibration).std()
-    expected_quantile = sorted(calibration)[int(np.ceil(41 * 0.80)) - 1]
-    implied_quantile = result["mean_interval_width_frac_std"][0] * calibration_scale / 2.0
-    assert expected_quantile == 0.1
-    assert implied_quantile == expected_quantile
-    assert result["empirical_coverage"].to_list() == [0.0]
+    assert result.height == 1
+    assert result.row(0, named=True) == {
+        "case_study": "probe",
+        "family": "gbm",
+        "config_name": "probe-config",
+        "prediction_hash": "prediction-a",
+        **expected[0],
+    }
 
 
-def test_selected_prediction_conformal_coverage_uses_calibration_scale(
+def test_selected_prediction_conformal_coverage_defaults_to_the_reviewed_horizon(
     tmp_path, monkeypatch
 ) -> None:
+    """The row's own label decides the embargo, so the figure and the widths cannot disagree
+    about how far a residual reaches. `label` is required of the selected row for that reason.
+    """
+    case_dir = tmp_path / "case_studies" / "etfs"
+    prediction_dir = case_dir / "run_log" / "predictions" / "prediction-a"
+    prediction_dir.mkdir(parents=True)
+    _write_prediction_panel(prediction_dir, {"CALM": [0.1] * 80, "WILD": [10.0] * 80})
+    monkeypatch.setattr(insight_chapter, "get_case_study_dir", lambda _case_study: case_dir)
+
+    row = _selected("prediction-a", _TWO_FOLD_SPEC)
+    row["case_study"] = "etfs"
+    defaulted = insight_chapter.conformal_coverage_for_selected_prediction(row, levels=(0.80,))
+    explicit = insight_chapter.conformal_coverage_for_selected_prediction(
+        row, levels=(0.80,), embargo_steps=holdout_conformal_embargo_steps("etfs", "fwd_ret_5d")
+    )
+    assert defaulted.equals(explicit)
+
+    # A row with no `label` falls back to the training spec, which names the same one.
+    # `us_equities_panel/15_model_analysis` builds exactly that row: it attaches the label to
+    # the frame this returns rather than to the dict it passes in.
+    unlabelled = {key: value for key, value in row.items() if key != "label"}
+    unlabelled["spec_json"] = json.dumps({**_TWO_FOLD_SPEC, "label": "fwd_ret_5d"})
+    assert insight_chapter.conformal_coverage_for_selected_prediction(
+        unlabelled, levels=(0.80,)
+    ).equals(explicit)
+
+    with pytest.raises(insight_chapter.RegistrySelectionError, match="names a label"):
+        insight_chapter.conformal_coverage_for_selected_prediction(
+            unlabelled | {"spec_json": json.dumps(_TWO_FOLD_SPEC)}, levels=(0.80,)
+        )
+
+
+def test_selected_prediction_conformal_coverage_takes_a_non_contiguous_geometry(
+    tmp_path, monkeypatch
+) -> None:
+    """A run may number its folds any way it likes, and one live sweep does.
+
+    ``us_equities_panel/deep_learning/fwd_ret_5d`` declares four folds and writes 0, 5, 10
+    and 15. The check is that every declared fold is present, not that the ids count from
+    zero: comparing against ``range(n_folds)`` refused the artifact outright and is what
+    stopped Chapter 13 executing.
+    """
     case_dir = tmp_path / "case_studies" / "probe"
     prediction_dir = case_dir / "run_log" / "predictions" / "prediction-a"
     prediction_dir.mkdir(parents=True)
-    calibration = [0.1] * 33 + [5.0] * 7
-    evaluation = [40.0, -40.0] * 20
-    pl.DataFrame(
-        {
-            "timestamp": ["2019-01-02"] * 40 + ["2020-01-02"] * 40,
-            "y_true": calibration + evaluation,
-            "y_score": [0.0] * 80,
-            "fold_id": [1] * 40 + [0] * 40,
-        }
-    ).write_parquet(prediction_dir / "predictions.parquet")
+    stride_five = [(step // 20) * 5 for step in range(80)]
+    assert sorted(set(stride_five)) == [0, 5, 10, 15]
+    _write_prediction_panel(
+        prediction_dir, {"CALM": [0.1] * 80, "WILD": [10.0] * 80}, fold_ids=stride_five
+    )
     monkeypatch.setattr(insight_chapter, "get_case_study_dir", lambda _case_study: case_dir)
 
     result = insight_chapter.conformal_coverage_for_selected_prediction(
-        {
-            "case_study": "probe",
-            "family": "gbm",
-            "config_name": "probe-config",
-            "prediction_hash": "prediction-a",
-            "spec_json": json.dumps({"computation": {"expected_prediction_keys": {"n_folds": 2}}}),
-        },
-        levels=(0.80,),
+        _selected("prediction-a", _FOUR_FOLD_SPEC), levels=(0.80,), embargo_steps=1
     )
 
-    quantile = 0.1
-    width = result["mean_interval_width_frac_std"][0]
-    assert width == 2.0 * quantile / pl.Series(calibration).std()
-    assert width != 2.0 * quantile / pl.Series(calibration + evaluation).std()
+    assert result.height == 1
+
+
+def test_selected_prediction_conformal_coverage_still_refuses_a_missing_fold(
+    tmp_path, monkeypatch
+) -> None:
+    """Three of the four declared folds, non-contiguous. A missing fold is the failure."""
+    case_dir = tmp_path / "case_studies" / "probe"
+    prediction_dir = case_dir / "run_log" / "predictions" / "prediction-a"
+    prediction_dir.mkdir(parents=True)
+    short = [(step // 27) * 5 for step in range(80)]
+    assert sorted(set(short)) == [0, 5, 10]
+    _write_prediction_panel(
+        prediction_dir, {"CALM": [0.1] * 80, "WILD": [10.0] * 80}, fold_ids=short
+    )
+    monkeypatch.setattr(insight_chapter, "get_case_study_dir", lambda _case_study: case_dir)
+
+    with pytest.raises(insight_chapter.RegistrySelectionError, match="expected 4 declared folds"):
+        insight_chapter.conformal_coverage_for_selected_prediction(
+            _selected("prediction-a", _FOUR_FOLD_SPEC), levels=(0.80,), embargo_steps=1
+        )
 
 
 def test_selected_prediction_conformal_coverage_rejects_all_null_declared_fold(
@@ -115,6 +201,7 @@ def test_selected_prediction_conformal_coverage_rejects_all_null_declared_fold(
     pl.DataFrame(
         {
             "timestamp": ["2019-01-02"] * 40 + ["2020-01-02"] * 40,
+            "symbol": ["AAA"] * 80,
             "y_true": [0.1] * 40 + [None] * 40,
             "y_score": [0.0] * 40 + [None] * 40,
             "fold_id": [0] * 40 + [1] * 40,
@@ -124,16 +211,7 @@ def test_selected_prediction_conformal_coverage_rejects_all_null_declared_fold(
 
     with pytest.raises(insight_chapter.RegistrySelectionError, match=r"observed \[0\]"):
         insight_chapter.conformal_coverage_for_selected_prediction(
-            {
-                "case_study": "probe",
-                "family": "gbm",
-                "config_name": "probe-config",
-                "prediction_hash": "prediction-a",
-                "spec_json": json.dumps(
-                    {"computation": {"expected_prediction_keys": {"n_folds": 2}}}
-                ),
-            },
-            levels=(0.80,),
+            _selected("prediction-a", _TWO_FOLD_SPEC), levels=(0.80,), embargo_steps=1
         )
 
 
@@ -146,6 +224,7 @@ def test_selected_prediction_conformal_coverage_rejects_non_finite_rows(
     pl.DataFrame(
         {
             "timestamp": ["2019-01-02"] * 40 + ["2020-01-02"] * 40,
+            "symbol": ["AAA"] * 80,
             "y_true": [0.1] * 80,
             "y_score": [0.0] * 79 + [float("inf")],
             "fold_id": [0] * 40 + [1] * 40,
@@ -155,16 +234,7 @@ def test_selected_prediction_conformal_coverage_rejects_non_finite_rows(
 
     with pytest.raises(insight_chapter.RegistrySelectionError, match="non-finite y_score"):
         insight_chapter.conformal_coverage_for_selected_prediction(
-            {
-                "case_study": "probe",
-                "family": "gbm",
-                "config_name": "probe-config",
-                "prediction_hash": "prediction-a",
-                "spec_json": json.dumps(
-                    {"computation": {"expected_prediction_keys": {"n_folds": 2}}}
-                ),
-            },
-            levels=(0.80,),
+            _selected("prediction-a", _TWO_FOLD_SPEC), levels=(0.80,), embargo_steps=1
         )
 
 
@@ -183,30 +253,16 @@ def test_selected_prediction_conformal_coverage_reads_the_legacy_spec_shape(
     case_dir = tmp_path / "case_studies" / "probe"
     prediction_dir = case_dir / "run_log" / "predictions" / "prediction-legacy"
     prediction_dir.mkdir(parents=True)
-    calibration = [0.1] * 33 + [5.0] * 7
-    evaluation = [1.0] * 40
-    pl.DataFrame(
-        {
-            "timestamp": ["2019-01-02"] * 40 + ["2020-01-02"] * 40,
-            "y_true": calibration + evaluation,
-            "y_score": [0.0] * 80,
-            "fold_id": [1] * 40 + [0] * 40,
-        }
-    ).write_parquet(prediction_dir / "predictions.parquet")
+    _write_prediction_panel(prediction_dir, {"CALM": [0.1] * 80, "WILD": [10.0] * 80})
     monkeypatch.setattr(insight_chapter, "get_case_study_dir", lambda _case_study: case_dir)
 
     legacy = insight_chapter.conformal_coverage_for_selected_prediction(
-        {
-            "case_study": "probe",
-            "family": "deep_learning",
-            "config_name": "probe-config",
-            "prediction_hash": "prediction-legacy",
-            "spec_json": json.dumps({"family": "deep_learning", "n_folds": 2}),
-        },
+        _selected("prediction-legacy", {"family": "deep_learning", "n_folds": 2}),
         levels=(0.80,),
+        embargo_steps=1,
     )
 
-    assert legacy["empirical_coverage"].to_list() == [0.0]
+    assert legacy["nominal_level"].to_list() == [0.80]
 
 
 def test_selected_prediction_conformal_coverage_still_rejects_a_single_fold(
@@ -219,35 +275,115 @@ def test_selected_prediction_conformal_coverage_still_rejects_a_single_fold(
 
     with pytest.raises(insight_chapter.RegistrySelectionError, match="at least two declared folds"):
         insight_chapter.conformal_coverage_for_selected_prediction(
-            {
-                "case_study": "probe",
-                "family": "deep_learning",
-                "config_name": "probe-config",
-                "prediction_hash": "prediction-one",
-                "spec_json": json.dumps({"family": "deep_learning", "n_folds": 1}),
-            },
+            _selected("prediction-one", {"family": "deep_learning", "n_folds": 1}),
             levels=(0.80,),
+            embargo_steps=1,
         )
 
 
-class TestTheDeclaredFoldCount:
-    """Both live spec shapes, because reading only one silently answers zero.
+def _write_booster(booster_dir, *, fold: int) -> None:
+    """A real two-feature LightGBM booster, so the loader parses what the pipeline writes.
 
-    Every caller raises "n_folds is not declared" on a 0, and that is what
-    `13_dl_time_series/12_case_study_insights` and `14_latent_factors/09_case_study_insights`
-    did the first time the CI fixture gave them a `sp500_equity_option_analytics` row: the
-    specs declare two folds under `computation.expected_prediction_keys`, and the readers
-    looked only at the top level. Four training runs across the seven live registries carry
-    the top-level key; 1193 do not.
+    `weak` is weak but genuinely split on - 287 and 160 gain against `strong`'s 9,125 and
+    7,312 on the two folds. It used to carry a coefficient of 0.1 over five rounds, which
+    left its gain at exactly zero, so the ordering asserted below was over a feature the
+    booster had never used. `top_features_by_gain` now drops those, which is what turned
+    that into a failure.
     """
+    import lightgbm as lgb
+    import numpy as np
 
-    def test_reads_the_v3_location(self) -> None:
-        spec = {"computation": {"expected_prediction_keys": {"n_folds": 2}}}
-        assert insight_chapter.declared_fold_count(spec) == 2
+    booster_dir.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(fold)
+    x = rng.normal(size=(200, 2))
+    y = 3.0 * x[:, 0] + 0.6 * x[:, 1] + rng.normal(scale=0.01, size=200)
+    model = lgb.LGBMRegressor(n_estimators=30, num_leaves=4, min_child_samples=5, verbose=-1)
+    model.fit(x, y, feature_name=["strong", "weak"])
+    model.booster_.save_model(str(booster_dir / f"fold_{fold}.txt"))
 
-    def test_reads_the_legacy_top_level_key(self) -> None:
-        assert insight_chapter.declared_fold_count({"n_folds": 5}) == 5
 
-    def test_answers_zero_when_neither_is_declared(self) -> None:
-        assert insight_chapter.declared_fold_count({"computation": {"cv": {}}}) == 0
-        assert insight_chapter.declared_fold_count({}) == 0
+def test_gbm_feature_importance_reads_the_boosters_the_training_stage_writes(
+    tmp_path, monkeypatch
+) -> None:
+    """Boosters live under the run's own `models` directory.
+
+    The loader used to look only beside it and one level up, so every case study
+    returned an empty frame and the sections built on it published nothing while
+    every check still passed.
+    """
+    case_dir = tmp_path / "case_studies" / "probe"
+    training_dir = case_dir / "run_log" / "training" / "hash-a"
+    _write_booster(training_dir / "models" / "boosters", fold=0)
+    _write_booster(training_dir / "models" / "boosters", fold=1)
+    monkeypatch.setattr(insight_chapter, "get_case_study_dir", lambda _case_study: case_dir)
+
+    result = insight_chapter.load_gbm_feature_importance("probe", "hash-a", "probe-config", top_n=2)
+
+    assert sorted(result["fold_id"].unique().to_list()) == [0, 1]
+    ordered = (
+        result.group_by("feature")
+        .agg(pl.col("importance_norm").mean())
+        .sort("importance_norm", descending=True)["feature"]
+        .to_list()
+    )
+    assert ordered == ["strong", "weak"]
+
+
+def test_gbm_feature_importance_still_reads_the_older_layouts(tmp_path, monkeypatch) -> None:
+    """Run logs written before boosters moved keep working."""
+    case_dir = tmp_path / "case_studies" / "probe"
+    _write_booster(case_dir / "run_log" / "training" / "hash-b" / "boosters", fold=0)
+    monkeypatch.setattr(insight_chapter, "get_case_study_dir", lambda _case_study: case_dir)
+
+    result = insight_chapter.load_gbm_feature_importance("probe", "hash-b", "probe-config", top_n=2)
+
+    assert result.height > 0
+
+
+def test_gbm_feature_importance_measures_only_the_selected_checkpoint(
+    tmp_path, monkeypatch
+) -> None:
+    """Importance belongs to the model the selection chose, not to every saved round.
+
+    Training saves all boosting rounds; a configuration is selected at one checkpoint
+    along that trajectory. The booster here is fitted so that the first rounds split on
+    `early` and later rounds split on `late`, which makes the two readings disagree.
+    """
+    import lightgbm as lgb
+    import numpy as np
+
+    rng = np.random.default_rng(0)
+    early = rng.normal(size=400)
+    late = rng.normal(size=400)
+    # `early` alone explains the signal; `late` only explains what is left after the
+    # first rounds have fitted it, so it enters the booster late.
+    y = 5.0 * early + 0.05 * late
+    model = lgb.LGBMRegressor(
+        n_estimators=200, learning_rate=0.5, num_leaves=4, min_child_samples=5, verbose=-1
+    )
+    model.fit(np.column_stack([early, late]), y, feature_name=["early", "late"])
+    booster_dir = tmp_path / "case_studies" / "probe" / "run_log" / "training" / "h" / "models"
+    booster_dir = booster_dir / "boosters"
+    booster_dir.mkdir(parents=True)
+    model.booster_.save_model(str(booster_dir / "fold_0.txt"))
+    monkeypatch.setattr(
+        insight_chapter, "get_case_study_dir", lambda _cs: tmp_path / "case_studies" / "probe"
+    )
+
+    def gain(num_iteration):
+        frame = insight_chapter.load_gbm_feature_importance(
+            "probe", "h", "probe-config", top_n=2, num_iteration=num_iteration
+        )
+        return dict(frame.group_by("feature").agg(pl.col("importance").mean()).iter_rows())
+
+    first_three = gain(3)
+    everything = gain(None)
+
+    # At three rounds no tree has split on `late` at all, so it carries zero gain and is
+    # not a ranked feature; over the whole booster it is. That is the same disagreement
+    # this test was written for, stated at its sharpest.
+    assert "late" not in first_three
+    assert everything["late"] > 0
+    assert insight_chapter.load_gbm_feature_importance(
+        "probe", "h", "probe-config", top_n=2, num_iteration=10_000
+    ).equals(insight_chapter.load_gbm_feature_importance("probe", "h", "probe-config", top_n=2))

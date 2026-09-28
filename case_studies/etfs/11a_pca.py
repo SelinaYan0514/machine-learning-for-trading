@@ -53,7 +53,7 @@
 # - Read a model with no epochs and say why it still publishes a checkpoint.
 # - Read a population published for every declared label rather than only the traded one.
 #
-# **Book reference**: Chapter 13, Section 13.3 (PCA for algorithmic trading) and Chapter 14,
+# **Book reference**: Chapter 14, Section 14.2 (Extracting latent factors with PCA) and
 # Section 14.5 (Bridging economics and statistics with advanced models). Chapter 6, Section 6.7
 # (Search accounting and run logging) introduces the run log this notebook writes to.
 #
@@ -200,6 +200,7 @@ requests = model_requests(
     execution_tier=EXECUTION_TIER,
     overrides=overrides,
     preview_reductions=PREVIEW_REDUCTIONS,
+    notebook="11a_pca",
 )
 resolved = tuple(request.resolve() for request in requests)
 
@@ -435,10 +436,23 @@ for earlier, later in zip(folds, folds[1:], strict=False):
             "rank_correlation": pair.select(pl.corr("earlier_rank", "later_rank")).item(),
         }
     )
-turnover = pl.DataFrame(turnover)
+# The schema is declared rather than inferred. A run with fewer than two folds - which a
+# narrowed population produces - leaves this list empty, and `pl.DataFrame([])` has no columns
+# at all, so the chart below fails on a missing `fold_pair` rather than on having nothing to
+# draw. Turnover between consecutive folds needs two folds; that is a property of the measure,
+# not a failure.
+turnover = pl.DataFrame(
+    turnover,
+    schema={"fold_pair": pl.String, "funds": pl.Int64, "rank_correlation": pl.Float64},
+)
 turnover
 
 # %%
+if turnover.height == 0:
+    print(
+        f"{len(folds)} fold(s) in this population, so there is no consecutive pair to compare "
+        "and no turnover to chart."
+    )
 fig = go.Figure(
     go.Bar(
         x=turnover.get_column("fold_pair").to_list(),
@@ -458,11 +472,16 @@ fig.update_layout(
 )
 # The range is read off the frame rather than asserted, so the alt text stays true of the next run.
 _values = turnover.get_column("rank_correlation")
+_range = (
+    f"values from {_values.min():.2f} to {_values.max():.2f}"
+    if turnover.height
+    else "no fold pairs, so the chart is empty"
+)
 show_plotly_with_alt(
     fig,
     "Bar chart of the rank correlation between the predicted cross-sections of consecutive "
     "walk-forward folds, one bar per fold pair, with a dashed zero line. Counted from the frame: "
-    f"{turnover.height} fold pairs, values from {_values.min():.2f} to {_values.max():.2f}.",
+    f"{turnover.height} fold pairs, {_range}.",
 )
 
 # %% [markdown]

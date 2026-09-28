@@ -6,7 +6,10 @@ import json
 import logging
 import os
 import shutil
+import sqlite3
 import uuid
+from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -45,7 +48,15 @@ VALID_PREDICTION_SPLITS = frozenset({"validation", "holdout"})
 # Columns a schema migration added, which an immutable row may therefore be missing
 # through no change of its own. Nothing else is filled on NULL: see the comment at the
 # backfill itself for why a nullable column is not the same as a migrated one.
-MIGRATION_BACKFILLED_COLUMNS = frozenset({"refutation_n_successful", "refutation_placebo_json"})
+MIGRATION_BACKFILLED_COLUMNS = frozenset(
+    {
+        "refutation_n_successful",
+        "refutation_placebo_json",
+        "refutation_placebo_t_json",
+        "refutation_frozen_fraction",
+        "covariance_type",
+    }
+)
 MAX_PREDICTION_STD_RATIO = 100.0
 
 
@@ -83,6 +94,435 @@ def _sampling_reduced(spec_json: str | None) -> bool:
         if value != (1.0 if key.endswith("_frac") else 0):
             return True
     return False
+
+
+def _artifacts_mapping(artifacts: object) -> dict[str, str]:
+    """``{name: {"sha256": ...}}`` as a flat mapping, dropping records that pin nothing.
+
+    The ``sha256:`` prefix is stripped here as well as in :func:`_files_mapping`, because a
+    prefixed digest compared against a bare one can never match and the guard would pass such
+    a run in silence. All 3,359 records in the nine live registries are bare, so this changes
+    nothing today - but ``darts_forecasting.py`` already builds a record as
+    ``{"dataset": ..., "sha256": f"sha256:{...}"}``, and ``tests/fixture_registry.py`` has
+    been stripping the prefix on this shape since before it delegated here.
+    """
+    if not isinstance(artifacts, dict):
+        return {}
+    return {
+        str(name): str(record["sha256"]).removeprefix("sha256:")
+        for name, record in sorted(artifacts.items())
+        if isinstance(record, dict) and record.get("sha256")
+    }
+
+
+#: The latent adapter's ``files`` roles that name the same artifact under a different word.
+#: The guard compares per NAME, so ``evaluation_label`` and ``eval_label`` would never be
+#: compared to each other however wide the reader got - the same file pinned twice, checked
+#: never. Measured across the nine live registries before this was added: the only case is
+#: ``us_firm_characteristics/fwd_class_1m``, where the four latent runs pin 04c53aa6a847 as
+#: ``evaluation_label`` and the gbm, linear and tabular_dl runs pin that same sha as
+#: ``eval_label``. Every eval-label sha agrees within its label, so folding the names
+#: together refuses nothing that registers today.
+_FILES_ROLE_ALIASES = {"evaluation_label": "eval_label"}
+
+
+def _files_mapping(files: object) -> dict[str, str]:
+    """A ``files`` list of ``{role, sha256}`` as the same mapping, keyed by role.
+
+    The ``sha256:`` prefix is stripped so a latent run's pin compares against the bare digest
+    every other family records, and a role in ``_FILES_ROLE_ALIASES`` is renamed to the word
+    the other families use. Two records naming one role would be a spec defect rather than a
+    legitimate second vintage, so the later one is not allowed to win silently.
+    """
+    if not isinstance(files, list):
+        return {}
+    mapping: dict[str, str] = {}
+    for record in files:
+        if not isinstance(record, dict):
+            continue
+        role, sha = record.get("role"), record.get("sha256")
+        if not role or not sha:
+            continue
+        digest = str(sha).removeprefix("sha256:")
+        name = _FILES_ROLE_ALIASES.get(str(role), str(role))
+        if mapping.setdefault(name, digest) != digest:
+            raise ValueError(
+                f"input_data_spec.files pins two shas for role {role!r}: "
+                f"{mapping[name]} and {digest}"
+            )
+    return dict(sorted(mapping.items()))
+
+
+def _input_artifact_shas(spec: dict | str | None) -> dict[str, str]:
+    """The whole-file sha256 a training spec pins per input artifact.
+
+    Three shapes, because the producers write three and reading only one left 119 of the
+    1,156 registered runs vintage-checked by nothing at all:
+
+    - ``computation.input_data_spec.artifacts``, what ``gbm``, ``linear`` and ``tabular_dl``
+      build from ``mds.input_lineage``.
+    - ``computation.input_data_spec.input_data_spec.artifacts``. ``deep_learning`` builds its
+      payload as ``{"input_data_spec": mds.input_lineage, ...}``
+      (``case_studies/utils/deep_learning.py``), so the same mapping ends up one level down.
+      A nesting slip, not a different contract.
+    - ``computation.input_data_spec.files``, a list of ``{role, sha256}`` with a ``sha256:``
+      prefix, which is what the latent adapter records.
+
+    Reading all three is what makes ``_enforce_input_artifact_vintage`` cover the population
+    it claims to. Measured across the nine live registries before the widening landed: the
+    119 newly-read runs introduce no conflict the rule would refuse - every (label, artifact)
+    pair they pin already agrees with itself - so this changes what is checked from here on
+    without retroactively refusing anything already registered.
+    """
+    if isinstance(spec, str):
+        try:
+            spec = json.loads(spec)
+        except (TypeError, ValueError):
+            return {}
+    if not isinstance(spec, dict):
+        return {}
+    computation = spec.get("computation")
+    if not isinstance(computation, dict):
+        return {}
+    input_data_spec = computation.get("input_data_spec")
+    if not isinstance(input_data_spec, dict):
+        return {}
+    if mapping := _artifacts_mapping(input_data_spec.get("artifacts")):
+        return mapping
+    nested = input_data_spec.get("input_data_spec")
+    if isinstance(nested, dict) and (mapping := _artifacts_mapping(nested.get("artifacts"))):
+        return mapping
+    return _files_mapping(input_data_spec.get("files"))
+
+
+def _registered_artifact_shas(db, *, label: str) -> dict[str, set[str]]:
+    """Per artifact name, the shas the runs already registered for *label* were fitted on.
+
+    Scoped to the label because the name ``label`` addresses ``labels/<label>.parquet``:
+    across labels those are different files by design, so a name-only comparison would
+    refuse every legitimate run. The case-study-wide artifacts (``financial``,
+    ``model_based``) are unaffected by the narrowing - a case study fits its labels from the
+    same files - and where one ever does not, the per-label answer is the right one.
+    """
+    shas: dict[str, set[str]] = {}
+    for (spec_json,) in db.execute("SELECT spec_json FROM training_runs WHERE label = ?", (label,)):
+        for name, sha in _input_artifact_shas(spec_json).items():
+            shas.setdefault(name, set()).add(sha)
+    return shas
+
+
+def _declared_artifact_supersessions(db, *, artifact_name: str, sha256: str) -> set[str]:
+    """Every sha *sha256* is declared to replace for *artifact_name*, following the chain back.
+
+    Ancestry, not one edge. A second deliberate regeneration produces a chain - C replaces
+    B, which already replaced A - and the population still holds runs fitted on A, because
+    a declaration retires a vintage for future runs and does not delete the runs that used
+    it. Reading one edge would demand that C also declare it supersedes A, which
+    :func:`declare_artifact_supersession` refuses: A already names B as its successor, and a
+    sha has one. So the chain would be unregisterable and the error would name the
+    declaration that cannot be made.
+    """
+    predecessors: dict[str, set[str]] = {}
+    for successor, superseded in db.execute(
+        "SELECT sha256, supersedes_sha256 FROM artifact_supersessions WHERE artifact_name = ?",
+        (artifact_name,),
+    ):
+        predecessors.setdefault(str(successor), set()).add(str(superseded))
+    retired: set[str] = set()
+    frontier = [sha256]
+    while frontier:
+        for predecessor in predecessors.get(frontier.pop(), ()):
+            if predecessor not in retired:
+                retired.add(predecessor)
+                frontier.append(predecessor)
+    return retired
+
+
+def _enforce_input_artifact_vintage(db, spec: dict) -> None:
+    """A run may not join a population fitted on a different vintage of the same artifact.
+
+    A training run pins its inputs by whole-file sha256 and then fits on whatever is on
+    disk, and nothing compares the two. Regenerate a stage-03 or stage-04 artifact and the
+    next run registers against a vintage no prior member of that population was fitted
+    under - and it is silent, so the mixture is found later by comparing the registry to the
+    disk by hand, if at all.
+
+    The state this catches is reachable and was reached. On 2026-09-07 `fx_pairs` held 138
+    training runs pinning one `model_based` sha while no file on disk carried it; a
+    re-derivation later the same day put those bytes back. Nothing reported either change,
+    and a fit registered in between would have joined that population under a vintage no
+    other member was fitted on.
+
+    Refusing here is what makes it cheap: `register_training_run` runs before the fit on
+    every path, so the run stops at the moment the change can still be undone rather than
+    after a population has been mixed.
+
+    Superseding an artifact on purpose is a legitimate operation, so the refusal has a
+    declared override rather than a bypass: :func:`declare_artifact_supersession` records
+    which sha the new one replaces, the same way a changed population names the snapshot it
+    supersedes and a second causal identity names the one it retires. Every diverging sha
+    must be declared, so a declaration cannot half-cover a registry that already holds two
+    vintages.
+    """
+    label = spec.get("label")
+    incoming = _input_artifact_shas(spec)
+    if not incoming or not label:
+        return
+    for conflict in input_artifact_vintage_conflicts(db, label=str(label), incoming=incoming):
+        raise ValueError(conflict.message)
+
+
+@dataclass(frozen=True)
+class ArtifactVintageConflict:
+    """One artifact whose on-disk vintage the population does not carry and nothing retires."""
+
+    artifact_name: str
+    label: str
+    sha256: str
+    undeclared: tuple[str, ...]
+    message: str
+
+
+def input_artifact_vintage_conflicts(
+    db, *, label: str, incoming: dict[str, str]
+) -> list[ArtifactVintageConflict]:
+    """The refusals :func:`_enforce_input_artifact_vintage` would raise, as values.
+
+     Separated from the raise so the same question can be asked BEFORE a chain is queued.
+     The refusal costs a launch rather than a fit - ``register_training_run`` runs ahead of
+     the fit on every path - but it still stops the chain ten seconds in, and until
+     ``scripts/check_input_artifact_vintage.py`` existed the only warning was that stop
+    .
+
+     The pre-flight has to ask THIS function rather than its own version of the comparison.
+     A check that re-implements the rule can disagree with it, and a pre-flight that passes
+     where registration refuses is worse than no pre-flight: it is a green light for a chain
+     that will not run.
+    """
+    conflicts: list[ArtifactVintageConflict] = []
+    registered = _registered_artifact_shas(db, label=label)
+    for name, sha in incoming.items():
+        known = registered.get(name)
+        if not known or sha in known:
+            # Nothing to compare against, or this run is fitting on the vintage the
+            # population already carries.
+            continue
+        undeclared = sorted(
+            known - _declared_artifact_supersessions(db, artifact_name=name, sha256=sha)
+        )
+        if not undeclared:
+            continue
+        conflicts.append(
+            ArtifactVintageConflict(
+                artifact_name=name,
+                label=label,
+                sha256=sha,
+                undeclared=tuple(undeclared),
+                message=(
+                    f"input artifact {name!r} on disk hashes {sha}, but every training run "
+                    f"registered for label {label!r} was fitted on "
+                    f"{undeclared if len(undeclared) > 1 else undeclared[0]}. "
+                    f"Registering this run would put two vintages of one artifact in the same "
+                    f"population with nothing recording it. If the artifact was regenerated on "
+                    f"purpose, declare it: declare_artifact_supersession(case_study, {name!r}, "
+                    f"sha256={sha!r}, supersedes_sha256={undeclared[0]!r}). If it was not, the "
+                    f"artifact on disk is not the one this population was built from - restore "
+                    f"it rather than fitting on it."
+                ),
+            )
+        )
+    return conflicts
+
+
+def declare_artifact_supersession(
+    case_study: str,
+    artifact_name: str,
+    *,
+    sha256: str,
+    supersedes_sha256: str,
+    case_dir: Path | None = None,
+) -> None:
+    """Record that *sha256* deliberately replaces *supersedes_sha256* for *artifact_name*.
+
+    The override for :func:`_enforce_input_artifact_vintage`. An author who regenerates a
+    stage-03 or stage-04 artifact on purpose calls this once, naming the sha being retired,
+    and every later run reading the new file registers normally.
+
+    Validated the way ``declare_causal_supersedes`` is, and for the same reason: this is a
+    function an author calls by hand with a hash copied out of an error message, so a
+    mistyped predecessor must be refused rather than recorded. A declaration naming a sha no
+    registered run was fitted on cannot unblock anything and would sit in the registry
+    reading as though it had.
+
+    ``scripts/record_artifact_supersession.py`` records the neighbouring fact in the new
+    artifact's *sidecar* - which folds came through the replacement unchanged - and calls
+    this function when it succeeds, so one author action leaves both records. The two are
+    not interchangeable: the sidecar answers whether a lock fitted on the old file can be
+    reconstructed against the new one, and refuses a replacement that is not a fold-wise
+    extension; this answers whether a new training run may join a population fitted on the
+    old vintage, which is a live question exactly when the sidecar route refuses. The
+    registry is where this one belongs because the guard that reads it runs at registration
+    time, where a spec carries shas and no artifact paths.
+    """
+    if sha256 == supersedes_sha256:
+        raise ValueError(f"artifact {artifact_name!r} cannot supersede itself ({sha256})")
+    if case_dir is None:
+        case_dir = _case_dir(case_study)
+    db = _open_registry(case_dir)
+    try:
+        pinned = {
+            sha
+            for (spec_json,) in db.execute("SELECT spec_json FROM training_runs")
+            for name, sha in _input_artifact_shas(spec_json).items()
+            if name == artifact_name
+        }
+        if supersedes_sha256 not in pinned:
+            raise ValueError(
+                f"no training run in {case_study}'s registry was fitted on "
+                f"{artifact_name!r} at {supersedes_sha256}, so there is nothing to "
+                f"supersede. Registered: {sorted(pinned) or 'none'}."
+            )
+        existing = db.execute(
+            "SELECT sha256 FROM artifact_supersessions "
+            "WHERE artifact_name = ? AND supersedes_sha256 = ?",
+            (artifact_name, supersedes_sha256),
+        ).fetchone()
+        if existing is not None:
+            if existing[0] != sha256:
+                raise ValueError(
+                    f"artifact {artifact_name!r} already declares {existing[0]} supersedes "
+                    f"{supersedes_sha256}; {sha256} cannot also supersede it"
+                )
+            return
+        db.execute(
+            "INSERT INTO artifact_supersessions "
+            "(artifact_name, sha256, supersedes_sha256, declared_at) VALUES (?, ?, ?, ?)",
+            (artifact_name, sha256, supersedes_sha256, _utc_now()),
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def _resolved_prediction_label(
+    case_study: str, training_hash: str, label: str | None, case_dir: Path
+) -> str | None:
+    """The label a prediction set was produced under: its parent run's, checked against the caller's.
+
+    `training_runs.label` is authoritative and always present, so a caller that does not pass
+    one is not an error - it is the common case, and every family reaches this through
+    `publish_predictions`, whose `label` is optional. No family runner passes one.
+
+    A caller that passes a label the parent run disagrees with is refused rather than
+    believed. Letting the argument win would stamp the artifact with a label its own
+    training run was not fitted under, and the coverage guard reading that column would
+    then accept the wrong declaration and refuse the right one - which is the mistake this
+    column exists to catch, made one layer up.
+    """
+    registered = None
+    try:
+        db = _open_registry(case_dir)
+        try:
+            row = db.execute(
+                "SELECT label FROM training_runs WHERE training_hash = ?", (training_hash,)
+            ).fetchone()
+        finally:
+            db.close()
+    except sqlite3.Error:
+        registered = None
+    else:
+        registered = row[0] if row and row[0] else None
+    if label and registered and label != registered:
+        raise ValueError(
+            f"predictions of training run {training_hash} are being published as {label!r}, "
+            f"but that run is registered against label {registered!r} in {case_study}. One of "
+            f"the two is wrong, and stamping the artifact with either would record a "
+            f"declaration the other contradicts."
+        )
+    return label or registered
+
+
+def _prediction_frame_label(predictions) -> str | None:
+    """The single label *predictions* states, or ``None`` where it states none."""
+    from case_studies.utils.artifact_digest import PREDICTION_LABEL_COLUMN
+
+    if predictions is None or PREDICTION_LABEL_COLUMN not in getattr(predictions, "columns", ()):
+        return None
+    import polars as pl
+
+    frame = predictions if isinstance(predictions, pl.DataFrame) else pl.from_pandas(predictions)
+    present = sorted(
+        str(value) for value in frame.get_column(PREDICTION_LABEL_COLUMN).unique().drop_nulls()
+    )
+    if len(present) > 1:
+        raise ValueError(f"prediction frame carries labels {present}, which is more than one")
+    return present[0] if present else None
+
+
+def _without_prediction_label(predictions, label: str | None):
+    """*predictions* as its content is measured: without the label it was produced under.
+
+    The label is a constant the registry already holds on the parent training run, so it is
+    data about the frame rather than part of it - which is why `artifact_digest` excludes it
+    and why every digest recorded before the column existed stays valid. `schema_json` has
+    to agree: recording a schema without the column while writing a parquet that has it
+    makes the published artifact fail its own immutability check when it is read back and
+    re-registered, which is what a resumed or replayed registration does.
+
+    A frame that states a label the publication contradicts is refused here rather than
+    silently stripped, because the two are then telling different stories about what was
+    fitted.
+    """
+    from case_studies.utils.artifact_digest import PREDICTION_LABEL_COLUMN
+
+    stated = _prediction_frame_label(predictions)
+    if stated is None:
+        return predictions
+    if label and stated != label:
+        raise ValueError(
+            f"prediction frame carries label(s) ['{stated}'] and is being published as {label!r}"
+        )
+    import polars as pl
+
+    if isinstance(predictions, pl.DataFrame):
+        return predictions.drop(PREDICTION_LABEL_COLUMN)
+    return predictions.drop(columns=[PREDICTION_LABEL_COLUMN])
+
+
+def _with_prediction_label(predictions, label: str | None):
+    """Stamp *label* onto a published prediction frame, so it states its own declaration.
+
+    A coverage check is sized by the label's outcome horizon, and the frames carried no
+    record of which label produced them, so a caller checking a variant's predictions against
+    the case study's primary label got a small, plausible, entirely spurious gap - two
+    sessions on `crypto_perps_funding`, invisible in the direction that makes the observed
+    frame a subset of the declaration. `coverage.py` has refused a
+    frame whose own `label` disagrees since that was found; the column it reads was never
+    written.
+
+    Written here because this is the one path every family publishes through, and last,
+    because everything that measures the frame - coverage, `schema_json`, the artifact
+    digest - measures it without this column. :func:`_without_prediction_label` has already
+    taken any column the caller supplied off, and refused it if it disagreed with the label
+    being published under.
+    """
+    import polars as pl
+
+    from case_studies.utils.artifact_digest import PREDICTION_LABEL_COLUMN
+
+    if predictions is None or not label:
+        return predictions
+    if PREDICTION_LABEL_COLUMN in predictions.columns:
+        present = sorted(
+            str(value)
+            for value in predictions.get_column(PREDICTION_LABEL_COLUMN).unique().drop_nulls()
+        )
+        if present and present != [label]:
+            raise ValueError(
+                f"prediction frame carries label(s) {present} and is being published as {label!r}"
+            )
+        return predictions
+    return predictions.with_columns(pl.lit(label, dtype=pl.String).alias(PREDICTION_LABEL_COLUMN))
 
 
 def _validate_prediction_dispersion(predictions, *, refuse: bool = True) -> None:
@@ -321,6 +761,25 @@ def register_training_run(
     spec = _validate_spec(spec)
     t_hash = training_hash_from_spec(spec)
     spec_json_str = canonical_json(spec)
+    # Defaulted here rather than only in `ResultsCatalog.register_training`, because this
+    # function has five other callers and none of them supplied it. A NULL `started_at` is
+    # what leaves a row with no recoverable timing at all: `elapsed_s` is filled in later by
+    # `record_training_runtime` and stays NULL when a run does not reach it, and without a
+    # start there is nothing to fall back on. Measured on the current nasdaq registry,
+    # 2026-09-05: 13 of 13 linear rows carry NULL for both, registered across 3.1 seconds.
+    # "When the identity was registered" is within seconds of "when work on it began" on
+    # every path that registers before fitting, which is all of them.
+    started_at = started_at or _utc_now()
+
+    # Ahead of both branches, because both write before they insert - the versioned one an
+    # immutable spec.json, the legacy one the same file unconditionally - and this check has
+    # to refuse before anything about the new vintage is on disk. Every path that reaches
+    # here registers before the fit, so the refusal costs no training time.
+    vintage_db = _open_registry(case_dir)
+    try:
+        _enforce_input_artifact_vintage(vintage_db, spec)
+    finally:
+        vintage_db.close()
 
     if spec.get("identity_version") in SUPPORTED_IDENTITY_VERSIONS:
         identity_version = int(spec["identity_version"])
@@ -783,6 +1242,7 @@ def register_prediction_set(
     case_dir: Path | None = None,
     expected_keys=None,
     allow_partial: bool = False,
+    retiring: Sequence[str] = (),
 ) -> str:
     """Register a prediction set. Returns prediction_hash.
 
@@ -815,6 +1275,11 @@ def register_prediction_set(
         use the binary label. Required when ``task_type="classification"``.
     case_dir : Path, optional
         Override case study directory.
+    retiring : sequence of str, optional
+        For ``split="holdout"`` only: prediction hashes the operator accepts retiring from
+        the window. Empty, the default, means a window already carrying another
+        configuration's evaluation refuses this one. See
+        :func:`case_studies.utils.strategy_analysis.refuse_a_second_look`.
     """
     from .metrics import compute_prediction_fold_metrics
 
@@ -831,7 +1296,7 @@ def register_prediction_set(
     db = _open_registry(case_dir)
     try:
         parent = db.execute(
-            "SELECT identity_version, execution_tier, spec_json FROM training_runs "
+            "SELECT identity_version, execution_tier, spec_json, config_name FROM training_runs "
             "WHERE training_hash = ?",
             (training_hash,),
         ).fetchone()
@@ -839,7 +1304,39 @@ def register_prediction_set(
         db.close()
     if parent is None:
         raise ValueError(f"unknown training_hash {training_hash}")
-    identity_version, execution_tier, parent_spec_json = parent
+    identity_version, execution_tier, parent_spec_json, parent_config_name = parent
+
+    # A holdout window carries one evaluation. Here rather than in a notebook, because the
+    # question is about what the registry is being asked to hold and every path that holds
+    # something arrives through this call: five of the nine holdout notebooks wrote this
+    # check out for themselves and four never did, which is not a judgement any of the four
+    # made - `fx_pairs` now carries two generations on one window, registered a week apart,
+    # and the notebook that registered the second had no check to fire. A guard copied into
+    # nine notebooks is a guard that is in five of them.
+    #
+    # Re-registering THIS generation is not a second look and is not refused:
+    # `holdout_generations_to_retire` puts a row equal to `this_generation` in no bucket, so
+    # a holdout notebook re-runs like any other stage. What refuses is a DIFFERENT
+    # configuration, or a different checkpoint of the same run, arriving at a window that has
+    # already been observed - and deleting the earlier row is the documented way past it,
+    # because retiring it through the registry's lifecycle records that a second look
+    # was taken, which is the fact the refusal exists to keep.
+    if split == "holdout":
+        from case_studies.utils.strategy_analysis import (
+            holdout_generations_to_retire,
+            refuse_a_second_look,
+        )
+
+        refuse_a_second_look(
+            holdout_generations_to_retire(
+                case_dir,
+                this_generation=(training_hash, (checkpoint_kind, checkpoint_value)),
+            ),
+            this_configuration=parent_config_name or "this run",
+            this_training_hash=training_hash,
+            checkpoint=(checkpoint_kind, checkpoint_value),
+            retiring=retiring,
+        )
 
     # After the parent lookup, not before it: the dispersion bound is a statement about a
     # converged fit, and only the parent row says whether this run claims to be one. The
@@ -857,22 +1354,32 @@ def register_prediction_set(
     # normalizing later would store a naive schema beside a UTC-aware parquet and make two
     # equivalent checkpoints disagree on nothing but the zone.
     predictions = _timestamps_as_utc(predictions)
+    # Resolved and removed before anything measures the frame, so coverage, `schema_json`
+    # and the artifact digest all describe the same thing: the predictions, without the
+    # label they were produced under. The column goes back on at the write below.
+    resolved_label = _resolved_prediction_label(
+        case_study, training_hash, label, case_dir
+    ) or _prediction_frame_label(predictions)
+    predictions = _without_prediction_label(predictions, resolved_label)
     coverage = None
     if identity_version in SUPPORTED_IDENTITY_VERSIONS:
         if predictions is None or expected_keys is None:
             raise ValueError(
                 "versioned prediction registration requires predictions and expected_keys"
             )
-        from .completeness import evaluate_prediction_coverage
+        from .completeness import (
+            evaluate_prediction_coverage,
+            require_comparable_key_digests,
+        )
 
         coverage = evaluate_prediction_coverage(expected_keys, predictions)
         if not coverage.complete and not allow_partial:
             raise ValueError(f"prediction coverage is partial: {coverage.as_dict()}")
         db = _open_registry(case_dir)
         try:
-            existing_schema = db.execute(
+            existing_coverage = db.execute(
                 """
-                SELECT c.schema_json
+                SELECT c.schema_json, c.expected_key_digest
                 FROM prediction_coverage c
                 JOIN prediction_sets p ON p.prediction_hash = c.prediction_hash
                 WHERE p.training_hash = ? AND p.split = ?
@@ -882,8 +1389,22 @@ def register_prediction_set(
             ).fetchone()
         finally:
             db.close()
-        if existing_schema is not None and existing_schema[0] != coverage.schema_json:
-            raise ValueError("prediction schema differs from an existing checkpoint")
+        if existing_coverage is not None:
+            if existing_coverage[0] != coverage.schema_json:
+                raise ValueError("prediction schema differs from an existing checkpoint")
+            # And the same question one level down. A checkpoint registered under a changed
+            # key rendering digests differently from its siblings whatever its keys, so a
+            # consumer grouping a training run's checkpoints by eligibility splits one
+            # contract into two and nothing says why. Refusing
+            # here is what makes the next rendering change arrive as an error naming its
+            # cause rather than as a quiet mis-grouping in a notebook. The stored digest
+            # is handed the keys it was taken over, so a row written before the rendering
+            # was stamped is identified by recomputing it rather than assumed to be old.
+            require_comparable_key_digests(
+                (existing_coverage[1], coverage.expected_key_digest),
+                what=f"training run {training_hash} at split {split!r}",
+                expected_keys=expected_keys,
+            )
 
     p_hash = prediction_hash_from_parts(
         training_hash,
@@ -897,12 +1418,20 @@ def register_prediction_set(
         assert coverage is not None
         import polars as pl
 
-        from case_studies.utils.artifact_digest import value_digest
+        from case_studies.utils.artifact_digest import published_prediction_digest
 
         normalized_predictions = (
             predictions if isinstance(predictions, pl.DataFrame) else pl.from_pandas(predictions)
         )
-        prediction_artifact_digest = value_digest(normalized_predictions)
+        # The published frame states its own label; the digest is taken without it. The
+        # column is a constant the registry already holds on the parent training run, so it
+        # is data about the frame rather than part of its content identity - and excluding
+        # it is what keeps every `artifact_digest` already recorded in the fleet valid
+        # . Coverage and `schema_json` above are computed on the
+        # frame with the column removed, for the same reason and so that the artifact
+        # written here passes its own immutability check when it is read back.
+        published_predictions = _with_prediction_label(normalized_predictions, resolved_label)
+        prediction_artifact_digest = published_prediction_digest(normalized_predictions)
         pred_dir = _prediction_dir(case_dir, p_hash)
         pred_path = pred_dir / "predictions.parquet"
         temporary = pred_dir / f".predictions.{uuid.uuid4().hex}.tmp"
@@ -920,7 +1449,8 @@ def register_prediction_set(
                     raise ValueError(f"immutable prediction identity conflict for {p_hash}")
                 if (
                     not pred_path.exists()
-                    or value_digest(pl.read_parquet(pred_path)) != prediction_artifact_digest
+                    or published_prediction_digest(pl.read_parquet(pred_path))
+                    != prediction_artifact_digest
                 ):
                     raise ValueError(f"immutable prediction artifact conflict for {p_hash}")
                 recorded_digest = db.execute(
@@ -941,7 +1471,7 @@ def register_prediction_set(
             else:
                 if pred_path.exists():
                     try:
-                        orphaned_digest = value_digest(pl.read_parquet(pred_path))
+                        orphaned_digest = published_prediction_digest(pl.read_parquet(pred_path))
                     except (OSError, ValueError, pl.exceptions.PolarsError) as exc:
                         raise ValueError(
                             f"immutable prediction artifact conflict for {p_hash}"
@@ -949,7 +1479,7 @@ def register_prediction_set(
                     if orphaned_digest != prediction_artifact_digest:
                         raise ValueError(f"immutable prediction artifact conflict for {p_hash}")
                 else:
-                    _save_parquet(temporary, normalized_predictions)
+                    _save_parquet(temporary, published_predictions)
                 try:
                     db.execute(
                         """
@@ -988,8 +1518,18 @@ def register_prediction_set(
     else:
         # Save predictions
         if predictions is not None:
+            import polars as pl
+
             pred_dir = _prediction_dir(case_dir, p_hash)
-            _save_parquet(pred_dir / "predictions.parquet", predictions)
+            frame = predictions if isinstance(predictions, pl.DataFrame) else None
+            _save_parquet(
+                pred_dir / "predictions.parquet",
+                predictions
+                if frame is None
+                else _with_prediction_label(
+                    frame, _resolved_prediction_label(case_study, training_hash, label, case_dir)
+                ),
+            )
 
         # Insert into DB
         db = _open_registry(case_dir)
@@ -1026,20 +1566,7 @@ def register_prediction_set(
             y_true_col, y_score_col = _detect_score_cols(predictions)
             prediction_columns = set(predictions.columns)
             metric_entity_col = "product" if "product" in prediction_columns else "symbol"
-            # Resolve label from training_runs if caller didn't supply it.
-            resolved_label = label
-            if not resolved_label:
-                try:
-                    db_lookup = _open_registry(case_dir)
-                    row = db_lookup.execute(
-                        "SELECT label FROM training_runs WHERE training_hash = ?",
-                        (training_hash,),
-                    ).fetchone()
-                    if row and row[0]:
-                        resolved_label = row[0]
-                    db_lookup.close()
-                except Exception:  # noqa: BLE001
-                    pass
+            resolved_label = _resolved_prediction_label(case_study, training_hash, label, case_dir)
             direction_frame, direction_name = (
                 _sibling_direction_labels(case_study, case_dir, resolved_label)
                 if task_type != "classification"
@@ -1988,12 +2515,15 @@ def register_causal_run(
     n_obs: int,
     dml_effect: float,
     dml_se_hac: float,
+    covariance_type: str | None = None,
     p_value_hac: float | None,
     naive_effect: float | None,
     confounding_bias_pct: float | None,
     refutation_p: float | None,
     refutation_n_successful: int | None = None,
     refutation_placebo_json: str | None = None,
+    refutation_placebo_t_json: str | None = None,
+    refutation_frozen_fraction: float | None = None,
     spec_json: str,
     notebook: str | None,
     started_at: str | None,
@@ -2048,11 +2578,13 @@ def register_causal_run(
             "n_obs",
             "dml_effect",
             "dml_se_hac",
+            "covariance_type",
             "p_value_hac",
             "naive_effect",
             "confounding_bias_pct",
             "refutation_p",
             "refutation_n_successful",
+            "refutation_frozen_fraction",
             "spec_json",
             "notebook",
         )
@@ -2075,11 +2607,13 @@ def register_causal_run(
             n_obs,
             dml_effect,
             dml_se_hac,
+            covariance_type,
             p_value_hac,
             naive_effect,
             confounding_bias_pct,
             refutation_p,
             refutation_n_successful,
+            refutation_frozen_fraction,
             spec_json,
             notebook,
         )
@@ -2138,12 +2672,14 @@ def register_causal_run(
             """
             INSERT INTO causal_runs (
                 causal_hash, label, treatment, confounders_json, embargo,
-                n_folds, n_obs, dml_effect, dml_se_hac, p_value_hac,
+                n_folds, n_obs, dml_effect, dml_se_hac, covariance_type, p_value_hac,
                 naive_effect, confounding_bias_pct, refutation_p,
                 refutation_n_successful, refutation_placebo_json,
+                refutation_placebo_t_json,
+                refutation_frozen_fraction,
                 spec_json, notebook, started_at, elapsed_s, git_commit,
                 supersedes_hash, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(causal_hash) DO UPDATE SET
                 label=excluded.label,
                 treatment=excluded.treatment,
@@ -2153,6 +2689,10 @@ def register_causal_run(
                 n_obs=excluded.n_obs,
                 dml_effect=excluded.dml_effect,
                 dml_se_hac=excluded.dml_se_hac,
+                -- Plain, not COALESCE: it is in `comparable_columns`, so an immutable
+                -- row has already had it backfilled or matched. The
+                -- `refutation_frozen_fraction` shape.
+                covariance_type=excluded.covariance_type,
                 p_value_hac=excluded.p_value_hac,
                 naive_effect=excluded.naive_effect,
                 confounding_bias_pct=excluded.confounding_bias_pct,
@@ -2164,6 +2704,19 @@ def register_causal_run(
                 refutation_placebo_json=COALESCE(
                     excluded.refutation_placebo_json, causal_runs.refutation_placebo_json
                 ),
+                -- Fill-once for the same reason, and separately: a row whose p-value was
+                -- computed on raw thetas, before the t-statistic correction, has no t-scale
+                -- draws to recover, so NULL here is what distinguishes it from a corrected
+                -- one. Erasing a filled value would lose that distinction.
+                refutation_placebo_t_json=COALESCE(
+                    excluded.refutation_placebo_t_json, causal_runs.refutation_placebo_t_json
+                ),
+                -- Plain, not COALESCE: this column is in `comparable_columns`, so by the
+                -- time the UPDATE runs the value either matched the stored one or was
+                -- backfilled into it. That is the `refutation_n_successful` shape, not the
+                -- `refutation_placebo_json` one, which is fill-once because nothing
+                -- compares it.
+                refutation_frozen_fraction=excluded.refutation_frozen_fraction,
                 spec_json=excluded.spec_json,
                 notebook=excluded.notebook,
                 started_at=excluded.started_at,
@@ -2183,11 +2736,14 @@ def register_causal_run(
                OR causal_runs.n_obs IS NOT excluded.n_obs
                OR causal_runs.dml_effect IS NOT excluded.dml_effect
                OR causal_runs.dml_se_hac IS NOT excluded.dml_se_hac
+               OR causal_runs.covariance_type IS NOT excluded.covariance_type
                OR causal_runs.p_value_hac IS NOT excluded.p_value_hac
                OR causal_runs.naive_effect IS NOT excluded.naive_effect
                OR causal_runs.confounding_bias_pct IS NOT excluded.confounding_bias_pct
                OR causal_runs.refutation_p IS NOT excluded.refutation_p
                OR causal_runs.refutation_n_successful IS NOT excluded.refutation_n_successful
+               OR causal_runs.refutation_frozen_fraction
+                   IS NOT excluded.refutation_frozen_fraction
                OR causal_runs.spec_json IS NOT excluded.spec_json
                OR causal_runs.notebook IS NOT excluded.notebook
                OR (excluded.supersedes_hash IS NOT NULL
@@ -2203,12 +2759,15 @@ def register_causal_run(
                 n_obs,
                 dml_effect,
                 dml_se_hac,
+                covariance_type,
                 p_value_hac,
                 naive_effect,
                 confounding_bias_pct,
                 refutation_p,
                 refutation_n_successful,
                 refutation_placebo_json,
+                refutation_placebo_t_json,
+                refutation_frozen_fraction,
                 spec_json,
                 notebook,
                 started_at,

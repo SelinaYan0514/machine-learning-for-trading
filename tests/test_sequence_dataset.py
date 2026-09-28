@@ -276,7 +276,7 @@ def test_backwards_compatible_without_val_start():
         )
 
 
-def test_sequence_windows_do_not_span_missing_entity_periods():
+def test_window_time_axis_is_regular_across_a_missing_entity_period():
     from case_studies.utils.sequence_dataset import prepare_fold_sequence_stores
 
     df, train_mask, val_mask, val_start_ts, _ = _synthetic_fold_df(
@@ -311,7 +311,7 @@ def test_sequence_windows_do_not_span_missing_entity_periods():
         assert np.all(np.diff(positions) == 1)
 
 
-def test_fixed_cadence_windows_do_not_span_missing_panel_periods():
+def test_window_time_axis_is_regular_across_a_missing_panel_bar():
     from case_studies.utils.sequence_dataset import prepare_fold_sequence_stores
 
     dates = pd.date_range("2021-01-01", periods=100, freq="8h", tz="UTC")
@@ -496,3 +496,313 @@ def test_priming_includes_label_buffer_gap_rows():
         )
         assert last_context == expected_context
         assert last_context > train_end
+
+
+def _strictly_positive_fold_df(
+    *,
+    missing_symbol: str = "S0",
+    n_symbols: int = 3,
+) -> tuple[pd.DataFrame, pd.Series, pd.Series, pd.Timestamp]:
+    """A panel whose `feat0` is strictly positive and missing for one symbol.
+
+    This is the shape a model-based feature has: `garch_cond_vol` is a
+    conditional volatility, so zero is below every value it can take, and a
+    symbol the walk skipped has no estimate at all.
+    """
+    df, train_mask, val_mask, val_start_ts, _ = _synthetic_fold_df(n_symbols=n_symbols)
+    df = df.assign(feat0=df["feat0"].abs() + 1.0)
+    df.loc[df["symbol"] == missing_symbol, "feat0"] = np.nan
+    return df, train_mask, val_mask, val_start_ts
+
+
+def test_missing_feature_is_imputed_at_the_training_mean_not_below_the_minimum():
+    """A symbol with no estimate must read as average, not as the extreme.
+
+    Filling the raw array before the scaler is fitted puts a 0.0 into a
+    strictly positive feature, which lands below its observed minimum once
+    standardized - the skipped symbol is then presented to the model as the
+    calmest name in the panel for its whole history.
+    """
+    df, train_mask, val_mask, val_start_ts = _strictly_positive_fold_df()
+
+    train_store, _, _ = prepare_fold_sequence_stores(
+        df,
+        train_mask=train_mask,
+        val_mask=val_mask,
+        feature_names=["feat0", "feat1"],
+        label_col="y",
+        date_col="timestamp",
+        entity_col="symbol",
+        lookback=20,
+        val_start=val_start_ts,
+    )
+
+    missing_idx = train_store.entities.index("S0")
+    missing_column = train_store.features[missing_idx][:, 0]
+    assert np.all(missing_column == 0.0), (
+        "the skipped symbol's normalized feature is not the training mean; "
+        f"it ranges {missing_column.min()} to {missing_column.max()} standard deviations"
+    )
+
+
+def test_training_statistics_ignore_rows_with_no_observation():
+    """The mean and scale describe the observed rows, not the filled ones."""
+    df, train_mask, val_mask, val_start_ts = _strictly_positive_fold_df()
+
+    train_store, _, _ = prepare_fold_sequence_stores(
+        df,
+        train_mask=train_mask,
+        val_mask=val_mask,
+        feature_names=["feat0", "feat1"],
+        label_col="y",
+        date_col="timestamp",
+        entity_col="symbol",
+        lookback=20,
+        val_start=val_start_ts,
+    )
+
+    observed = df.loc[train_mask & df["feat0"].notna(), "feat0"].to_numpy(dtype=np.float64)
+    assert train_store.feature_mean is not None
+    assert train_store.feature_scale is not None
+    np.testing.assert_allclose(train_store.feature_mean[0], observed.mean(), rtol=1e-4)
+    np.testing.assert_allclose(train_store.feature_scale[0], observed.std(), rtol=1e-4)
+
+
+def test_an_infinity_does_not_reach_the_training_statistics():
+    """`np.nan_to_num` maps posinf to the float32 maximum by default.
+
+    One such value in a training fold would set that feature's mean and scale
+    for every symbol, so an infinity has to be treated as a missing
+    observation rather than as a very large one.
+    """
+    df, train_mask, val_mask, val_start_ts = _strictly_positive_fold_df(missing_symbol="S0")
+    finite_rows = df.index[(df["symbol"] == "S1") & train_mask]
+    df.loc[finite_rows[0], "feat0"] = np.inf
+
+    train_store, _, _ = prepare_fold_sequence_stores(
+        df,
+        train_mask=train_mask,
+        val_mask=val_mask,
+        feature_names=["feat0", "feat1"],
+        label_col="y",
+        date_col="timestamp",
+        entity_col="symbol",
+        lookback=20,
+        val_start=val_start_ts,
+    )
+
+    assert train_store.feature_mean is not None
+    assert train_store.feature_mean[0] < 10.0, (
+        f"an infinity reached the training mean: {train_store.feature_mean[0]}"
+    )
+    for feats in train_store.features:
+        assert np.all(np.isfinite(feats)), "a non-finite value survived normalization"
+
+
+def _panel_with_missing(dates, symbol_gaps, *, feature_names=("feat0",)):
+    """Panel over `dates`; `symbol_gaps` maps a symbol to the dates it lacks."""
+    rows = [
+        {
+            "symbol": symbol,
+            "timestamp": timestamp,
+            "y": float(i % 7) - 3.0,
+            **{name: float(i) + j for j, name in enumerate(feature_names)},
+        }
+        for symbol, gaps in symbol_gaps.items()
+        for i, timestamp in enumerate(dates)
+        if timestamp not in gaps
+    ]
+    return pd.DataFrame(rows)
+
+
+def _train_store(df, *, lookback, val_start, feature_names=("feat0",), **kwargs):
+    from case_studies.utils.sequence_dataset import prepare_fold_sequence_stores
+
+    train_store, _, _ = prepare_fold_sequence_stores(
+        df,
+        train_mask=df["timestamp"] < val_start,
+        val_mask=df["timestamp"] >= val_start,
+        feature_names=list(feature_names),
+        label_col="y",
+        date_col="timestamp",
+        entity_col="symbol",
+        lookback=lookback,
+        val_start=val_start,
+        **kwargs,
+    )
+    return train_store
+
+
+def test_a_window_survives_a_single_absent_period_and_records_it():
+    """One absent session no longer discards the next `lookback` windows.
+
+    The old rule rejected every window crossing an absent period, so a symbol
+    missing 4% of its sessions lost most of its windows. The window now keeps a
+    cell for the absent period and marks it unobserved.
+    """
+    dates = pd.date_range("2021-01-01", periods=200, freq="B")
+    gap = dates[100]
+    df = _panel_with_missing(dates, {"S0": {gap}, "S1": set()})
+    lookback = 20
+    store = _train_store(df, lookback=lookback, val_start=dates[180])
+
+    s0 = store.entities.index("S0")
+    windows_spanning_gap = [
+        int(end)
+        for sym, end in zip(store.symbol_idx, store.end_idx, strict=True)
+        if int(sym) == s0
+        and store.timestamps[s0][int(end) - lookback] <= gap <= store.timestamps[s0][int(end)]
+    ]
+    assert windows_spanning_gap, "no accepted window spans the absent session"
+
+    observed_channel = store.features[s0][:, -2]
+    gap_cell = int(np.searchsorted(store.timestamps[s0], np.datetime64(gap, "ns")))
+    assert observed_channel[gap_cell] == 0.0, "the absent cell is not marked unobserved"
+    assert observed_channel.sum() == len(observed_channel) - 1, (
+        "cells other than the absent session were marked unobserved"
+    )
+
+
+def test_a_window_missing_more_than_the_declared_fraction_is_rejected():
+    """A window whose observed share falls below the floor is not eligible."""
+    dates = pd.date_range("2021-01-01", periods=200, freq="B")
+    lookback = 20
+    # Three absent sessions inside any window covering them: 17/20 = 0.85 < 0.90.
+    gaps = {dates[100], dates[102], dates[104]}
+    df = _panel_with_missing(dates, {"S0": gaps, "S1": set()})
+    store = _train_store(df, lookback=lookback, val_start=dates[180])
+
+    s0 = store.entities.index("S0")
+    stamps = store.timestamps[s0]
+    for sym, end in zip(store.symbol_idx, store.end_idx, strict=True):
+        if int(sym) != s0:
+            continue
+        end = int(end)
+        covered = sum(
+            1 for g in gaps if stamps[end - lookback] <= np.datetime64(g, "ns") < stamps[end]
+        )
+        assert covered < 3, (
+            f"window ending {stamps[end]} covers all three absent sessions "
+            "and should have failed the observed-fraction floor"
+        )
+
+
+def test_one_long_outage_is_rejected_where_the_same_count_scattered_is_not():
+    """The consecutive bound is what the fraction floor cannot express.
+
+    At lookback 60 a 0.90 floor admits six absent cells. Six scattered absences
+    are a thinly quoted symbol; six in a row is an outage, and the model would
+    read a sixth of the window as one continuous fabrication.
+    """
+    dates = pd.date_range("2021-01-01", periods=400, freq="B")
+    lookback = 60
+    run = set(dates[200:206])  # six consecutive
+    scattered = {dates[200], dates[210], dates[220], dates[230], dates[240], dates[250]}
+
+    outage = _train_store(
+        _panel_with_missing(dates, {"S0": run, "S1": set()}),
+        lookback=lookback,
+        val_start=dates[380],
+    )
+    thin = _train_store(
+        _panel_with_missing(dates, {"S0": scattered, "S1": set()}),
+        lookback=lookback,
+        val_start=dates[380],
+    )
+
+    def spanning(store, absent):
+        sid = store.entities.index("S0")
+        stamps = store.timestamps[sid]
+        first = np.datetime64(min(absent), "ns")
+        last = np.datetime64(max(absent), "ns")
+        return sum(
+            1
+            for sym, end in zip(store.symbol_idx, store.end_idx, strict=True)
+            if int(sym) == sid and stamps[int(end) - lookback] <= first and last < stamps[int(end)]
+        )
+
+    assert spanning(outage, run) == 0, "a six-period outage was admitted"
+    assert spanning(thin, scattered) > 0, (
+        "six scattered absences were rejected; the fraction floor admits them"
+    )
+
+
+def test_staleness_counts_periods_since_the_last_real_observation():
+    dates = pd.date_range("2021-01-01", periods=200, freq="B")
+    gaps = {dates[100], dates[101]}
+    df = _panel_with_missing(dates, {"S0": gaps, "S1": set()})
+    store = _train_store(df, lookback=20, val_start=dates[180])
+
+    s0 = store.entities.index("S0")
+    stamps = store.timestamps[s0]
+    staleness = store.features[s0][:, -1]
+    first_gap = int(np.searchsorted(stamps, np.datetime64(dates[100], "ns")))
+    assert staleness[first_gap - 1] == 0.0
+    assert staleness[first_gap] == 1.0
+    assert staleness[first_gap + 1] == 2.0
+    assert staleness[first_gap + 2] == 0.0, "staleness did not reset on the next real row"
+
+
+def test_no_prediction_is_emitted_at_an_inserted_cell():
+    """Inserted cells exist to keep the time axis regular, never to be scored."""
+    dates = pd.date_range("2021-01-01", periods=200, freq="B")
+    gaps = {dates[100], dates[140]}
+    df = _panel_with_missing(dates, {"S0": gaps, "S1": set()})
+    store = _train_store(df, lookback=20, val_start=dates[180])
+
+    s0 = store.entities.index("S0")
+    absent = {np.datetime64(g, "ns") for g in gaps}
+    scored = {
+        store.timestamps[s0][int(end)]
+        for sym, end in zip(store.symbol_idx, store.end_idx, strict=True)
+        if int(sym) == s0
+    }
+    assert scored, "S0 produced no windows at all"
+    assert not (scored & absent), f"windows are scored at inserted cells {sorted(scored & absent)}"
+
+
+class TestTheDeclaredWindowStride:
+    """`train_sequence_stride` spaces the training windows; the count follows.
+
+    `max_train_sequences` is the other form: it fixes the total and derives the spacing,
+    so two folds of different length get different spacing. On nasdaq's minute panel the
+    750,000-window budget drew one window every 5.4 minutes against a 15-minute label, so
+    consecutive windows carried overlapping labels (ml4t/agent-workspace#1015).
+    """
+
+    @staticmethod
+    def _sample(counts, *, stride=0, max_sequences=0):
+        from case_studies.utils.sequence_dataset import _sample_sequence_positions
+
+        return _sample_sequence_positions(np.asarray(counts, dtype=np.int64), max_sequences, stride)
+
+    def test_a_stride_takes_every_nth_endpoint_of_each_symbol(self):
+        [offsets] = self._sample([100], stride=15)
+        assert offsets.tolist() == list(range(0, 100, 15))
+
+    def test_the_count_follows_the_stride_and_differs_between_folds(self):
+        """The property the count form cannot have: the same spacing in both folds."""
+        long_fold, short_fold = (
+            self._sample([4_066_041], stride=15),
+            self._sample([3_997_571], stride=15),
+        )
+        assert len(long_fold[0]) == 271_070
+        assert len(short_fold[0]) == 266_505
+        assert np.diff(long_fold[0]).max() == np.diff(short_fold[0]).max() == 15
+
+    def test_a_symbol_shorter_than_the_stride_keeps_its_first_window(self):
+        """Striding never drops a symbol from the universe."""
+        offsets = self._sample([3, 1, 0], stride=15)
+        assert offsets[0].tolist() == [0]
+        assert offsets[1] is None  # one endpoint, taken whole
+        assert offsets[2] is None  # none to take
+
+    def test_no_stride_leaves_the_count_form_untouched(self):
+        assert self._sample([100, 100], stride=0, max_sequences=0) == [None, None]
+        capped = self._sample([100, 100], stride=0, max_sequences=50)
+        assert sum(len(o) for o in capped) == 50
+
+    def test_the_stride_wins_over_a_count_because_a_run_declares_one_or_the_other(self):
+        """`resolve_dl_train_sequence_stride` refuses both; this is the sampler's half."""
+        [offsets] = self._sample([100], stride=15, max_sequences=90)
+        assert offsets.tolist() == list(range(0, 100, 15))

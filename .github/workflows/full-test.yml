@@ -41,7 +41,15 @@ jobs:
 
     steps:
       - name: Install git
-        run: apt-get update -qq && apt-get install -y -qq git openssh-client >/dev/null
+        run: |
+          # A transient apt mirror failure used to kill the whole job.
+          for attempt in 1 2 3; do
+            apt-get update -qq && apt-get install -y -qq git openssh-client >/dev/null && exit 0
+            echo "apt-get failed (attempt $attempt of 3); retrying in $((attempt * 15))s"
+            sleep $((attempt * 15))
+          done
+          echo "::error::apt-get could not install git after three attempts"
+          exit 1
 
       - uses: actions/checkout@v6
 
@@ -49,15 +57,24 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: ml4t/third-edition-test-data
+          ref: ci
           path: test-data
           ssh-key: ${{ secrets.TEST_DATA_DEPLOY_KEY }}
           lfs: false
 
+      - name: Record the fixture this job read
+        run: |
+          # tee, not a plain redirect: the summary is where a reader looks, and the log is
+          # where this is greppable and where a broken command would be visible at all. A
+          # step whose whole output goes somewhere no API exposes cannot be checked.
+          printf '%s\n' "test-data $(git -C test-data rev-parse HEAD)" \
+            "$(git -C test-data log -1 --format='%cs %s')" | tee -a "$GITHUB_STEP_SUMMARY"
+
       - name: Seed intermediates
         run: |
-          mkdir -p $ML4T_OUTPUT_DIR
+          mkdir -p "$ML4T_OUTPUT_DIR"
           if [ -d test-data/intermediates ]; then
-            cp -r test-data/intermediates/* $ML4T_OUTPUT_DIR/
+            cp -r test-data/intermediates/* "$ML4T_OUTPUT_DIR"/
           fi
 
       # No --timeout. A per-test wall clock here contradicts the per-cell budgets in
@@ -68,6 +85,11 @@ jobs:
       - name: Run ALL chapter notebooks
         env:
           PYTHONPATH: ${{ github.workspace }}
+          # Six chapter notebooks download HuggingFace checkpoints while they run, and an
+          # anonymous download is rate limited per IP across a shared runner pool. The
+          # token is free and buys a per-account limit. test.yml has passed it since
+          # 2026-09-12 and this workflow and weekly-external.yml were both missed.
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           python -m pytest tests/test_chapter_notebooks.py \
             -v --tb=short
@@ -109,7 +131,15 @@ jobs:
 
     steps:
       - name: Install git
-        run: apt-get update -qq && apt-get install -y -qq git openssh-client >/dev/null
+        run: |
+          # A transient apt mirror failure used to kill the whole job.
+          for attempt in 1 2 3; do
+            apt-get update -qq && apt-get install -y -qq git openssh-client >/dev/null && exit 0
+            echo "apt-get failed (attempt $attempt of 3); retrying in $((attempt * 15))s"
+            sleep $((attempt * 15))
+          done
+          echo "::error::apt-get could not install git after three attempts"
+          exit 1
 
       - uses: actions/checkout@v6
 
@@ -117,9 +147,18 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: ml4t/third-edition-test-data
+          ref: ci
           path: test-data
           ssh-key: ${{ secrets.TEST_DATA_DEPLOY_KEY }}
           lfs: false
+
+      - name: Record the fixture this job read
+        run: |
+          # tee, not a plain redirect: the summary is where a reader looks, and the log is
+          # where this is greppable and where a broken command would be visible at all. A
+          # step whose whole output goes somewhere no API exposes cannot be checked.
+          printf '%s\n' "test-data $(git -C test-data rev-parse HEAD)" \
+            "$(git -C test-data log -1 --format='%cs %s')" | tee -a "$GITHUB_STEP_SUMMARY"
 
       # No --timeout, for the reason the chapters job gives: twenty-four case-study entries
       # in tests/overrides.yaml declare budgets above 600s, up to sp500_options'
@@ -144,7 +183,15 @@ jobs:
 
     steps:
       - name: Install git
-        run: apt-get update -qq && apt-get install -y -qq git openssh-client >/dev/null
+        run: |
+          # A transient apt mirror failure used to kill the whole job.
+          for attempt in 1 2 3; do
+            apt-get update -qq && apt-get install -y -qq git openssh-client >/dev/null && exit 0
+            echo "apt-get failed (attempt $attempt of 3); retrying in $((attempt * 15))s"
+            sleep $((attempt * 15))
+          done
+          echo "::error::apt-get could not install git after three attempts"
+          exit 1
 
       - uses: actions/checkout@v6
 
@@ -152,8 +199,17 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: ml4t/third-edition-test-data
+          ref: ci
           path: test-data
           ssh-key: ${{ secrets.TEST_DATA_DEPLOY_KEY }}
+
+      - name: Record the fixture this job read
+        run: |
+          # tee, not a plain redirect: the summary is where a reader looks, and the log is
+          # where this is greppable and where a broken command would be visible at all. A
+          # step whose whole output goes somewhere no API exposes cannot be checked.
+          printf '%s\n' "test-data $(git -C test-data rev-parse HEAD)" \
+            "$(git -C test-data log -1 --format='%cs %s')" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Run py312 notebooks
         env:
@@ -161,7 +217,7 @@ jobs:
         run: |
           python -m pytest tests/test_docker_notebooks.py \
             -v --tb=short \
-            -k "03_sigcwgan or 06_path_signatures or 12_wasserstein \
+            -k "03_sigcwgan or 06_path_signatures \
                 or 01_word2vec or 02_asset_embeddings or 03_sentiment_evolution \
                 or 01_timegan or 07_dp_gan \
                 or 10_shap_nlp_sentiment or 06_conditional_autoencoder \

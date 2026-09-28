@@ -59,7 +59,6 @@
 """S&P 500 Equity + Option Analytics - Feasibility Analysis."""
 
 import datetime as dt
-import warnings
 
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
@@ -74,12 +73,13 @@ from case_studies.utils.feasibility import (
     exceedance_curve,
     fold_timeline,
 )
+from case_studies.utils.warning_policy import apply_notebook_warning_policy
 from data import load_sp500_daily_bars, load_sp500_options_surface
 from utils.cv_splits import generate_cv_splits
 from utils.paths import get_case_study_dir
 from utils.style import COLORS, FIGSIZE, add_message_title, show_with_alt
 
-warnings.filterwarnings("ignore")
+apply_notebook_warning_policy()
 
 # %% tags=["parameters"]
 CASE_STUDY_ID = "sp500_equity_option_analytics"
@@ -814,9 +814,9 @@ print(
 # both a solved implied volatility and a share price. That is the timeline the later stages build
 # their folds from as well, because they read the label file, which is written on the same dates
 # and stops a horizon short of the sample's end since a forward return needs sessions after it. The
-# splitter numbers folds from zero backwards from the most recent, so fold 0 is the one that ends
-# against the holdout and fold 1 the earlier one. The figure draws them earliest-first and labels
-# each with that number, which is why the labels count down; every later stage prints the same ones.
+# splitter numbers folds chronologically, so fold 0 is the earlier one and fold 1 ends against the
+# holdout. The figure draws them earliest-first and labels each with that number, so the labels
+# count up alongside the dates; every later stage prints the same ones.
 # It draws the boundaries the splitter returned rather than recomputing them.
 #
 # The purge gap is narrow next to training blocks measured in years, so counting it off the session

@@ -62,7 +62,7 @@ import warnings
 import plotly.graph_objects as go
 import polars as pl
 
-from case_studies.research import open_study, split_unpublished_members
+from case_studies.research import open_study, reuse_disclosure, split_unpublished_members
 from case_studies.utils.backtest_explorer import BacktestExplorer
 from case_studies.utils.backtest_loaders import (
     VECTORIZED_CASE_STUDIES,
@@ -101,7 +101,8 @@ MAX_RISK_VARIANTS = 0
 # None defers to the case study's configured count; an int caps it.
 TOP_N_COMBOS = None
 # Both names stay bound here although nothing below reads them: that is what makes the harness
-# force preview and supply a workspace (`tests/pm_helpers.py:954`). Without them the canonical
+# force preview and supply a workspace - `_declares_tier_and_workspace` in `tests/pm_helpers.py`
+# looks for exactly this pair. Without them the canonical
 # branch regenerates in place, which needs symlinks a CI checkout does not have.
 EXECUTION_TIER = "canonical"
 WORKSPACE: str = ""
@@ -113,7 +114,7 @@ WORKSPACE: str = ""
 # the concentration and the allocator are held exactly as registered, and the only thing added is
 # the rule. That is what makes each overlay's Sharpe comparable with the baseline it came from -
 # and what lets [`17_costs`](17_costs.ipynb), which runs after this stage, decide between an
-# overlaid and an un-overlaid carrier on the measurement rather than on the order of the chain.
+# overlaid and an un-overlaid combination on the measurement rather than on the order of the chain.
 #
 # **Position rules need a bar-by-bar engine.** A stop-loss has to be evaluated on every bar of the
 # holding period to know whether it fired, so a case study whose backtests are computed as a
@@ -344,7 +345,7 @@ for index, combo_row in enumerate(top_combos.iter_rows(named=True)):
 
 print(
     f"\nRisk sweep in {(time.monotonic() - sweep_start) / 60:.1f} minutes: "
-    f"{n_done - served} computed, {served} served from the registry, {len(failures)} failed"
+    f"{reuse_disclosure(n_done - served, served, len(failures))}"
 )
 if failures:
     failure_frame = pl.DataFrame(failures)
@@ -491,6 +492,6 @@ show_plotly_with_alt(
 # is not consulted.
 
 # %% [markdown]
-# **Next**: [`17_costs`](17_costs.ipynb) prices whichever carrier wins across the baseline, the
+# **Next**: [`17_costs`](17_costs.ipynb) prices whichever combination wins across the baseline, the
 # allocation sweep and this overlay stage, and [`20_strategy_analysis`](20_strategy_analysis.ipynb)
 # then reads the whole progression and opens the holdout.

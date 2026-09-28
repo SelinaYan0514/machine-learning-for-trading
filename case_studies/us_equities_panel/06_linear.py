@@ -88,6 +88,7 @@ import polars as pl
 from plotly.subplots import make_subplots
 
 from case_studies.research import (
+    candidate_set_supersedes,
     declared_labels,
     load_model_configs,
     model_requests,
@@ -97,6 +98,7 @@ from case_studies.research import (
     planned_model_plan,
     primary_label,
     run_model_population,
+    supersedes_for_run,
 )
 from utils.style import COLORS, show_plotly_with_alt
 
@@ -106,8 +108,46 @@ EXECUTION_TIER = "canonical"
 WORKSPACE: str = ""
 PREVIEW_REDUCTIONS: dict = {}
 CONFIG_NAMES: list[str] = []
+DIAGNOSTIC_CONFIG_NAMES = ["ols"]
 POPULATION_NAME = ""
 SUPERSEDES_POPULATION: str = ""
+
+# A candidate set is sealed once written, so a run whose members differ from the recorded
+# generation has to name the set it replaces, keyed by the full set name because that is what
+# the refusal prints. These two moved when 04_model_based_features was rebuilt at production
+# scale on 2026-09-10: every stage-06 training run registered before that pinned the superseded
+# `model_based` artifact, so the whole catalog refitted and both 2026-08-18 generations went
+# stale.
+# Resolved through `candidate_set_supersedes` rather than passed straight to `freeze`, because a
+# reader's clean clone has no generation to supersede and `create` refuses a first version that
+# claims to replace one.
+#
+# The four `fwd_ret_5d` and `fwd_ret_21d` entries were added 2026-09-11, and the comment they
+# replace - "have no recorded generation and need no entry" - was true when it was written and
+# stopped being true when this notebook ran. The 2026-09-10 run created all six sets; the two
+# `fwd_ret_1d` ones already had a generation to supersede and were the only two that needed
+# declaring to get that run published. The other four are now gen 1 and live, so the NEXT run
+# that moves their members is refused at the freeze, which is after the fit. That refusal cost
+# 78 minutes of cold fitting once already.
+#
+# A literal here names the generation in force, and it is re-typed whenever that generation
+# moves. The two arms of `candidate_set_supersedes` are not two equally good declarations:
+# `create` matches on the member list before it reads the declaration at all, so naming the tip
+# on an unchanged re-run writes nothing, while naming what the tip replaced raises
+# "must explicitly supersedes <tip>" as soon as the members do move - at the freeze, after the
+# fit. The tip is therefore correct on both the re-run and the refit and the predecessor is
+# correct on only one of them, so there is no run on which the predecessor is the better
+# declaration. Reproduced against `CandidateSet.create` and `OfficialPopulation.create` on
+# 2026-09-11; the guard is `same_list` in research/population.py and the `bound is not None`
+# branch in research/comparison.py.
+SUPERSEDES_SETS: dict = {
+    "us-equities-fwd-ret-1d-linear-v1": "55d64275dfd6",
+    "us-equities-fwd-ret-1d-linear-diagnostics-v1": "ed1840bfaeb8",
+    "us-equities-fwd-ret-5d-linear-v1": "e7b744f380d5",
+    "us-equities-fwd-ret-5d-linear-diagnostics-v1": "5514968cd0bb",
+    "us-equities-fwd-ret-21d-linear-v1": "6e8179623f0a",
+    "us-equities-fwd-ret-21d-linear-diagnostics-v1": "636c1c2425aa",
+}
 
 # %%
 study = open_study("us_equities_panel", execution_tier=EXECUTION_TIER, workspace=WORKSPACE or None)
@@ -142,11 +182,13 @@ declared_labels(study, "linear")
 # - **Lasso** penalizes the sum of absolute coefficients, which drives some of them exactly to
 #   zero: it selects features rather than shrinking them. **ElasticNet** mixes the two.
 #
-# Lasso and ElasticNet are parameterized here by `alpha_frac` rather than a raw penalty. For any
-# fold there is a threshold penalty $\alpha_{\max}$ - the smallest one that zeros every
-# coefficient - computed from that fold's own data. `alpha_frac` is the fraction of it to apply,
-# so one declared `alpha_frac` means the same thing on every fold, while a fixed raw penalty would
-# mean something different on each.
+# Lasso and ElasticNet are declared with a raw `alpha`, two values each an order of magnitude
+# apart, and ElasticNet also carries `l1_ratio` - the share of the penalty that is L1 rather than
+# L2. An L1 penalty behaves differently from Ridge in one way that matters for reading the grid:
+# for any fold there is a threshold penalty $\alpha_{\max}$, the smallest one that zeros every
+# coefficient, and where it falls depends on that fold's own design matrix. So one declared
+# `alpha` is a different fraction of the way to that threshold on every fold, and a configuration
+# can zero out on some folds and not on others. Section 4's coverage column is what shows it.
 
 # %%
 configs = load_model_configs(
@@ -169,6 +211,22 @@ if narrows_declared_catalog(study, "linear", configs) and not POPULATION_NAME:
         f"this run fits {configs.height} of the declared configurations, so it cannot publish "
         "the canonical population; pass POPULATION_NAME to give it its own"
     )
+
+# Only an unnarrowed canonical run publishes the diagnostic set, so only that run has to carry
+# every diagnostic configuration. A narrowed or preview run publishes no name and is free to
+# leave any of them out.
+is_published_population = (
+    EXECUTION_TIER == "canonical" and not POPULATION_NAME and not PREVIEW_REDUCTIONS
+)
+if is_published_population:
+    unknown_diagnostics = sorted(
+        set(DIAGNOSTIC_CONFIG_NAMES) - set(configs.get_column("config_name").unique().to_list())
+    )
+    if not DIAGNOSTIC_CONFIG_NAMES or unknown_diagnostics:
+        raise ValueError(
+            "an unnarrowed canonical run publishes the diagnostic set, so its configurations "
+            f"have to be among the ones fitted: {unknown_diagnostics}"
+        )
 
 # %% [markdown]
 # ## 2. Binding the declarations to the data
@@ -206,6 +264,7 @@ requests = model_requests(
     configs,
     execution_tier=EXECUTION_TIER,
     preview_reductions=PREVIEW_REDUCTIONS,
+    notebook="06_linear",
 )
 plan = plan_models(study, requests=requests)
 
@@ -268,14 +327,26 @@ planned.select(
 # parameter as much as a changed menu - produces a different population under the same name, and
 # the registry refuses to write it without being told which snapshot it supersedes. That lineage
 # is the only record of which generation is which.
+#
+# A declared `SUPERSEDES_POPULATION` hash only means something where a generation of this name
+# already exists. A preview run, a first canonical run against an empty `run_log/`, and a run
+# under a caller-chosen `POPULATION_NAME` are all refused by `OfficialPopulation.create` if one
+# is passed anyway, so `supersedes_for_run` works out which of those cases this run is and
+# resolves the hash accordingly.
 
 # %%
 population_name = POPULATION_NAME or "us-equities-linear-checkpoints-v1"
+supersedes = supersedes_for_run(
+    study,
+    population_name=population_name,
+    declared=SUPERSEDES_POPULATION,
+    execution_tier=EXECUTION_TIER,
+)
 execution, population = run_model_population(
     study,
     plan,
     population_name=population_name,
-    supersedes=SUPERSEDES_POPULATION or None,
+    supersedes=supersedes,
 )
 
 fitted = sum(len(item["fitted_folds"]) for item in execution.diagnostics)
@@ -378,6 +449,87 @@ catalog.select(
     "ic_n_days",
     "full_coverage",
 )
+
+# %% [markdown]
+# ## Freeze the compatible result sets
+#
+# The population above is one immutable list covering every label this run fitted.
+# `16_backtest` never opens it: it opens *candidate sets*, named per `(label, family)`, because a
+# comparison is only meaningful within one label's protocol. `15_model_analysis` opens both - the
+# population, to confirm the run filled every member it promised, and the candidate sets, to make
+# the comparison. Freezing is what creates those names.
+#
+# Without this the two downstream notebooks name six sets that nothing produces, and they fail
+# differently: `15` raises when `CandidateSet.one` cannot find the name, while `16` would simply
+# backtest whatever subset of names does resolve. A missing name is a silently narrower strategy
+# chain, which is the failure the named-set design exists to prevent.
+#
+# The diagnostic subset is bounded hard, and the reason is arithmetic. `15` loads every diagnostic
+# member's raw prediction frame and holds them all while it joins them pairwise; one frame on this
+# panel is over seven million rows and about 225 MB in memory. So the set is one member per label and
+# family: the diagnostic configuration at its last checkpoint. Here that is `ols`, the unpenalized
+# baseline every penalized configuration is a shrinkage of, and a linear model has one fitted
+# state, so its last checkpoint is its only one.
+#
+# Only an unnarrowed canonical run publishes. The guard on `narrows_declared_catalog` above already
+# refuses to publish the canonical *population* from a narrowed run; the same condition governs the
+# canonical set names, for the same reason - a name must not mean two different member sets.
+
+# %% tags=["results"]
+set_rows = []
+if is_published_population:
+    for label_value in panel_labels:
+        label_name = label_value.replace("_", "-")
+        label_rows = execution.catalog_rows.filter(pl.col("label") == label_value)
+        full_set_name = f"us-equities-{label_name}-linear-v1"
+        full_set = study.predictions.freeze(
+            label_rows,
+            name=full_set_name,
+            supersedes=candidate_set_supersedes(
+                study, name=full_set_name, declared=SUPERSEDES_SETS.get(full_set_name, "")
+            ),
+        )
+        diagnostic_rows = label_rows.filter(
+            pl.col("config_name").is_in(DIAGNOSTIC_CONFIG_NAMES)
+            # `.fill_null(True)` covers a family that publishes no checkpoint value at all, where
+            # the comparison is null rather than false and would otherwise empty the frame.
+            & (
+                pl.col("checkpoint_value") == pl.col("checkpoint_value").max().over("config_name")
+            ).fill_null(True)
+        )
+        if diagnostic_rows.height == 0:
+            raise ValueError(
+                f"no {label_value} rows for diagnostic configurations {DIAGNOSTIC_CONFIG_NAMES}"
+            )
+        diagnostic_set_name = f"us-equities-{label_name}-linear-diagnostics-v1"
+        diagnostic_set = study.predictions.freeze(
+            diagnostic_rows,
+            name=diagnostic_set_name,
+            supersedes=candidate_set_supersedes(
+                study,
+                name=diagnostic_set_name,
+                declared=SUPERSEDES_SETS.get(diagnostic_set_name, ""),
+            ),
+        )
+        set_rows.extend(
+            [
+                {
+                    "role": "backtest population",
+                    "set_name": full_set.name,
+                    "members": len(full_set.members),
+                },
+                {
+                    "role": "bounded diagnostics",
+                    "set_name": diagnostic_set.name,
+                    "members": len(diagnostic_set.members),
+                },
+            ]
+        )
+compatible_sets = pl.DataFrame(
+    set_rows,
+    schema={"role": pl.String, "set_name": pl.String, "members": pl.Int64},
+)
+compatible_sets
 
 # %% [markdown]
 # ### How the penalty grid ranks
@@ -556,10 +708,10 @@ else:
 # **Where the Ridge curve turns tells you how collinear the design matrix is.** It is flat while
 # the penalty is too weak to bind, rises as shrinkage starts collapsing groups of near-duplicate
 # features onto their common direction, and falls once the penalty is strong enough to erode the
-# signal along with the noise. The distance from the peak back to unregularized OLS is the part of
-# the signal that multicollinearity was burying. On a feature set close to orthogonal the same
-# curve would be nearly flat, and that comparison is worth making on your own data before spending
-# a grid on it.
+# signal along with the noise. How far it climbs above its own flat left end is how much of the
+# signal collinearity was burying, because the left end is where the penalty is too weak to change
+# what the fit does. On a feature set close to orthogonal the curve would be nearly flat
+# throughout, and that comparison is worth making on your own data before spending a grid on it.
 #
 # **Whether the three horizons agree is the second thing to read.** They are the same features and
 # the same folds, differing only in how far ahead the label looks. Where the orderings agree, the

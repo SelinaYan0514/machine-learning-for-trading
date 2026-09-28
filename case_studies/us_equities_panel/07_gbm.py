@@ -86,9 +86,11 @@
 
 import plotly.graph_objects as go
 import polars as pl
+from IPython.display import display
 from plotly.subplots import make_subplots
 
 from case_studies.research import (
+    candidate_set_supersedes,
     declared_labels,
     load_model_configs,
     model_requests,
@@ -98,6 +100,7 @@ from case_studies.research import (
     planned_model_plan,
     primary_label,
     run_model_population,
+    supersedes_for_run,
 )
 from utils.style import COLORS, show_plotly_with_alt
 
@@ -107,8 +110,22 @@ EXECUTION_TIER = "canonical"
 WORKSPACE: str = ""
 PREVIEW_REDUCTIONS: dict = {}
 CONFIG_NAMES: list[str] = []
+DIAGNOSTIC_CONFIG_NAMES = ["default_mse"]
 POPULATION_NAME = ""
-SUPERSEDES_POPULATION: str = ""
+SUPERSEDES_POPULATION: str = "1ce92c9f8dc0"
+
+# A candidate set is sealed once written, so a run whose members differ from the recorded
+# generation has to name the set it replaces, keyed by the full set name because that is what
+# the refusal prints. Both moved when 04_model_based_features was rebuilt at production scale
+# on 2026-09-10: all 15 registered gbm runs pin `model_based` at sha256 86ece972 and the file on
+# disk is 0e74d15f, so every one is unreachable and the catalog refits from cold. `fwd_ret_5d`
+# and `fwd_ret_21d` have no recorded generation and need no entry - `create` refuses a first
+# version that claims to replace one. Resolved through `candidate_set_supersedes` rather than
+# passed straight to `freeze`, so a reader's clean clone publishes generation one.
+SUPERSEDES_SETS: dict = {
+    "us-equities-fwd-ret-1d-gbm-v1": "464646b3bd65",
+    "us-equities-fwd-ret-1d-gbm-diagnostics-v1": "30766ca63471",
+}
 
 # %%
 study = open_study("us_equities_panel", execution_tier=EXECUTION_TIER, workspace=WORKSPACE or None)
@@ -132,12 +149,33 @@ declared_labels(study, "gbm")
 # Each name resolves to a preset in `case_studies/config/lgb/` holding the complete LightGBM
 # parameter set. The grid is a product of two axes:
 #
-# - **Five capacity profiles.** `default` uses the library's own leaf count; the rest fix it at 7,
-#   15, 31 and 63.
+# - **A capacity ladder** at 7, 15, 31 and 63 leaves, plus a `default` profile.
 # - **Three objectives**, as described above.
 #
-# Every configuration runs the same number of boosting iterations at the same learning rate, so
-# the grid isolates capacity and loss rather than confounding them with training length.
+# **`default` is not a fifth rung, and the grid does not isolate capacity.** The `params` block of
+# each `default_*` preset holds only `objective` and `seed`; the frame above shows both blocks side
+# by side. `default_huber` also declares a top-level `huber_alpha_scale`, but every `leaves_*_huber`
+# declares the same value, so it separates the objectives from each other and not `default` from the
+# ladder.
+#
+# Everything a `default_*` preset leaves out is filled by LightGBM's own default, and that is where
+# the two profiles part company. Its default leaf limit is the `leaves_31` rung, so the two agree on
+# the axis the ladder varies. It runs at twice the learning rate the twelve `leaves_*` presets
+# declare. And it carries none of their `bagging_fraction`, `bagging_freq`, `feature_fraction`,
+# `lambda_l1`, `lambda_l2` or `min_child_samples`, which resolve to no L1 or L2 penalty at all,
+# subsampling switched off rather than merely weakened, and a minimum leaf size well under half the
+# ladder's. So `default` and `leaves_31` share a leaf limit and not a capacity: seven declared
+# parameters apart rather than none.
+#
+# Read the gap between them as capacity and you will be reading the wrong axis. The two sit side
+# by side in the final-iteration chart in Section 4 at identical leaf counts, and whatever
+# separates them there is those seven parameters rather than the number of regions a tree may
+# carve. A library default is a property of the installed version, so the resolved values the fit
+# actually used are the ones in the training specification the run registers, not these.
+#
+# What the grid does hold fixed is training length - every configuration declares
+# `max_iterations: 500` and `checkpoint_interval: 50` - so the checkpoint comparison below is
+# sound even where the capacity comparison is not.
 
 # %%
 configs = load_model_configs(
@@ -160,6 +198,22 @@ if narrows_declared_catalog(study, "gbm", configs) and not POPULATION_NAME:
         f"this run fits {configs.height} of the declared configurations, so it cannot publish "
         "the canonical population; pass POPULATION_NAME to give it its own"
     )
+
+# Only an unnarrowed canonical run publishes the diagnostic set, so only that run has to carry
+# every diagnostic configuration. A narrowed or preview run publishes no name and is free to
+# leave any of them out.
+is_published_population = (
+    EXECUTION_TIER == "canonical" and not POPULATION_NAME and not PREVIEW_REDUCTIONS
+)
+if is_published_population:
+    unknown_diagnostics = sorted(
+        set(DIAGNOSTIC_CONFIG_NAMES) - set(configs.get_column("config_name").unique().to_list())
+    )
+    if not DIAGNOSTIC_CONFIG_NAMES or unknown_diagnostics:
+        raise ValueError(
+            "an unnarrowed canonical run publishes the diagnostic set, so its configurations "
+            f"have to be among the ones fitted: {unknown_diagnostics}"
+        )
 
 # %% [markdown]
 # ## 2. Binding the declarations to the data
@@ -189,6 +243,7 @@ requests = model_requests(
     configs,
     execution_tier=EXECUTION_TIER,
     preview_reductions=PREVIEW_REDUCTIONS,
+    notebook="07_gbm",
 )
 plan = plan_models(study, requests=requests)
 
@@ -244,14 +299,26 @@ planned.select(
 # parameter moves every training identity as surely as a changed menu does, so the refit is a
 # different population under the same name and the registry refuses to write it without being told
 # which snapshot it supersedes. That lineage is the only record of which generation is which.
+#
+# A declared `SUPERSEDES_POPULATION` hash only means something where a generation of this name
+# already exists. A preview run, a first canonical run against an empty `run_log/`, and a run
+# under a caller-chosen `POPULATION_NAME` are all refused by `OfficialPopulation.create` if one
+# is passed anyway, so `supersedes_for_run` works out which of those cases this run is and
+# resolves the hash accordingly.
 
 # %%
 population_name = POPULATION_NAME or "us-equities-gbm-checkpoints-v1"
+supersedes = supersedes_for_run(
+    study,
+    population_name=population_name,
+    declared=SUPERSEDES_POPULATION,
+    execution_tier=EXECUTION_TIER,
+)
 execution, population = run_model_population(
     study,
     plan,
     population_name=population_name,
-    supersedes=SUPERSEDES_POPULATION or None,
+    supersedes=supersedes,
 )
 
 fitted = sum(len(item["fitted_folds"]) for item in execution.diagnostics)
@@ -300,6 +367,36 @@ print(f"population {population.name}: {len(population.members)} prediction sets"
 # longer forward window runs out earlier and one global maximum would mark a whole label
 # incomplete for a reason unrelated to any model.
 
+# %% [markdown]
+# ### What the run produced, and the sets it publishes
+#
+# The cell below reports both, because they are one statement: the population is one immutable
+# list covering every label this run fitted, and the candidate sets are the names the later
+# notebooks open it by.
+#
+# `16_backtest` never opens the population: it opens *candidate sets*, named per
+# `(label, family)`, because a comparison is only meaningful within one label's protocol.
+# `15_model_analysis` opens both - the population, to confirm the run filled every member it
+# promised, and the candidate sets, to make the comparison. Freezing is what creates those names.
+#
+# Without this the two downstream notebooks name six sets that nothing produces, and they fail
+# differently: `15` raises when `CandidateSet.one` cannot find the name, while `16` would simply
+# backtest whatever subset of names does resolve. A missing name is a silently narrower strategy
+# chain, which is the failure the named-set design exists to prevent.
+#
+# The diagnostic subset is bounded hard, and the reason is arithmetic. `15` loads every diagnostic
+# member's raw prediction frame and holds them all while it joins them pairwise; one frame on this
+# panel is over seven million rows and about 225 MB in memory. So the set is one member per label and
+# family: the diagnostic configuration at its last checkpoint. `default_mse` is that configuration
+# here - the untuned starting point the leaf and objective sweeps vary from - and its last
+# checkpoint is the state a reader would compare against another family's finished fit. The
+# checkpoint dimension is not lost by bounding it away: the learning curves above are where it is
+# read, and they are drawn from registry metrics rather than from raw frames.
+#
+# Only an unnarrowed canonical run publishes. The guard on `narrows_declared_catalog` above already
+# refuses to publish the canonical *population* from a narrowed run; the same condition governs the
+# canonical set names, for the same reason - a name must not mean two different member sets.
+
 # %% tags=["results"]
 catalog = execution.catalog_rows.select(
     "config_name",
@@ -331,15 +428,79 @@ panel_labels = [label for label in [primary] if label in present] + [
 order_label = panel_labels[0]
 print(f"{catalog.height} candidate models: {catalog.n_unique('config_name')} configurations")
 print(f"at {catalog.n_unique('checkpoint_value')} checkpoints each, on {len(panel_labels)} labels")
-catalog.select(
-    "label",
-    "config_name",
-    "checkpoint_value",
-    "ic_mean",
-    "ic_std",
-    "ic_n_days",
-    "full_coverage",
-).head(15)
+# `display` rather than a bare expression: a cell renders only its last value, and this cell
+# ends with the frozen-set table. Without it the model results table would be computed and
+# never shown.
+display(
+    catalog.select(
+        "label",
+        "config_name",
+        "checkpoint_value",
+        "ic_mean",
+        "ic_std",
+        "ic_n_days",
+        "full_coverage",
+    )
+    # Five per label rather than fifteen off the top. The frame is sorted by label and then by IC,
+    # so a flat head shows one label's block and the paragraph above sends the reader to all three.
+    .group_by("label", maintain_order=True)
+    .head(5)
+)
+
+set_rows = []
+if is_published_population:
+    for label_value in panel_labels:
+        label_name = label_value.replace("_", "-")
+        label_rows = execution.catalog_rows.filter(pl.col("label") == label_value)
+        full_set_name = f"us-equities-{label_name}-gbm-v1"
+        full_set = study.predictions.freeze(
+            label_rows,
+            name=full_set_name,
+            supersedes=candidate_set_supersedes(
+                study, name=full_set_name, declared=SUPERSEDES_SETS.get(full_set_name, "")
+            ),
+        )
+        diagnostic_rows = label_rows.filter(
+            pl.col("config_name").is_in(DIAGNOSTIC_CONFIG_NAMES)
+            # `.fill_null(True)` covers a family that publishes no checkpoint value at all, where
+            # the comparison is null rather than false and would otherwise empty the frame.
+            & (
+                pl.col("checkpoint_value") == pl.col("checkpoint_value").max().over("config_name")
+            ).fill_null(True)
+        )
+        if diagnostic_rows.height == 0:
+            raise ValueError(
+                f"no {label_value} rows for diagnostic configurations {DIAGNOSTIC_CONFIG_NAMES}"
+            )
+        diagnostic_set_name = f"us-equities-{label_name}-gbm-diagnostics-v1"
+        diagnostic_set = study.predictions.freeze(
+            diagnostic_rows,
+            name=diagnostic_set_name,
+            supersedes=candidate_set_supersedes(
+                study,
+                name=diagnostic_set_name,
+                declared=SUPERSEDES_SETS.get(diagnostic_set_name, ""),
+            ),
+        )
+        set_rows.extend(
+            [
+                {
+                    "role": "backtest population",
+                    "set_name": full_set.name,
+                    "members": len(full_set.members),
+                },
+                {
+                    "role": "bounded diagnostics",
+                    "set_name": diagnostic_set.name,
+                    "members": len(diagnostic_set.members),
+                },
+            ]
+        )
+compatible_sets = pl.DataFrame(
+    set_rows,
+    schema={"role": pl.String, "set_name": pl.String, "members": pl.Int64},
+)
+compatible_sets
 
 # %% [markdown]
 # ### What more trees do
@@ -482,19 +643,27 @@ trees_effect
 # should separate more as trees are added, since each additional tree is fitted to the residuals
 # the previous ones left.
 #
-# The chart below drops the checkpoint dimension by taking each configuration's final state, so
-# every configuration is compared at the same amount of training. That is the comparison that does
-# not require choosing anything after the fact. The configurations are held in one order across
+# The chart below drops the checkpoint dimension by taking each configuration's own final state -
+# the comparison that does not require choosing anything after the fact. Every preset here
+# declares the same `max_iterations`, so that is also a comparison at equal training length, and
+# the line printed under the frame says so rather than assuming it. The configurations are held in one order across
 # the panels - their ranking on the primary label - so a panel that does not descend is a horizon
 # that orders the grid differently.
+#
+# The final state below is each configuration's own last checkpoint, so a configuration declaring
+# a shorter schedule than its neighbours is still compared at the state it reached. Every preset
+# in this grid declares the same `max_iterations`, so today those last checkpoints coincide, and
+# the line printed under the agreement frame reports the iteration count they all landed on.
 
 # %%
 final = (
-    catalog.filter(pl.col("checkpoint_value") == pl.col("checkpoint_value").max().over("label"))
+    catalog.filter(
+        pl.col("checkpoint_value") == pl.col("checkpoint_value").max().over("label", "config_name")
+    )
     .filter("full_coverage")
     .sort(["label", "ic_mean"], descending=[False, True])
 )
-final_iteration = int(final.get_column("checkpoint_value").max())
+final_iterations = sorted(set(final.get_column("checkpoint_value").to_list()))
 config_order = (
     final.filter(pl.col("label") == order_label)
     .sort("ic_mean", descending=True)
@@ -548,7 +717,7 @@ fig_final.update_xaxes(
     col=1,
 )
 fig_final.update_layout(
-    title="The grid does not keep one order across the three horizons",
+    title="Validation IC at the final iteration, in the primary label's order",
     height=300 * len(panel_labels),
     width=1000,
     margin=dict(t=90),
@@ -584,7 +753,12 @@ agreement = (
     )
     .sort("label")
 )
-print(f"compared at {final_iteration} boosting iterations")
+if len(final_iterations) == 1:
+    print(f"compared at {final_iterations[0]} boosting iterations")
+else:
+    # Say so rather than printing one of them: the panel is then a comparison of final states at
+    # different training lengths, which is a weaker claim than the text above makes.
+    print(f"compared at each configuration's own final iteration, which differ: {final_iterations}")
 agreement
 
 # %% [markdown]
@@ -623,8 +797,11 @@ agreement
 #
 # **Known limitations.** The IC here is an average of per-date rank correlations with no
 # adjustment for the serial dependence that overlapping forward returns create, so it is a ranking
-# diagnostic rather than a test. The grid varies capacity and loss at a fixed learning rate and
-# fixed features, so it says nothing about interactions with either. Every number is measured on
+# diagnostic rather than a test. The grid varies capacity and loss at fixed features and fixed
+# training length, but not at a fixed learning rate - the `default` profile runs at twice the
+# ladder's - so the `default` rows are not comparable with the rest on
+# capacity alone, and nothing here separates a learning-rate effect from a regularization one.
+# Every number is measured on
 # the validation folds, which have been read many times over by the time a case study reaches this
 # notebook.
 #
