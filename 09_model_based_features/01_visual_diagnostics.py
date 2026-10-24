@@ -8,7 +8,7 @@
 #       format_version: '1.3'
 #       jupytext_version: 1.19.3
 #   kernelspec:
-#     display_name: Python 3 (ipykernel)
+#     display_name: ml4t (3.14.5)
 #     language: python
 #     name: python3
 # ---
@@ -45,6 +45,13 @@
 #
 # None. This is the starting point for Chapter 9. The transforms that follow from these
 # diagnostics are in `02_structural_breaks` and `03_fractional_differencing`.
+
+# %%
+from utils import ML4T_DATA_PATH
+
+p = ML4T_DATA_PATH / "macro" / "fred_macro.parquet"
+print("读取位置：", p)
+print("文件存在：", p.exists())
 
 # %% [markdown]
 # ## Setup
